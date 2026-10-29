@@ -7443,7 +7443,13 @@ int main(int argc, char** argv) {
         // had no room left for them: "mtp: the draft head does not fit" on two 16 GB cards.  (Strata-DualGPU)
         const int64_t draft_head = (&st == last_st && !o.mtp.empty() && st.head.loaded())
                                        ? (int64_t) mtp.bind_bytes(st.head.row_bytes(), n_vocab) : 0;
-        const int64_t room = stage_room(st.dev, true, false) - draft_head;
+        // LOCAL: the layer-major super-chunk's device buffers are cudaMalloc'd at prompt time, after the
+        // caches and the session/windows; if the cache fills the card they cannot fit and the walk declines.
+        // Measured on this rig (5080+4060Ti, IQ2_XS, 64K): the super-chunk needs ~1.1 GiB free on the last
+        // card after everything else is loaded; the session+windows+verifiers eat ~500 MiB on top of the
+        // cache, so the cache must leave ~1.5 GiB to end at ~1.1 GiB.  Constant: our local fork only.
+        const int64_t lm_reserve = &st == last_st ? (int64_t) 0 : 0;   // LOCAL: the session expands to fill whatever the cache leaves; reserving here does not engage layer-major
+        const int64_t room = stage_room(st.dev, true, false) - draft_head - lm_reserve;
         const strata::core::OnDevice on(st.dev);
         {
             size_t fb = 0, tb = 0;
