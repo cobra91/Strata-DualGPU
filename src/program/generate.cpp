@@ -4456,6 +4456,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
     }
+    mem_mark("the CUDA context alone (before the weight arena)");
     void* arena = nullptr;
     if (const cudaError_t ce = cudaMalloc(&arena, pool_bytes); ce != cudaSuccess) {
         // #486: the arena is the first large allocation and its size does not depend on the context, so what is
@@ -7270,13 +7271,58 @@ int main(int argc, char** argv) {
             // short by (want - free); a figure of 0 only says "at least": the first two such reads give back 1 GiB
             // each (under WDDM the free figure read before the allocation runs ~0.7 GiB high), later ones a quarter
             int64_t give = want - (int64_t) free_b + (64ll << 20);
-            if (free_b < ((size_t) 16 << 20))
-                give = std::max<int64_t>(give, ++zero_reads <= 2 ? 1ll << 30 : xcache.bytes() / 4);
+            // LOCAL: the 1 GiB WDDM correction over-shrinks on 16 GB cards where every slot counts. Cap it
+            // at 256 MiB (the measured WDDM overshoot on this rig is ~300-700 MiB, not 1 GiB), and let the
+            // loop iterate if the first correction was not enough. STRATA_SHRINK_1G=1 restores the old floor.
+            if (free_b < ((size_t) 16 << 20)) {
+                const bool old_floor = [] { const char* v = std::getenv("STRATA_SHRINK_1G"); return v != nullptr && std::atoi(v) != 0; }();
+                give = std::max<int64_t>(give, old_floor
+                               ? (++zero_reads <= 2 ? 1ll << 30 : xcache.bytes() / 4)
+                               : (256ll << 20));
+            }
             const int64_t keep_bytes = xcache.bytes() - give;
             std::fprintf(stderr, "strata generate: only %lld MiB free once the slots are written (reserve %d MiB); "
                                  "shrinking the expert cache\n", (long long) (free_b >> 20), o.vram_reserve_mib);
             xcache.close();
             if (!shrink_to(keep_bytes)) break;
+        }
+        // LOCAL: after the shrink loop, if the free VRAM is still comfortably above the reserve,
+        // the shrink over-corrected - grow the cache to use the surplus (the fork's mechanism
+        // effectively does this by starting from a bigger allocation and shrinking less).
+        // STRATA_NO_GROW=1 turns it off.
+        if (auto_cache && o.expert_cache > 0 && !profile.empty()) {
+            static const bool no_grow = [] { const char* v = std::getenv("STRATA_NO_GROW"); return v != nullptr && std::atoi(v) != 0; }();
+            if (!no_grow) {
+                size_t fb = 0, tb = 0;
+                cudaMemGetInfo(&fb, &tb);
+                const int64_t surplus = (int64_t) fb - (((int64_t) o.vram_reserve_mib + 256) << 20);
+                if (surplus > (256ll << 20)) {
+                    const int64_t blob0 = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+                    const int64_t extra = surplus / blob0;
+                    const int64_t want_slots = (int64_t) o.expert_cache + extra;
+                    if (want_slots > o.expert_cache && want_slots <= (int64_t) profile.size()) {
+                        xcache.close();
+                        sized_slots.clear();
+                        for (const auto& pr : profile) {
+                            if ((int64_t) sized_slots.size() >= want_slots) break;
+                            sized_slots.push_back((int64_t) nib::slot_bytes(pr.first));
+                        }
+                        const int before = o.expert_cache;
+                        o.expert_cache = (int) sized_slots.size();
+                        std::string grow_err;
+                        if (xcache.open_sized(sized_slots, g.n_layers, g.n_expert, grow_err)) {
+                            cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
+                            cudaDeviceSynchronize();
+                            std::fprintf(stderr, "strata generate: LOCAL grow: %lld MiB surplus -> %d slots (was %d)\n",
+                                         (long long) (surplus >> 20), o.expert_cache, before);
+                        } else {
+                            o.expert_cache = before;
+                            std::fprintf(stderr, "strata generate: LOCAL grow failed (%s); keeping the shrunk size\n",
+                                         grow_err.c_str());
+                        }
+                    }
+                }
+            }
         }
         if (failed > 0 && o.expert_cache > 0)
             std::fprintf(stderr, "strata generate: expert cache: %d slots (%.2f GiB) after %d smaller tries - a bigger "
