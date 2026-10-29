@@ -6880,12 +6880,22 @@ int main(int argc, char** argv) {
     const bool auto_cache = o.expert_cache < 0;
     bool reserve_adapted = false;   // #496: the auto sizing lowered the reserve so a small card's cache fits
     // --pipeline-windows: what it allocates on CUDA0 after the cache (see kPipeWindowMib)
-    const int64_t pipe_first = o.pipeline_windows <= 0 ? 0
-        : (kPipeWindowMib << 20) + (o.pipeline_windows >= 2 ? 2 * (int64_t) gdn_snapshot_bytes(ss) : 0);
+    // LOCAL: pipe_first subtracted here steals ~247 MiB from the expert cache, which cascades into a
+    // shrink (0 MiB free → #841 retries → hundreds of slots lost). The fork (Strata-DualGPU) does not
+    // pre-reserve this; it sizes the cache first and lets pipeline-windows take what remains. We do the
+    // same here: the cache gets the maximum, and pw2 allocates after it (it already has its own OOM
+    // error paths). STRATA_PIPE_FIRST=1 restores the old behaviour.
+    const bool pipe_first_asked = [] { const char* v = std::getenv("STRATA_PIPE_FIRST"); return v != nullptr && std::atoi(v) != 0; }();
+    const int64_t pipe_first = pipe_first_asked ? (o.pipeline_windows <= 0 ? 0
+        : (kPipeWindowMib << 20) + (o.pipeline_windows >= 2 ? 2 * (int64_t) gdn_snapshot_bytes(ss) : 0)) : 0;
     if (pipe_first > 0)
         std::fprintf(stderr, "strata generate: --pipeline-windows %d: %lld MiB of CUDA0 kept out of the expert cache "
                              "(the second verifier%s)\n", o.pipeline_windows, (long long) (pipe_first >> 20),
                      o.pipeline_windows >= 2 ? ", the GDN snapshots" : "");
+    else if (o.pipeline_windows > 0 && !pipe_first_asked)
+        std::fprintf(stderr, "strata generate: --pipeline-windows %d: the expert cache is sized first; the second "
+                             "verifier and the GDN snapshots allocate after it (LOCAL, STRATA_PIPE_FIRST=1 restores)\n",
+                     o.pipeline_windows);
     // The MiB the prompt path's OWN buffers (no loan) take, which the cache sizing leaves out.  0.1.39's rule is
     // 160 + chunk * 680 / 1024 (~16 GiB at 24576 against ~2.4 GiB really allocated); STRATA_OWNED_PRICE=exact prices the
     // real allocation instead (Prefill::bytes_needed_owned: 2 MiB pages, the ring in one piece, as PR #796 measured)
