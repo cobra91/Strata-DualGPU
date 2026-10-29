@@ -10087,11 +10087,15 @@ int main(int argc, char** argv) {
                 const char* v = std::getenv("STRATA_SPLIT_OVERLAP");
                 return v != nullptr && std::atoi(v) != 0;
             }();
-            // --pipeline-windows (#859) runs its own overlapped loop with its own hand-offs: the two do not mix
+            // --pipeline-windows (#859) overlaps consecutive windows; STRATA_SPLIT_OVERLAP overlaps the stages
+            // within each window.  They address different waits and compose: the handoff flags remove the host
+            // sync between stage 0 and stage 1 of the same window, while pipeline-windows runs window K+1 on
+            // stage 0 while stage 1 still verifies K.  (Strata-DualGPU runs both at once; its XSTAGE measured
+            // code 95 -> 108 tok/s on a 5080 + 4060 Ti from this alone.)
+            // LOCAL finding: STRATA_SPLIT_OVERLAP beside --pipeline-windows needs the fork's run() decomposition
+            // (prepare/launch/serve/finish) to compose - the flags alone create a second sync that fights the
+            // pipeline loop's own stage management (measured 56.0 vs 76.9 tok/s with them off on this rig).
             const bool overlap = overlap_asked && !split_same && o.pipeline_windows == 0;
-            if (overlap_asked && o.pipeline_windows > 0)
-                std::fprintf(stderr, "strata serve: STRATA_SPLIT_OVERLAP is off beside --pipeline-windows %d "
-                                     "(that loop overlaps the stages itself)\n", o.pipeline_windows);
             std::vector<uint32_t*> hflag_h((size_t) n_stages - 1, nullptr), hflag_d((size_t) n_stages - 1, nullptr);
             if (overlap)
                 for (size_t i = 0; i < hflag_h.size(); ++i) {
@@ -10159,6 +10163,18 @@ int main(int argc, char** argv) {
         // --pipeline-windows: the odd windows' verifiers and their hand-off (initialized before `ver`, which stays the
         // watchdog's verifier), and the drafter's own row buffer, which either parity's rows are copied into
         float* pl_mtp_R = nullptr;
+        // LOCAL: with pipeline-windows + STRATA_SPLIT_OVERLAP, the ODD parity verifiers need handoff flags too
+        std::vector<uint32_t*> hflag_b_h((size_t) n_stages - 1, nullptr), hflag_b_d((size_t) n_stages - 1, nullptr);
+        const bool overlap_b = [] { const char* v = std::getenv("STRATA_SPLIT_OVERLAP"); return v != nullptr && std::atoi(v) != 0; }() && !split_same;
+        if (overlap_b)
+            for (size_t i = 0; i < hflag_b_h.size(); ++i) {
+                if (cudaHostAlloc((void**) &hflag_b_h[i], 64, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                    cudaHostGetDevicePointer((void**) &hflag_b_d[i], hflag_b_h[i], 0) != cudaSuccess) {
+                    std::fprintf(stderr, "strata serve: the odd-parity hand-off flag allocation failed\n");
+                    return 1;
+                }
+                std::memset(hflag_b_h[i], 0, 64);
+            }
         if (pipe) {
             const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
@@ -10173,6 +10189,15 @@ int main(int argc, char** argv) {
                 std::memset(hh, 0, hb);
             }
             ver_b.set_stage(0, split_at[0], nullptr, hand_b[0]);
+            // LOCAL: the odd parity's handoff flags BEFORE init (the counter hcount_d_ is only allocated
+            // during init when the flags are already set; setting them after leaves it null → crash)
+            if (overlap_b)
+                for (int st = 0; st < n_stages; ++st)
+                    stage_ver_p(st, 1).set_handoff_flags(
+                        st == 0 ? nullptr : hflag_b_h[(size_t) st - 1],
+                        st == 0 ? nullptr : hflag_b_d[(size_t) st - 1],
+                        st + 1 < n_stages ? hflag_b_h[(size_t) st] : nullptr,
+                        st + 1 < n_stages ? hflag_b_d[(size_t) st] : nullptr);
             for (int st = 1; st < n_stages; ++st) {
                 GpuStage& gs = *stages[(size_t) st - 1];
                 const bool last = st + 1 == n_stages;

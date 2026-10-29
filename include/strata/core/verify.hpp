@@ -199,6 +199,11 @@ public:
     void set_handoff_flags(uint32_t* in_host, uint32_t* in_dev, uint32_t* out_host, uint32_t* out_dev) {
         hflag_in_h_ = in_host; hflag_in_d_ = in_dev; hflag_out_h_ = out_host; hflag_out_d_ = out_dev;
     }
+    /// LOCAL (Strata-DualGPU XSTAGE): the cross-stage flag, one word of mapped portable memory per boundary,
+    /// shared with the next stage.  When set, `run` launches every stage's graph at once and serves them in
+    /// order - no host wait between the stages.  Before `init`.  (This composes with --pipeline-windows:
+    /// the pipeline loop's pl_launch already overlaps windows; this overlaps stages within a window.)
+    void set_stage_flags(uint32_t* in_flag, uint32_t* out_flag) { xin_ = in_flag; xout_ = out_flag; }
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
@@ -541,6 +546,8 @@ private:
     uint32_t* hflag_in_d_ = nullptr;
     uint32_t* hflag_out_h_ = nullptr;    ///< ... and the outgoing one's
     uint32_t* hflag_out_d_ = nullptr;
+    uint32_t* xin_ = nullptr;             ///< LOCAL (XSTAGE): the incoming stage flag (mapped portable)
+    uint32_t* xout_ = nullptr;            ///< LOCAL (XSTAGE): the outgoing stage flag
     uint32_t* hcount_d_ = nullptr;       ///< handoff_publish's block counter (device memory)
     uint32_t* herr_h_ = nullptr;         ///< the bounded hand-off wait gave up (mapped; the reading stage's)
     uint32_t* herr_d_ = nullptr;

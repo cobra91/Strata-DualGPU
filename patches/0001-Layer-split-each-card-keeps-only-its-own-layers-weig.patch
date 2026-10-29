@@ -1,0 +1,505 @@
+From d9ff51445fbe8cd032f8d6b9afe973aeb83f5a4e Mon Sep 17 00:00:00 2001
+From: Francesco Albano <119073350+Hardin22@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 21:42:54 +0200
+Subject: [PATCH] Layer split: each card keeps only its own layers' weights
+
+A split loaded the dense weights of all 48 layers on every card, though each card
+runs only its own layers. Now every card loads them as before, the split is
+decided, and each card reloads only its own layers' weights before the sessions
+and the expert caches are made. The VRAM this frees goes to the expert caches.
+The automatic split counts it when it places the boundary, so this also works
+with --layer-split auto (upstream's #559 and #639 do it for explicit split
+points). --no-trim-stage-weights keeps the old behaviour.
+
+The PLE's six layer-1 weights are the only pointers into the old copy taken
+before the split is known; they are wired again after the reload. The router
+copy for the file tier's lookahead reads each layer's router from the card that
+runs it.
+
+On a 4060 Ti + 5080 at K=20 this frees 1.9 and 1.3 GiB. Same engine, without and
+with trimming (code / prose at context 0, code / prose at 32K, 32K prompt):
+
+  IQ2_XS:  162 / 109, 149 / 100, 1,899  ->  172 / 111, 157 / 104, 2,201 tok/s
+  IQ3_XXS: 141 /  95,  98 /  71, 1,006  ->  144 /  97, 131 /  92, 1,978 tok/s
+
+With IQ3_XXS at 160K the experts no card held did not all fit in RAM before, and
+about 2,400 were read from the SSD per benchmark run; now none are. Teacher-forced
+over 5,335 tokens, IQ3_XXS with and without trimming picks the same top token at
+93.5% of the positions (perplexity 6.95 and 7.03).
+---
+ README.md                            |   1 +
+ docs/DUAL_GPU.md                     |  27 ++++
+ include/strata/core/native_dense.hpp |  10 +-
+ src/core/native_dense.cpp            |  30 +++-
+ src/program/generate.cpp             | 200 ++++++++++++++++++++-------
+ 5 files changed, 217 insertions(+), 51 deletions(-)
+
+diff --git a/README.md b/README.md
+index 4b951155..31363709 100644
+--- a/README.md
++++ b/README.md
+@@ -34,6 +34,7 @@ half of every step on my PC), most of the work went into making them run at the
+   one. On by default with two GPUs.
+ - The faster card goes last, since it also runs the output head and the draft model, and the automatic split
+   balances the two cards for pipelining. The server orders the cards by itself.
++- Each card keeps only the weights of the layers it runs, and the VRAM this frees goes to its expert cache.
+ - Adaptive expert swaps between VRAM and RAM no longer stop decoding while they copy.
+ - Fewer host waits and kernel launches per step: device-side flags between the cards, the draft chain in one CUDA
+   graph, programmatic dependent launch on RTX 50 cards.
+diff --git a/docs/DUAL_GPU.md b/docs/DUAL_GPU.md
+index d1372744..a70066a2 100644
+--- a/docs/DUAL_GPU.md
++++ b/docs/DUAL_GPU.md
+@@ -131,6 +131,32 @@ that drives none. 1800 MiB is what two 4K monitors, a browser and the compositor
+ running out of VRAM. With one 1080p monitor you can go lower with `--vram-reserve-mib` (first card) and
+ `--vram-reserve-later-mib` (the others). `"vram_reserve": "as_given"` in the config turns the automatic choice off.
+ 
++## 9. Each card keeps only its own layers' weights
++
++A split used to load the dense weights of all 48 layers on every card, although each card runs only its own layers.
++Now each card keeps the weights of its layers, and the VRAM this frees goes to its expert cache. Upstream has the same
++idea in two open pull requests, #559 (blange48) and #639 (JeanP00l), for explicit split points. Here it also works
++with `--layer-split auto`: every card loads everything first, the search counts what trimming will free on each card
++when it places the boundary, and then each card reloads only its own layers before the sessions and caches are made.
++
++On this PC that frees 1.9 GiB on the 4060 Ti and 1.3 GiB on the 5080. Same engine, `--no-trim-stage-weights`
++against the default, K=20:
++
++| | code | prose | code, 32K context | prose, 32K context | 32K prompt |
++|---|---:|---:|---:|---:|---:|
++| IQ2_XS, every card holds every layer | 162 | 109 | 149 | 100 | 1,899 |
++| IQ2_XS, own layers only | 172 | 111 | 157 | 104 | 2,201 |
++| IQ3_XXS (160K context), every layer | 141 | 95 | 98 | 71 | 1,006 |
++| IQ3_XXS, own layers only | 144 | 97 | 131 | 92 | 1,978 |
++
++IQ3_XXS gains the most. Its experts are bigger, and before this change the ones no card held did not all fit in RAM,
++so about 2,400 of them were read from the SSD in one benchmark run. With 2,174 more of them in VRAM the rest fit, and
++none are read from the SSD. The automatic split still picks K=20 for it.
++
++More experts in VRAM means more of them computed by the GPU, which rounds differently from the CPU (see
++[Is the output still the same model?](#is-the-output-still-the-same-model)). On the 5,335 tokens of that comparison, IQ3_XXS with and without trimming picked the same top token at 93.5%
++of the positions, with a perplexity of 6.95 and 7.03.
++
+ ## Where it ended up
+ 
+ The stock draft head throughout, decode in tokens per second:
+@@ -175,6 +201,7 @@ seeded sampling, and runs with forced rollbacks.
+ | `--vram-reserve-later-mib N` | VRAM left free on the later cards of a split |
+ | `--pipeline-windows 0/1/2` | pipelined windows; 2 by default on a two-GPU split |
+ | `--layer-split auto` | balances the two stages when pipelined (section 6) |
++| `--no-trim-stage-weights` | every card keeps the dense weights of all the layers (section 9) |
+ | `--adapt-async 0` | the blocking adaptive tier |
+ | `--list-gpus` | prints the visible cards and exits |
+ | `"gpu_order": "as_given"` | the server keeps the config's card order |
+diff --git a/include/strata/core/native_dense.hpp b/include/strata/core/native_dense.hpp
+index 8330fac5..6e762b7d 100644
+--- a/include/strata/core/native_dense.hpp
++++ b/include/strata/core/native_dense.hpp
+@@ -19,8 +19,15 @@ public:
+     ~NativeDense();
+     NativeDense(const NativeDense&) = delete;
+     NativeDense& operator=(const NativeDense&) = delete;
++    /// With `layer_hi >= 0`, only the blk.<l>. matrices of layers [layer_lo, layer_hi) are uploaded (a layer split's
++    /// stage: the other layers run on another card).
+     bool load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
+-              bool include_ple_key = false);
++              bool include_ple_key = false, int64_t layer_lo = 0, int64_t layer_hi = -1);
++    /// Frees the uploaded matrices and the scratch, so `load` can run again.  The WeightRefs that pointed at them
++    /// must not be used afterwards (the caller reloads their table too).
++    void release();
++    /// The uploaded bytes of layers [lo, hi).
++    uint64_t bytes_in(int64_t lo, int64_t hi) const;
+     /// Plan v0.3 P1: the canonical tensor names `load` would serve natively from these shards (eligible name,
+     /// supported type, 2-D), read from the GGUF headers only - so the canonical arena can skip them.
+     static bool served_names(const std::vector<std::string>& shards, bool include_ple_key,
+@@ -36,5 +43,6 @@ private:
+     std::vector<void*> weights_;
+     void* scratch_ = nullptr;
+     uint64_t bytes_ = 0;
++    std::vector<uint64_t> layer_bytes_;   ///< uploaded bytes per layer
+ };
+ } // namespace strata::core
+diff --git a/src/core/native_dense.cpp b/src/core/native_dense.cpp
+index 4a86d48c..ef4ce5ef 100644
+--- a/src/core/native_dense.cpp
++++ b/src/core/native_dense.cpp
+@@ -6,6 +6,7 @@
+ #include <cuda_runtime.h>
+ #include <algorithm>
+ #include <climits>
++#include <cstdlib>
+ #include <exception>
+ #include <limits>
+ #include <memory>
+@@ -26,6 +27,11 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
+     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
+     return false;
+ }
++// the layer of a blk.<l>. tensor, -1 for any other
++int64_t layer_of(const std::string& name) {
++    if (name.rfind("blk.", 0) != 0) return -1;
++    return std::strtoll(name.c_str() + 4, nullptr, 10);
++}
+ struct DeviceFree { void operator()(void* p) const { if (p) cudaFree(p); } };
+ using DevicePtr = std::unique_ptr<void, DeviceFree>;
+ struct Pending {
+@@ -63,13 +69,25 @@ bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set
+     return true;
+ }
+ 
+-NativeDense::~NativeDense() {
++NativeDense::~NativeDense() { release(); }
++
++void NativeDense::release() {
+     if (scratch_) cudaFree(scratch_);
+     for (void* p : weights_) cudaFree(p);
++    scratch_ = nullptr;
++    weights_.clear();
++    layer_bytes_.clear();
++    bytes_ = 0;
++}
++
++uint64_t NativeDense::bytes_in(int64_t lo, int64_t hi) const {
++    uint64_t n = 0;
++    for (int64_t l = std::max<int64_t>(lo, 0); l < hi && l < (int64_t) layer_bytes_.size(); ++l) n += layer_bytes_[(size_t) l];
++    return n;
+ }
+ 
+ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
+-                       bool include_ple_key) {
++                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi) {
+     if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
+     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
+     try {
+@@ -77,6 +95,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
+         std::set<std::string> seen;
+         int max_in = 0;
+         uint64_t total = 0;
++        std::vector<uint64_t> per_layer;
+         uint64_t split_count = 0, split_tensors = 0;
+         std::set<uint64_t> split_numbers;
+         bool have_architecture = false;
+@@ -139,6 +158,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
+             }
+             for (const auto& tensor : gguf.tensors()) {
+                 if (!eligible(tensor, include_ple_key)) continue;
++                const int64_t layer = layer_of(tensor.name);
++                if (layer_hi >= 0 && (layer < layer_lo || layer >= layer_hi)) continue;   // another stage's layer
+                 if (!seen.insert(tensor.name).second) {
+                     err = "native dense: duplicate tensor " + tensor.name; return false;
+                 }
+@@ -168,6 +189,10 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
+                 }
+                 max_in = (std::max)(max_in, (int) ref.ne0);
+                 total += bytes;
++                if (layer >= 0) {
++                    if (per_layer.size() <= (size_t) layer) per_layer.resize((size_t) layer + 1, 0);
++                    per_layer[(size_t) layer] += bytes;
++                }
+                 pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data)});
+             }
+         }
+@@ -186,6 +211,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
+         }
+         scratch_ = scratch.release();
+         bytes_ = total;
++        layer_bytes_ = std::move(per_layer);
+         return true;
+     } catch (const std::exception& error) {
+         err = std::string("native dense: ") + error.what();
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 421a6f96..c588461f 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -531,6 +531,9 @@ struct Options {
+     /// verifies K (rolled back when K is not fully accepted).  0 = off.  -1 (the default): 2 when the layer split runs
+     /// on exactly two GPUs, else 0.
+     int pipeline_windows = -1;
++    /// A layer split: each card keeps the dense weights of its own layers only (the rest of the model's are another
++    /// card's), and the VRAM this frees goes to its expert cache.  --no-trim-stage-weights: every card keeps them all.
++    bool trim_stage_weights = true;
+     /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
+     /// edits, quoted input, tool-call JSON) by at least this many tokens, the window may be filled with what followed
+     /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
+@@ -705,6 +708,9 @@ void usage() {
+                  "  --pipeline-windows N --serve, a layer split on two GPUs: 2 = stage 0 runs window K+1 while\n"
+                  "                       stage 1 verifies K (the default there), 1 = only the prompt's windows,\n"
+                  "                       0 = off (the stages take turns).\n"
++                 "  --no-trim-stage-weights  a layer split: every card keeps the dense weights of all the layers,\n"
++                 "                       as before.  By default each card keeps only those of the layers it runs\n"
++                 "                       and the VRAM this frees goes to its expert cache.\n"
+                  "  --list-gpus          print the visible CUDA devices (SMs, clock, VRAM, compute capability)\n"
+                  "                       and exit; the server orders a split's cards with it.\n"
+                  "  --pool-affinity MODE Worker CPU affinity: all (default: one worker per physical core, as\n"
+@@ -894,6 +900,8 @@ struct GpuStage {
+     int dev = 0;
+     int64_t lb = 0, le = 0;
+     double pcie_frac = 0.0;
++    void* arena = nullptr;                               ///< its dense weights (`wt`)
++    uint64_t arena_bytes = 0;
+     strata::core::WeightTable wt;
+     strata::core::NativeDense dense;
+     strata::core::NativeHead head;
+@@ -1468,6 +1476,8 @@ int main(int argc, char** argv) {
+         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
+         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
+         else if (a == "--pipeline-windows") o.pipeline_windows = std::max(0, std::atoi(next("--pipeline-windows")));
++        else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
++        else if (a == "--no-trim-stage-weights") o.trim_stage_weights = false;
+         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
+         else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, std::atoi(next("--mtp-max-t")));
+         else if (a == "--control-vector") o.cvec_files.push_back({next("--control-vector"), 1.0f});
+@@ -2362,53 +2372,18 @@ int main(int argc, char** argv) {
+     // module was built and parity-tested, and nothing called it.  Everything below is construction - the table
+     // is a mapping of the ORIGINAL second GGUF shard, the six weights are already loaded in the arena, and the
+     // three buffers are the only allocation.
+-    strata::kernels::PleTable ple_table;
+-    std::vector<float> ple_emb_host((size_t) strata::kernels::NG_N_EMBD);
+-    float* ple_emb_dev = nullptr;
+-    float* ple_scratch = nullptr;
+-    if (!o.ple_gguf.empty()) {
+-        strata::kernels::PleIoOptions pio;
+-        pio.mode = o.ple_io == "mmap" || o.ple_io == "ram" ? strata::kernels::PleIo::Mmap : strata::kernels::PleIo::Direct;
+-        pio.lock = o.ple_io == "ram";
+-        const auto tpl = Clock::now();
+-        pio.max_inflight = (uint32_t) o.ple_inflight;
+-        pio.cache_rows = (uint64_t) o.ple_row_cache;
+-        pio.io_thread = !o.ple_sync_submit;
+-        // Keep the SSD awake while rows are being asked for (PleReader::set_keepalive): some SSDs stall the first
+-        // reads 50-150 ms after ~250 ms without a command.  STRATA_SSD_KEEPALIVE = ms without a read before one
+-        // page is read anyway (default 100, 0 = off), STRATA_SSD_KEEPALIVE_WINDOW = seconds after the last row
+-        // request that this goes on (default 60; then the SSD may sleep until the next request).
+-        {
+-            const char* ka = std::getenv("STRATA_SSD_KEEPALIVE");
+-            const char* kw = std::getenv("STRATA_SSD_KEEPALIVE_WINDOW");
+-            pio.keepalive_ms = ka != nullptr && *ka ? std::clamp(std::atof(ka), 0.0, 10000.0) : 100.0;
+-            pio.keepalive_window_s = kw != nullptr && *kw ? std::clamp(std::atof(kw), 1.0, 86400.0) : 60.0;
+-            if (pio.mode != strata::kernels::PleIo::Direct || !pio.io_thread) pio.keepalive_ms = 0;
+-        }
+-        if (!ple_table.open(o.ple_gguf, err, pio)) {
+-            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+-            return 1;
+-        }
+-        if (pio.lock)
+-            std::fprintf(stderr, "strata generate: PLE table %s (--ple-io ram) in %.1f s\n",
+-                         ple_table.locked() ? "locked in RAM" : "loaded (not locked)",
+-                         std::chrono::duration<double>(Clock::now() - tpl).count());
+-        if (pio.keepalive_ms > 0)
+-            std::fprintf(stderr, "strata generate: the SSD is kept awake while rows are read: one page of the table after "
+-                                 "%.0f ms without a read, until %.0f s after the last request "
+-                                 "(STRATA_SSD_KEEPALIVE=0 turns it off)\n", pio.keepalive_ms, pio.keepalive_window_s);
+-        else if (pio.mode == strata::kernels::PleIo::Direct)
+-            std::fprintf(stderr, "strata generate: SSD keep-alive off: the SSD may fall asleep between reads\n");
+-        const strata::core::WeightRef* wk = wt.find("blk.1.ple_key.weight");
+-        const strata::core::WeightRef* wv = wt.find("blk.1.ple_value.weight");
+-        const strata::core::WeightRef* wnk = wt.find("blk.1.ple_norm_key.weight");
+-        const strata::core::WeightRef* wnq = wt.find("blk.1.ple_norm_query.weight");
+-        const strata::core::WeightRef* wnc = wt.find("blk.1.ple_norm_conv.weight");
+-        const strata::core::WeightRef* wc = wt.find("blk.1.ple_conv1d.weight");
++    // the six layer-1 weights the PLE reads, from CUDA0's table (again after a trimmed split reloads it)
++    auto wire_ple = [&](const strata::core::WeightTable& t) -> bool {
++        const strata::core::WeightRef* wk = t.find("blk.1.ple_key.weight");
++        const strata::core::WeightRef* wv = t.find("blk.1.ple_value.weight");
++        const strata::core::WeightRef* wnk = t.find("blk.1.ple_norm_key.weight");
++        const strata::core::WeightRef* wnq = t.find("blk.1.ple_norm_query.weight");
++        const strata::core::WeightRef* wnc = t.find("blk.1.ple_norm_conv.weight");
++        const strata::core::WeightRef* wc = t.find("blk.1.ple_conv1d.weight");
+         if (!wk || !wv || !wnk || !wnq || !wnc || !wc) {
+             std::fprintf(stderr, "strata generate: the pack has no blk.1.ple_* tensors, so the PLE cannot be "
+                                  "wired - and running without it is a DIFFERENT MODEL (LEDGER L123)\n");
+-            return 1;
++            return false;
+         }
+         // `ple_key` is S2 and the loader has already widened its scales to f32, so the two planes are located
+         // by the sizes the `WeightRef` records rather than re-derived - the same rule `plane_ptrs` follows.
+@@ -2423,7 +2398,7 @@ int main(int argc, char** argv) {
+             if (!wk->native_data || (wk->native_type != 42 && wk->native_type != 18 && wk->native_type != 23 &&
+                                      wk->native_type != 8) || !wk->native_q8_1) {
+                 std::fprintf(stderr, "strata generate: native PLE key is absent or incompatible\n");
+-                return 1;
++                return false;
+             }
+             ss.ple.w.key_native_data = wk->native_data;
+             ss.ple.w.key_native_type = wk->native_type;
+@@ -2445,9 +2420,49 @@ int main(int argc, char** argv) {
+                                  "%llu B for %lld values); the PLE conv1d kernel reads F16 - repack with "
+                                  "tools/iq_pack.py\n",
+                          (int) wc->kind, (unsigned long long) wc->bytes, (long long) wc->elements);
+-            return 1;
++            return false;
+         }
+         ss.ple.w.conv1d_f16 = (const uint16_t*) wc->data;
++        return true;
++    };
++    strata::kernels::PleTable ple_table;
++    std::vector<float> ple_emb_host((size_t) strata::kernels::NG_N_EMBD);
++    float* ple_emb_dev = nullptr;
++    float* ple_scratch = nullptr;
++    if (!o.ple_gguf.empty()) {
++        strata::kernels::PleIoOptions pio;
++        pio.mode = o.ple_io == "mmap" || o.ple_io == "ram" ? strata::kernels::PleIo::Mmap : strata::kernels::PleIo::Direct;
++        pio.lock = o.ple_io == "ram";
++        const auto tpl = Clock::now();
++        pio.max_inflight = (uint32_t) o.ple_inflight;
++        pio.cache_rows = (uint64_t) o.ple_row_cache;
++        pio.io_thread = !o.ple_sync_submit;
++        // Keep the SSD awake while rows are being asked for (PleReader::set_keepalive): some SSDs stall the first
++        // reads 50-150 ms after ~250 ms without a command.  STRATA_SSD_KEEPALIVE = ms without a read before one
++        // page is read anyway (default 100, 0 = off), STRATA_SSD_KEEPALIVE_WINDOW = seconds after the last row
++        // request that this goes on (default 60; then the SSD may sleep until the next request).
++        {
++            const char* ka = std::getenv("STRATA_SSD_KEEPALIVE");
++            const char* kw = std::getenv("STRATA_SSD_KEEPALIVE_WINDOW");
++            pio.keepalive_ms = ka != nullptr && *ka ? std::clamp(std::atof(ka), 0.0, 10000.0) : 100.0;
++            pio.keepalive_window_s = kw != nullptr && *kw ? std::clamp(std::atof(kw), 1.0, 86400.0) : 60.0;
++            if (pio.mode != strata::kernels::PleIo::Direct || !pio.io_thread) pio.keepalive_ms = 0;
++        }
++        if (!ple_table.open(o.ple_gguf, err, pio)) {
++            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
++            return 1;
++        }
++        if (pio.lock)
++            std::fprintf(stderr, "strata generate: PLE table %s (--ple-io ram) in %.1f s\n",
++                         ple_table.locked() ? "locked in RAM" : "loaded (not locked)",
++                         std::chrono::duration<double>(Clock::now() - tpl).count());
++        if (pio.keepalive_ms > 0)
++            std::fprintf(stderr, "strata generate: the SSD is kept awake while rows are read: one page of the table after "
++                                 "%.0f ms without a read, until %.0f s after the last request "
++                                 "(STRATA_SSD_KEEPALIVE=0 turns it off)\n", pio.keepalive_ms, pio.keepalive_window_s);
++        else if (pio.mode == strata::kernels::PleIo::Direct)
++            std::fprintf(stderr, "strata generate: SSD keep-alive off: the SSD may fall asleep between reads\n");
++        if (!wire_ple(wt)) return 1;
+         ss.ple.consts = strata::kernels::ple_artifact_consts();
+         if (o.ple_delay_us > 0) ple_table.set_injected_delay_us(o.ple_delay_us);
+         ss.ple.table = &ple_table;
+@@ -2549,6 +2564,8 @@ int main(int argc, char** argv) {
+                          (unsigned long long) (total_b >> 20));
+             return 1;
+         }
++        st.arena = arena_s;
++        st.arena_bytes = pool_bytes;
+         if (!o.native_dense_gguf.empty() && !st.dense.load(o.native_dense_gguf, st.wt, err, o.native_ple_key)) {
+             std::fprintf(stderr, "strata generate: layer split, CUDA%d native dense projections: %s\n", st.dev,
+                          err.c_str());
+@@ -2705,6 +2722,41 @@ int main(int argc, char** argv) {
+                                  (drafter ? kDrafterMib : 0)) << 20;
+         return std::max<int64_t>((int64_t) fb - reserve, 0);
+     };
++    // ---- TRIMMED STAGE WEIGHTS (the default with a split, --no-trim-stage-weights: off).  Every card has just
++    // loaded the dense weights of all the layers and runs only its own: once the split is known each one reloads
++    // its own layers' (below), and the search counts what that frees towards the card's expert cache.  On a 4060
++    // Ti + 5080 with Swift 1.5 IQ3_XXS at K=20 that was 1.9 + 1.3 GiB, 2,174 more cached experts and none left to
++    // read from the files: 98 -> 131 tok/s on code at a 32K context, its prompt 1,006 -> 1,978 tok/s.
++    const bool trim = o.trim_stage_weights && multi_gpu && !stages.empty();
++    std::vector<std::vector<std::string>> layer_rows((size_t) g.n_layers);   // the arena's blk.<l>. rows
++    std::vector<int64_t> trim_prefix((size_t) g.n_layers + 1, 0);           // the bytes of layers [0, l)
++    if (trim) {
++        if (std::FILE* f = std::fopen((o.pack + "/index.txt").c_str(), "rb")) {
++            char line[1024], name[256];
++            while (std::fgets(line, sizeof line, f))
++                if (line[0] != '#' && std::sscanf(line, "%255s", name) == 1 && std::strncmp(name, "blk.", 4) == 0 &&
++                    !skip.count(name)) {
++                    const long l = std::strtol(name + 4, nullptr, 10);
++                    if (l >= 0 && l < g.n_layers) layer_rows[(size_t) l].push_back(name);
++                }
++            std::fclose(f);
++        }
++        for (int64_t l = 0; l < g.n_layers; ++l) {
++            std::set<std::string> without = skip;
++            without.insert(layer_rows[(size_t) l].begin(), layer_rows[(size_t) l].end());
++            uint64_t rest = pool_bytes;
++            if (!strata::core::WeightTable::pool_bytes(o.pack, rest, err, &without)) {
++                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
++                return 1;
++            }
++            trim_prefix[(size_t) l + 1] = trim_prefix[(size_t) l] + (int64_t) (pool_bytes - rest) +
++                                          (int64_t) native_dense.bytes_in(l, l + 1);
++        }
++    }
++    // what a stage that runs [lb, le) frees by trimming (until then every card holds every layer)
++    auto trim_frees = [&](int64_t lb, int64_t le) -> int64_t {
++        return trim ? trim_prefix[(size_t) g.n_layers] - (trim_prefix[(size_t) le] - trim_prefix[(size_t) lb]) : 0;
++    };
+     if (multi_gpu && split_auto) {
+         const auto& lay = strata::kernels::cpu::expert_layout();
+         const int ns = (int) stages.size() + 1;
+@@ -2740,7 +2792,8 @@ int main(int argc, char** argv) {
+             for (int i = 0; i < ns; ++i) {
+                 const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1];
+                 const int64_t le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
+-                capr[(size_t) i] = cap[(size_t) i] - (int64_t) strata::core::session_bytes(g, o.max_context, K, lb, le);
++                capr[(size_t) i] = cap[(size_t) i] - (int64_t) strata::core::session_bytes(g, o.max_context, K, lb, le) +
++                                   trim_frees(lb, le);
+             }
+             std::fill(used.begin(), used.end(), 0);
+             held_mass = 0;
+@@ -2821,6 +2874,52 @@ int main(int argc, char** argv) {
+                          (long long) split_at[i], (long long) (g.n_layers - 1));
+             return 2;
+         }
++    // ---- the trimmed stage weights (see above): each card reloads only its own layers' dense weights.  Nothing
++    // holds a pointer into the old copies yet but the PLE's six layer-1 weights, which are wired again.
++    if (trim) {
++        auto reload = [&](int dev, int64_t lo, int64_t hi, void*& base, uint64_t& base_bytes,
++                          strata::core::WeightTable& table, strata::core::NativeDense& dense) -> bool {
++            const strata::core::OnDevice on(dev);
++            std::set<std::string> sk = skip;
++            for (int64_t l = 0; l < g.n_layers; ++l)
++                if (l < lo || l >= hi) sk.insert(layer_rows[(size_t) l].begin(), layer_rows[(size_t) l].end());
++            uint64_t bytes = 0;
++            if (!strata::core::WeightTable::pool_bytes(o.pack, bytes, err, &sk)) return false;
++            dense.release();
++            table = strata::core::WeightTable{};
++            cudaFree(base);
++            base = nullptr;
++            if (cudaMalloc(&base, bytes) != cudaSuccess) {
++                cudaGetLastError();
++                err = "the trimmed weight arena could not be allocated";
++                return false;
++            }
++            base_bytes = bytes;
++            return table.load(o.pack, base, bytes, err, &sk) &&
++                   (o.native_dense_gguf.empty() ||
++                    dense.load(o.native_dense_gguf, table, err, o.native_ple_key, lo, hi));
++        };
++        const int64_t before = trim_prefix[(size_t) g.n_layers];
++        std::string kept;
++        for (size_t i = 0; i <= stages.size(); ++i) {
++            const int64_t lo = i == 0 ? 0 : split_at[i - 1], hi = i < split_at.size() ? split_at[i] : g.n_layers;
++            const bool ok = i == 0 ? reload(0, lo, hi, arena, pool_bytes, wt, native_dense) &&
++                                         (o.ple_gguf.empty() || wire_ple(wt))
++                                   : reload(stages[i - 1]->dev, lo, hi, stages[i - 1]->arena, stages[i - 1]->arena_bytes,
++                                            stages[i - 1]->wt, stages[i - 1]->dense);
++            const int dev = i == 0 ? 0 : stages[i - 1]->dev;
++            if (!ok) {
++                std::fprintf(stderr, "strata generate: layer split, CUDA%d: its own layers' weights: %s\n", dev,
++                             err.c_str());
++                return 1;
++            }
++            kept += (kept.empty() ? "" : ", ") + std::string("CUDA") + std::to_string(dev) + " " +
++                    std::to_string(lo) + "-" + std::to_string(hi - 1) + " (" +
++                    std::to_string(trim_frees(lo, hi) >> 20) + " MiB freed)";
++        }
++        std::fprintf(stderr, "strata generate: layer split: each card keeps only its own layers' dense weights "
++                             "(%.2f GiB in all): %s\n", (double) before / 1073741824.0, kept.c_str());
++    }
+     // the stage that runs a layer (0: CUDA0's)
+     auto stage_of = [&](int64_t l) -> int {
+         int st = 0;
+@@ -3552,7 +3651,12 @@ int main(int argc, char** argv) {
+         std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
+         bool ok = true;
+         for (int64_t l = 0; l < g.n_layers && ok; ++l) {
+-            const strata::core::WeightRef* w = wt.find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
++            const strata::core::WeightTable* owner = &wt;   // the card that runs the layer holds its router
++            int owner_dev = 0;
++            for (const auto& st : stages)
++                if (l >= st->lb && l < st->le) { owner = &st->wt; owner_dev = st->dev; }
++            const strata::core::OnDevice on_owner(owner_dev);
++            const strata::core::WeightRef* w = owner->find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
+             ok = w != nullptr && w->kind == strata::core::WeightKind::Bf16InF32 &&
+                  w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 2;
+             if (!ok) break;
+-- 
+2.56.0.windows.2
+
