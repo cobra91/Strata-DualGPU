@@ -856,9 +856,6 @@ struct Options {
     /// sent as `BGEN <slot> <max_new> ...` reads its prompt and its first token through the usual path, then
     /// continues in slot <slot> of the batch windows (`BT <slot> <id>` lines, then `BDONE <slot> ...`).
     int batch = 0;
-    /// With an explicit --layer-split, every GPU loads only its own layers' dense weights instead of the whole
-    /// model's: the VRAM they took goes back to the expert cache (opt-in)
-    bool trim_stage_weights = false;
     /// The --batch slots in this many groups pipelined through the stages of a layer split (stage k
     /// runs one group while stage k+1 runs another).  1 = every slot in one window, stage after stage.
     int batch_groups = 1;
@@ -969,6 +966,9 @@ struct Options {
     /// when K is not accepted as guessed).  0 = off (the stages take turns).
     /// -1 (not asked for) = 2 on gfx12 (HIP) layer splits of 3 or more stages, else 0; --pipeline-windows N asks for it.
     int pipeline_windows = -1;
+    /// A layer split: each card keeps the dense weights of its own layers only (the rest of the model's are another
+    /// card's), and the VRAM this frees goes to its expert cache.  --no-trim-stage-weights: every card keeps them all.
+    bool trim_stage_weights = true;
     /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
     /// edits, quoted input, tool-call JSON) by at least this many tokens, the window may be filled with what followed
     /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
@@ -1275,6 +1275,9 @@ void usage() {
                  "                       worker; nothing is done when none is spare) or a CPU list such as 24,26 (Linux; the\n"
                  "                       host's and the workers' CPUs are dropped from it).  Moves threads only, never a\n"
                  "                       result.  STRATA_AUX_CPUS sets it too; a request's strata_tune aux_cpus=0|1 beats it.\n"
+                 "  --no-trim-stage-weights  a layer split: every card keeps the dense weights of all the layers,\n"
+                 "                       as before.  By default each card keeps only those of the layers it runs\n"
+                 "                       and the VRAM this frees goes to its expert cache.\n"
                  "  --pool-affinity MODE Worker CPU affinity: all (default: one worker per physical core, as\n"
                  "                       always), auto (hybrid CPUs: P-cores first, then their SMT siblings,\n"
                  "                       then E-cores) or p-cores (P-cores and their siblings only).  measure (opt-in,\n"
@@ -1489,6 +1492,8 @@ struct GpuStage {
     int64_t lb = 0, le = 0;
     double pcie_frac = 0.0;
     double link_gbps = 0.0;   ///< this card's probed host->device bandwidth (PcieAuto's per-stage share)
+    void* arena = nullptr;                               ///< its dense weights (`wt`)
+    uint64_t arena_bytes = 0;
     strata::core::WeightTable wt;
     strata::core::NativeDense dense;
     strata::core::NativeHead head;
@@ -3643,6 +3648,7 @@ int main(int argc, char** argv) {
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
         else if (a == "--prefill-head-alias") o.prefill_head_alias = true;
         else if (a == "--pipeline-windows") o.pipeline_windows = std::max(0, std::min(2, std::atoi(next("--pipeline-windows"))));
+        else if (a == "--no-trim-stage-weights") o.trim_stage_weights = false;
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
         else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, std::atoi(next("--mtp-max-t")));
         else if (a == "--lookup-max-t") o.lookup_max_t = std::max(0, std::atoi(next("--lookup-max-t")));
@@ -5191,6 +5197,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
     }
+    mem_mark("the CUDA context alone (before the weight arena)");
     void* arena = nullptr;
     if (const cudaError_t ce = cudaMalloc(&arena, pool_bytes); ce != cudaSuccess) {
         // #486: the arena is the first large allocation and its size does not depend on the context, so what is
@@ -5404,6 +5411,59 @@ int main(int argc, char** argv) {
     // module was built and parity-tested, and nothing called it.  Everything below is construction - the table
     // is a mapping of the ORIGINAL second GGUF shard, the six weights are already loaded in the arena, and the
     // three buffers are the only allocation.
+    // the six layer-1 weights the PLE reads, from CUDA0's table (again after a trimmed split reloads it)
+    auto wire_ple = [&](const strata::core::WeightTable& t) -> bool {
+        const strata::core::WeightRef* wk = t.find("blk.1.ple_key.weight");
+        const strata::core::WeightRef* wv = t.find("blk.1.ple_value.weight");
+        const strata::core::WeightRef* wnk = t.find("blk.1.ple_norm_key.weight");
+        const strata::core::WeightRef* wnq = t.find("blk.1.ple_norm_query.weight");
+        const strata::core::WeightRef* wnc = t.find("blk.1.ple_norm_conv.weight");
+        const strata::core::WeightRef* wc = t.find("blk.1.ple_conv1d.weight");
+        if (!wk || !wv || !wnk || !wnq || !wnc || !wc) {
+            std::fprintf(stderr, "strata generate: the pack has no blk.1.ple_* tensors, so the PLE cannot be "
+                                 "wired - and running without it is a DIFFERENT MODEL (LEDGER L123)\n");
+            return false;
+        }
+        // `ple_key` is S2 and the loader has already widened its scales to f32, so the two planes are located
+        // by the sizes the `WeightRef` records rather than re-derived - the same rule `plane_ptrs` follows.
+        if (!wk->quantized()) {
+            // plan v0.3 P6: the IQ model files' BF16 key (the pack's extra.bin, raw BF16)
+            ss.ple.w.key_bf16 = (const uint16_t*) wk->data;
+        } else if (wk->data != nullptr) {
+            ss.ple.w.key_codes = (const uint8_t*) wk->data;
+            ss.ple.w.key_scales = (const float*) ((const uint8_t*) wk->data + wk->codes_bytes);
+        }
+        if (o.native_ple_key && wk->quantized()) {
+            if (!wk->native_data || (wk->native_type != 42 && wk->native_type != 18 && wk->native_type != 23 &&
+                                     wk->native_type != 8) || !wk->native_q8_1) {
+                std::fprintf(stderr, "strata generate: native PLE key is absent or incompatible\n");
+                return false;
+            }
+            ss.ple.w.key_native_data = wk->native_data;
+            ss.ple.w.key_native_type = wk->native_type;
+            ss.ple.w.key_native_q8_1 = wk->native_q8_1;
+        }
+        ss.ple.w.value_bf16 = (const uint16_t*) wv->data;
+        ss.ple.w.norm_key = (const float*) wnk->data;
+        ss.ple.w.norm_query = (const float*) wnq->data;
+        ss.ple.w.norm_conv = (const float*) wnc->data;
+        // The conv1d kernel reads F16, so this cast is a claim about the pack's storage.  A checkpoint that keeps
+        // the tensor F32 (Q8_0, UD-Q4_K_XL) would hand the kernel the low halves of the f32 words - not an error,
+        // a plausible wrong layer-1 routing.  tools/iq_pack.py narrows it (index kind 3); a pack that did not is
+        // refused here (#255, gopinath87607).  F16 is index kind 5 or 3 (F16InF32) in a native pack and kind 0
+        // (verbatim 2-byte F16) in the canonical Q2_0 pack; BF16 (kind 4) has the same size and is not F16.
+        const bool f16 = wc->kind == strata::core::WeightKind::F16InF32 ||
+                         (wc->kind == strata::core::WeightKind::Verbatim && wc->code_bits == 0);
+        if (!f16 || wc->bytes != (uint64_t) wc->elements * 2) {
+            std::fprintf(stderr, "strata generate: blk.1.ple_conv1d.weight is not stored as F16 (pack index kind %d, "
+                                 "%llu B for %lld values); the PLE conv1d kernel reads F16 - repack with "
+                                 "tools/iq_pack.py\n",
+                         (int) wc->kind, (unsigned long long) wc->bytes, (long long) wc->elements);
+            return false;
+        }
+        ss.ple.w.conv1d_f16 = (const uint16_t*) wc->data;
+        return true;
+    };
     strata::kernels::PleTable ple_table;
     bool ple_lock_by_policy = false;   // the table was locked in RAM by the residency policy (not by --ple-io ram): #4518 may give the lock back
     std::vector<float> ple_emb_host((size_t) strata::kernels::NG_N_EMBD);
@@ -5548,63 +5608,8 @@ int main(int argc, char** argv) {
                                  "(STRATA_SSD_KEEPALIVE=0 turns it off)\n", pio.keepalive_ms, pio.keepalive_window_s);
         else if (pio.mode == strata::kernels::PleIo::Direct)
             std::fprintf(stderr, "strata generate: SSD keep-alive off: the SSD may fall asleep between reads\n");
-        const strata::core::WeightRef* wk = wt.find("blk.1.ple_key.weight");
-        const strata::core::WeightRef* wv = wt.find("blk.1.ple_value.weight");
-        const strata::core::WeightRef* wnk = wt.find("blk.1.ple_norm_key.weight");
-        const strata::core::WeightRef* wnq = wt.find("blk.1.ple_norm_query.weight");
-        const strata::core::WeightRef* wnc = wt.find("blk.1.ple_norm_conv.weight");
-        const strata::core::WeightRef* wc = wt.find("blk.1.ple_conv1d.weight");
-        if (!wk || !wv || !wnk || !wnq || !wnc || !wc) {
-            std::fprintf(stderr, "strata generate: the pack has no blk.1.ple_* tensors, so the PLE cannot be "
-                                 "wired - and running without it is a DIFFERENT MODEL (LEDGER L123)\n");
-            return 1;
-        }
-        // `ple_key` is S2 and the loader has already widened its scales to f32, so the two planes are located
-        // by the sizes the `WeightRef` records rather than re-derived - the same rule `plane_ptrs` follows.
-        if (!wk->quantized()) {
-            // plan v0.3 P6: the IQ model files' BF16 key (the pack's extra.bin, raw BF16)
-            ss.ple.w.key_bf16 = (const uint16_t*) wk->data;
-        } else if (wk->data != nullptr) {
-            ss.ple.w.key_codes = (const uint8_t*) wk->data;
-            ss.ple.w.key_scales = (const float*) ((const uint8_t*) wk->data + wk->codes_bytes);
-        }
-        if (o.native_ple_key && wk->quantized()) {
-            if (!wk->native_data || (wk->native_type != 42 && wk->native_type != 18 && wk->native_type != 23 &&
-                                     wk->native_type != 8) || !wk->native_q8_1) {
-                std::fprintf(stderr, "strata generate: native PLE key is absent or incompatible\n");
-                return 1;
-            }
-            ss.ple.w.key_native_data = wk->native_data;
-            ss.ple.w.key_native_type = wk->native_type;
-            ss.ple.w.key_native_q8_1 = wk->native_q8_1;
-        }
-        ss.ple.w.value_bf16 = (const uint16_t*) wv->data;
-        ss.ple.w.norm_key = (const float*) wnk->data;
-        ss.ple.w.norm_query = (const float*) wnq->data;
-        ss.ple.w.norm_conv = (const float*) wnc->data;
-        // The conv1d kernel reads F16, so this cast is a claim about the pack's storage.  A checkpoint that keeps
-        // the tensor F32 (Q8_0, UD-Q4_K_XL) would hand the kernel the low halves of the f32 words - not an error,
-        // a plausible wrong layer-1 routing.  tools/iq_pack.py narrows it (index kind 3); a pack that did not is
-        // refused here (#255, gopinath87607).  F16 is index kind 5 or 3 (F16InF32) in a native pack and kind 0
-        // (verbatim 2-byte F16) in the canonical Q2_0 pack; BF16 (kind 4) has the same size and is not F16.
-        const bool f16 = wc->kind == strata::core::WeightKind::F16InF32 ||
-                         (wc->kind == strata::core::WeightKind::Verbatim && wc->code_bits == 0);
-        if (!f16 || wc->bytes != (uint64_t) wc->elements * 2) {
-            std::fprintf(stderr, "strata generate: blk.1.ple_conv1d.weight is not stored as F16 (pack index kind %d, "
-                                 "%llu B for %lld values); the PLE conv1d kernel reads F16 - repack with "
-                                 "tools/iq_pack.py\n",
-                         (int) wc->kind, (unsigned long long) wc->bytes, (long long) wc->elements);
-            return 1;
-        }
-        ss.ple.w.conv1d_f16 = (const uint16_t*) wc->data;
-        ss.ple.consts = ple_consts_run;
-        for (int h = 0; h < strata::kernels::PLE_N_HEADS; ++h) {   // the hash may only reach rows the table has
-            if (ple_consts_run.offset[h] + ple_consts_run.vocab[h] > ple_table.rows()) {
-                std::fprintf(stderr, "strata generate: PLE head %d reaches row %llu but the table has %llu rows (the model file's hash constants do not fit its PLE table)\n",
-                             h, (unsigned long long) (ple_consts_run.offset[h] + ple_consts_run.vocab[h]), (unsigned long long) ple_table.rows());
-                return 1;
-            }
-        }
+        if (!wire_ple(wt)) return 1;
+        ss.ple.consts = strata::kernels::ple_artifact_consts();
         if (o.ple_delay_us > 0) ple_table.set_injected_delay_us(o.ple_delay_us);
         ss.ple.table = &ple_table;
         ss.ple.token = &ss.ple_token;
@@ -5844,6 +5849,8 @@ int main(int argc, char** argv) {
             }
             return false;
         }
+        st.arena = arena_s;
+        st.arena_bytes = pool_bytes;
         if (!o.native_dense_gguf.empty() && !st.dense.load(o.native_dense_gguf, st.wt, err, o.native_ple_key)) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d native dense projections: %s\n", st.dev,
                          err.c_str());
@@ -6097,6 +6104,41 @@ int main(int argc, char** argv) {
         rin.pipe_snap_mib = kPipeSnapMib;
         return strata::program::stage_reserve::room_bytes((int64_t) fb, rin);
     };
+    // ---- TRIMMED STAGE WEIGHTS (the default with a split, --no-trim-stage-weights: off).  Every card has just
+    // loaded the dense weights of all the layers and runs only its own: once the split is known each one reloads
+    // its own layers' (below), and the search counts what that frees towards the card's expert cache.  On a 4060
+    // Ti + 5080 with Swift 1.5 IQ3_XXS at K=20 that was 1.9 + 1.3 GiB, 2,174 more cached experts and none left to
+    // read from the files: 98 -> 131 tok/s on code at a 32K context, its prompt 1,006 -> 1,978 tok/s.
+    const bool trim = o.trim_stage_weights && multi_gpu && !stages.empty();
+    std::vector<std::vector<std::string>> layer_rows((size_t) g.n_layers);   // the arena's blk.<l>. rows
+    std::vector<int64_t> trim_prefix((size_t) g.n_layers + 1, 0);           // the bytes of layers [0, l)
+    if (trim) {
+        if (std::FILE* f = std::fopen((o.pack + "/index.txt").c_str(), "rb")) {
+            char line[1024], name[256];
+            while (std::fgets(line, sizeof line, f))
+                if (line[0] != '#' && std::sscanf(line, "%255s", name) == 1 && std::strncmp(name, "blk.", 4) == 0 &&
+                    !skip.count(name)) {
+                    const long l = std::strtol(name + 4, nullptr, 10);
+                    if (l >= 0 && l < g.n_layers) layer_rows[(size_t) l].push_back(name);
+                }
+            std::fclose(f);
+        }
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            std::set<std::string> without = skip;
+            without.insert(layer_rows[(size_t) l].begin(), layer_rows[(size_t) l].end());
+            uint64_t rest = pool_bytes;
+            if (!strata::core::WeightTable::pool_bytes(o.pack, rest, err, &without)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+            trim_prefix[(size_t) l + 1] = trim_prefix[(size_t) l] + (int64_t) (pool_bytes - rest) +
+                                          (int64_t) native_dense.bytes_in(l, l + 1);
+        }
+    }
+    // what a stage that runs [lb, le) frees by trimming (until then every card holds every layer)
+    auto trim_frees = [&](int64_t lb, int64_t le) -> int64_t {
+        return trim ? trim_prefix[(size_t) g.n_layers] - (trim_prefix[(size_t) le] - trim_prefix[(size_t) lb]) : 0;
+    };
     if (multi_gpu && split_auto) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         const int ns = (int) stages.size() + 1;
@@ -6213,7 +6255,7 @@ int main(int argc, char** argv) {
             for (int i = 0; i < ns; ++i) {
                 const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1];
                 const int64_t le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
-                capr[(size_t) i] = stage_left(i, lb, le);
+                capr[(size_t) i] = stage_left(i, lb, le) + trim_frees(lb, le);
             }
             std::fill(used.begin(), used.end(), 0);
             std::fill(held_cnt.begin(), held_cnt.end(), 0);
@@ -6235,6 +6277,22 @@ int main(int argc, char** argv) {
                 ++held_cnt[(size_t) st];
             }
             held_mass /= std::max(total_mass, 1e-9);
+            // --pipeline-windows 2 on two stages: the stages overlap, so a window costs about the slower stage,
+            // and a stage's CPU misses wait on that stage.  The last one also runs the head and the draft chain
+            // the next window waits for: ~4 ms on an RTX 5080, about 12 of its layers.  (A sum of the stages put
+            // 2 of 48 layers on the first card of a 4060 Ti + 5080 pair and left most of its VRAM idle: 29 tok/s
+            // against 165 at K=20.  From Strata-DualGPU, adapted to keep this tree's per-link miss scaling.)
+            if (o.pipeline_windows >= 2 && ns == 2) {
+                double slowest = 0.0;
+                for (int i = 0; i < ns; ++i) {
+                    const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1], le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
+                    const double gpu = (double) (le - lb + (i + 1 == ns ? 12 : 0)) * layer_ms[(size_t) i];
+                    slowest = std::max(slowest, gpu + miss_ms * link_scale[(size_t) i] *
+                                       std::max(0.0, mass_i[(size_t) i] - held_i[(size_t) i]) /
+                                       std::max(total_mass, 1e-9));
+                }
+                return slowest;
+            }
             // Each stage's misses on its own link (link_scale; 1.0 everywhere = the fitted single-constant formula).
             double ms = 0.0;
             for (int i = 0; i < ns; ++i)
@@ -6684,6 +6742,55 @@ int main(int argc, char** argv) {
                          (long long) split_at[i], (long long) (g.n_layers - 1));
             return 2;
         }
+    // ---- the trimmed stage weights (see above): each card reloads only its own layers' dense weights.  Nothing
+    // holds a pointer into the old copies yet but the PLE's six layer-1 weights, which are wired again.
+    if (trim) {
+        auto reload = [&](int dev, int64_t lo, int64_t hi, void*& base, uint64_t& base_bytes,
+                          strata::core::WeightTable& table, strata::core::NativeDense& dense) -> bool {
+            const strata::core::OnDevice on(dev);
+            std::set<std::string> sk = skip;
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                if (l < lo || l >= hi) sk.insert(layer_rows[(size_t) l].begin(), layer_rows[(size_t) l].end());
+            uint64_t bytes = 0;
+            if (!strata::core::WeightTable::pool_bytes(o.pack, bytes, err, &sk)) return false;
+            dense.release();
+            // the process-wide range that `load` also reads may be stale from an earlier stage's
+            // set_layer_range (an explicit split loads its later stages eagerly): reset it to ours
+            strata::core::NativeDense::set_layer_range((int) lo, (int) hi);
+            table = strata::core::WeightTable{};
+            cudaFree(base);
+            base = nullptr;
+            if (cudaMalloc(&base, bytes) != cudaSuccess) {
+                cudaGetLastError();
+                err = "the trimmed weight arena could not be allocated";
+                return false;
+            }
+            base_bytes = bytes;
+            return table.load(o.pack, base, bytes, err, &sk) &&
+                   (o.native_dense_gguf.empty() ||
+                    dense.load(o.native_dense_gguf, table, err, o.native_ple_key, lo, hi));
+        };
+        const int64_t before = trim_prefix[(size_t) g.n_layers];
+        std::string kept;
+        // CUDA0 only: the later stages' trimmed weights are loaded by upstream's `late_weights` loop below
+        // (which also verifies the split search's pricing), and this block runs before it - reloading them
+        // here too would leave `native dense: already loaded`.
+        {
+            const int64_t lo = 0, hi = split_at.empty() ? g.n_layers : split_at[0];
+            const bool ok = reload(0, lo, hi, arena, pool_bytes, wt, native_dense) &&
+                            (o.ple_gguf.empty() || wire_ple(wt));
+            if (!ok) {
+                std::fprintf(stderr, "strata generate: layer split, CUDA0: its own layers' weights: %s\n",
+                             err.c_str());
+                return 1;
+            }
+            kept += std::string("CUDA0 ") + std::to_string(lo) + "-" + std::to_string(hi - 1) + " (" +
+                    std::to_string(trim_frees(lo, hi) >> 20) + " MiB freed)";
+        }
+        std::fprintf(stderr, "strata generate: layer split: CUDA0 keeps only its own layers' dense weights "
+                             "(%.2f GiB in all): %s (the later cards trim in late_weights)\n",
+                     (double) before / 1073741824.0, kept.c_str());
+    }
     // the stage that runs a layer (0: CUDA0's)
     auto stage_of = [&](int64_t l) -> int {
         int st = 0;
@@ -7896,12 +8003,22 @@ int main(int argc, char** argv) {
     const bool auto_cache = o.expert_cache < 0;
     bool reserve_adapted = false;   // #496: the auto sizing lowered the reserve so a small card's cache fits
     // --pipeline-windows: what it allocates on CUDA0 after the cache (see kPipeWindowMib)
-    const int64_t pipe_first = o.pipeline_windows <= 0 ? 0
-        : (kPipeWindowMib << 20) + (o.pipeline_windows >= 2 ? 2 * (int64_t) gdn_snapshot_bytes(ss) : 0);
+    // LOCAL: pipe_first subtracted here steals ~247 MiB from the expert cache, which cascades into a
+    // shrink (0 MiB free → #841 retries → hundreds of slots lost). The fork (Strata-DualGPU) does not
+    // pre-reserve this; it sizes the cache first and lets pipeline-windows take what remains. We do the
+    // same here: the cache gets the maximum, and pw2 allocates after it (it already has its own OOM
+    // error paths). STRATA_PIPE_FIRST=1 restores the old behaviour.
+    const bool pipe_first_asked = [] { const char* v = std::getenv("STRATA_PIPE_FIRST"); return v != nullptr && std::atoi(v) != 0; }();
+    const int64_t pipe_first = pipe_first_asked ? (o.pipeline_windows <= 0 ? 0
+        : (kPipeWindowMib << 20) + (o.pipeline_windows >= 2 ? 2 * (int64_t) gdn_snapshot_bytes(ss) : 0)) : 0;
     if (pipe_first > 0)
         std::fprintf(stderr, "strata generate: --pipeline-windows %d: %lld MiB of CUDA0 kept out of the expert cache "
                              "(the second verifier%s)\n", o.pipeline_windows, (long long) (pipe_first >> 20),
                      o.pipeline_windows >= 2 ? ", the GDN snapshots" : "");
+    else if (o.pipeline_windows > 0 && !pipe_first_asked)
+        std::fprintf(stderr, "strata generate: --pipeline-windows %d: the expert cache is sized first; the second "
+                             "verifier and the GDN snapshots allocate after it (LOCAL, STRATA_PIPE_FIRST=1 restores)\n",
+                     o.pipeline_windows);
     // The MiB the prompt path's OWN buffers (no loan) take, which the cache sizing leaves out.  0.1.39's rule is
     // 160 + chunk * 680 / 1024 (~16 GiB at 24576 against ~2.4 GiB really allocated); STRATA_OWNED_PRICE=exact prices the
     // real allocation instead (Prefill::bytes_needed_owned: 2 MiB pages, the ring in one piece, as PR #796 measured)
@@ -8410,13 +8527,58 @@ int main(int argc, char** argv) {
             // short by (want - free); a figure of 0 only says "at least": the first two such reads give back 1 GiB
             // each (under WDDM the free figure read before the allocation runs ~0.7 GiB high), later ones a quarter
             int64_t give = want - (int64_t) free_b + (64ll << 20);
-            if (free_b < ((size_t) 16 << 20))
-                give = std::max<int64_t>(give, ++zero_reads <= 2 ? 1ll << 30 : xcache.bytes() / 4);
+            // LOCAL: the 1 GiB WDDM correction over-shrinks on 16 GB cards where every slot counts. Cap it
+            // at 256 MiB (the measured WDDM overshoot on this rig is ~300-700 MiB, not 1 GiB), and let the
+            // loop iterate if the first correction was not enough. STRATA_SHRINK_1G=1 restores the old floor.
+            if (free_b < ((size_t) 16 << 20)) {
+                const bool old_floor = [] { const char* v = std::getenv("STRATA_SHRINK_1G"); return v != nullptr && std::atoi(v) != 0; }();
+                give = std::max<int64_t>(give, old_floor
+                               ? (++zero_reads <= 2 ? 1ll << 30 : xcache.bytes() / 4)
+                               : (256ll << 20));
+            }
             const int64_t keep_bytes = xcache.bytes() - give;
             std::fprintf(stderr, "strata generate: only %lld MiB free once the slots are written (reserve %d MiB); "
                                  "shrinking the expert cache\n", (long long) (free_b >> 20), o.vram_reserve_mib);
             xcache.close();
             if (!shrink_to(keep_bytes)) break;
+        }
+        // LOCAL: after the shrink loop, if the free VRAM is still comfortably above the reserve,
+        // the shrink over-corrected - grow the cache to use the surplus (the fork's mechanism
+        // effectively does this by starting from a bigger allocation and shrinking less).
+        // STRATA_NO_GROW=1 turns it off.
+        if (auto_cache && o.expert_cache > 0 && !profile.empty()) {
+            static const bool no_grow = [] { const char* v = std::getenv("STRATA_NO_GROW"); return v != nullptr && std::atoi(v) != 0; }();
+            if (!no_grow) {
+                size_t fb = 0, tb = 0;
+                cudaMemGetInfo(&fb, &tb);
+                const int64_t surplus = (int64_t) fb - (((int64_t) o.vram_reserve_mib + 256) << 20);
+                if (surplus > (256ll << 20)) {
+                    const int64_t blob0 = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+                    const int64_t extra = surplus / blob0;
+                    const int64_t want_slots = (int64_t) o.expert_cache + extra;
+                    if (want_slots > o.expert_cache && want_slots <= (int64_t) profile.size()) {
+                        xcache.close();
+                        sized_slots.clear();
+                        for (const auto& pr : profile) {
+                            if ((int64_t) sized_slots.size() >= want_slots) break;
+                            sized_slots.push_back((int64_t) nib::slot_bytes(pr.first));
+                        }
+                        const int before = o.expert_cache;
+                        o.expert_cache = (int) sized_slots.size();
+                        std::string grow_err;
+                        if (xcache.open_sized(sized_slots, g.n_layers, g.n_expert, grow_err)) {
+                            cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
+                            cudaDeviceSynchronize();
+                            std::fprintf(stderr, "strata generate: LOCAL grow: %lld MiB surplus -> %d slots (was %d)\n",
+                                         (long long) (surplus >> 20), o.expert_cache, before);
+                        } else {
+                            o.expert_cache = before;
+                            std::fprintf(stderr, "strata generate: LOCAL grow failed (%s); keeping the shrunk size\n",
+                                         grow_err.c_str());
+                        }
+                    }
+                }
+            }
         }
         if (failed > 0 && o.expert_cache > 0)
             std::fprintf(stderr, "strata generate: expert cache: %d slots (%.2f GiB) after %d smaller tries - a bigger "
@@ -8587,8 +8749,19 @@ int main(int argc, char** argv) {
         GpuStage& st = *stp;
         const auto& lay = strata::kernels::cpu::expert_layout();
         // the drafter and the head are already allocated by now (they load above, before this), so what is left
-        // to hold back is the windows - and `free_b` has already lost the drafter.
-        int64_t room = stage_room(st.dev, true, false);
+        // to hold back is the windows - and `free_b` has already lost the drafter.  Not the draft head and its
+        // logits: the drafter allocates them when it binds, after this, as on one GPU (#199), so on the last stage
+        // they come out of the cache here.  Out of the reserve instead, a later card without a display (300 MiB)
+        // had no room left for them: "mtp: the draft head does not fit" on two 16 GB cards.  (Strata-DualGPU)
+        const int64_t draft_head = (&st == last_st && !o.mtp.empty() && st.head.loaded())
+                                       ? (int64_t) mtp.bind_bytes(st.head.row_bytes(), n_vocab) : 0;
+        // LOCAL: the layer-major super-chunk's device buffers are cudaMalloc'd at prompt time, after the
+        // caches and the session/windows; if the cache fills the card they cannot fit and the walk declines.
+        // Measured on this rig (5080+4060Ti, IQ2_XS, 64K): the super-chunk needs ~1.1 GiB free on the last
+        // card after everything else is loaded; the session+windows+verifiers eat ~500 MiB on top of the
+        // cache, so the cache must leave ~1.5 GiB to end at ~1.1 GiB.  Constant: our local fork only.
+        const int64_t lm_reserve = &st == last_st ? (int64_t) 0 : 0;   // LOCAL: the session expands to fill whatever the cache leaves; reserving here does not engage layer-major
+        int64_t room = stage_room(st.dev, true, false) - draft_head - lm_reserve;
         const strata::core::OnDevice on(st.dev);
 #if defined(STRATA_HAVE_DFLASH2)
         // DFlash2's own draft head and logits (and, in serve, the prompt staging) are bound on its card AFTER the caches, as the single card prices them (mtp_bind above): without
@@ -9000,7 +9173,12 @@ int main(int argc, char** argv) {
         std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
         bool ok = true;
         for (int64_t l = 0; l < g.n_layers && ok; ++l) {
-            const strata::core::WeightRef* w = wt.find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
+            const strata::core::WeightTable* owner = &wt;   // the card that runs the layer holds its router
+            int owner_dev = 0;
+            for (const auto& st : stages)
+                if (l >= st->lb && l < st->le) { owner = &st->wt; owner_dev = st->dev; }
+            const strata::core::OnDevice on_owner(owner_dev);
+            const strata::core::WeightRef* w = owner->find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
             ok = w != nullptr && w->kind == strata::core::WeightKind::Bf16InF32 &&
                  w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 2;
             if (!ok) break;
@@ -11525,11 +11703,15 @@ int main(int argc, char** argv) {
                 const char* v = std::getenv("STRATA_SPLIT_OVERLAP");
                 return v != nullptr && std::atoi(v) != 0;
             }();
-            // --pipeline-windows (#859) runs its own overlapped loop with its own hand-offs: the two do not mix
+            // --pipeline-windows (#859) overlaps consecutive windows; STRATA_SPLIT_OVERLAP overlaps the stages
+            // within each window.  They address different waits and compose: the handoff flags remove the host
+            // sync between stage 0 and stage 1 of the same window, while pipeline-windows runs window K+1 on
+            // stage 0 while stage 1 still verifies K.  (Strata-DualGPU runs both at once; its XSTAGE measured
+            // code 95 -> 108 tok/s on a 5080 + 4060 Ti from this alone.)
+            // LOCAL finding: STRATA_SPLIT_OVERLAP beside --pipeline-windows needs the fork's run() decomposition
+            // (prepare/launch/serve/finish) to compose - the flags alone create a second sync that fights the
+            // pipeline loop's own stage management (measured 56.0 vs 76.9 tok/s with them off on this rig).
             const bool overlap = overlap_asked && !split_same && o.pipeline_windows == 0;
-            if (overlap_asked && o.pipeline_windows > 0)
-                std::fprintf(stderr, "strata serve: STRATA_SPLIT_OVERLAP is off beside --pipeline-windows %d "
-                                     "(that loop overlaps the stages itself)\n", o.pipeline_windows);
             std::vector<uint32_t*> hflag_h((size_t) n_stages - 1, nullptr), hflag_d((size_t) n_stages - 1, nullptr);
             if (overlap)
                 for (size_t i = 0; i < hflag_h.size(); ++i) {
@@ -11601,6 +11783,18 @@ int main(int argc, char** argv) {
         // --pipeline-windows: the odd windows' verifiers and their hand-off (initialized before `ver`, which stays the
         // watchdog's verifier), and the drafter's own row buffer, which either parity's rows are copied into
         float* pl_mtp_R = nullptr;
+        // LOCAL: with pipeline-windows + STRATA_SPLIT_OVERLAP, the ODD parity verifiers need handoff flags too
+        std::vector<uint32_t*> hflag_b_h((size_t) n_stages - 1, nullptr), hflag_b_d((size_t) n_stages - 1, nullptr);
+        const bool overlap_b = [] { const char* v = std::getenv("STRATA_SPLIT_OVERLAP"); return v != nullptr && std::atoi(v) != 0; }() && !split_same;
+        if (overlap_b)
+            for (size_t i = 0; i < hflag_b_h.size(); ++i) {
+                if (cudaHostAlloc((void**) &hflag_b_h[i], 64, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                    cudaHostGetDevicePointer((void**) &hflag_b_d[i], hflag_b_h[i], 0) != cudaSuccess) {
+                    std::fprintf(stderr, "strata serve: the odd-parity hand-off flag allocation failed\n");
+                    return 1;
+                }
+                std::memset(hflag_b_h[i], 0, 64);
+            }
         if (pipe) {
             const size_t hb = (size_t) strata::kernels::kVerifyNarrowT *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
@@ -11615,6 +11809,15 @@ int main(int argc, char** argv) {
                 std::memset(hh, 0, hb);
             }
             ver_b.set_stage(0, split_at[0], nullptr, hand_b[0]);
+            // LOCAL: the odd parity's handoff flags BEFORE init (the counter hcount_d_ is only allocated
+            // during init when the flags are already set; setting them after leaves it null → crash)
+            if (overlap_b)
+                for (int st = 0; st < n_stages; ++st)
+                    stage_ver_p(st, 1).set_handoff_flags(
+                        st == 0 ? nullptr : hflag_b_h[(size_t) st - 1],
+                        st == 0 ? nullptr : hflag_b_d[(size_t) st - 1],
+                        st + 1 < n_stages ? hflag_b_h[(size_t) st] : nullptr,
+                        st + 1 < n_stages ? hflag_b_d[(size_t) st] : nullptr);
             for (int st = 1; st < n_stages; ++st) {
                 GpuStage& gs = *stages[(size_t) st - 1];
                 const bool last = st + 1 == n_stages;
