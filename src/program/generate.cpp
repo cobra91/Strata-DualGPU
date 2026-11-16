@@ -8232,8 +8232,14 @@ int main(int argc, char** argv) {
 #endif
                         if (stages.empty())
                             for (const auto& d : slot_mtp) mtp_b += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
-                        const int64_t pipe_b = o.pipeline_windows <= 0 ? 0
-                            : (kPipeWindowMib << 20) + (o.pipeline_windows >= 2 ? 2 * (int64_t) gdn_snapshot_bytes(ss) : 0);
+                        // Size the expert cache first: pipeline-windows' second verifier and GDN snapshots
+                        // have their own OOM error paths and allocate after the cache. Pre-reserving their
+                        // bytes here steals ~247 MiB from the cache on a two-card split, which cascades into
+                        // a shrink (0 MiB free -> retries -> hundreds of slots lost). STRATA_PIPE_FIRST=1
+                        // restores the old pre-reserve.
+                        const bool pipe_first_asked = [] { const char* v = std::getenv("STRATA_PIPE_FIRST"); return v != nullptr && std::atoi(v) != 0; }();
+                        const int64_t pipe_b = pipe_first_asked && o.pipeline_windows > 0
+                            ? (kPipeWindowMib << 20) + (o.pipeline_windows >= 2 ? 2 * (int64_t) gdn_snapshot_bytes(ss) : 0) : 0;
                         const int64_t room = (int64_t) strata::core::device_free_bytes() -
                                              ((((int64_t) o.vram_reserve_mib + pf_mib) << 20) + mtp_b + pipe_b);
                         cap_bytes = room > 0 ? (uint64_t) room : 0;
