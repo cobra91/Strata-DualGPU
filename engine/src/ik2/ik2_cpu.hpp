@@ -63,4 +63,16 @@ struct ExpertJob {
 };
 void post_expert(Pool& pool, ExpertJob* job, int C, int F, float gcap, float ucap);
 
+// A layer's CPU experts at once (IK2_DEVPLAN's service thread): gate / up rows of all of them in 64-row tasks, the
+// activation, then down's rows, on a pool of threads that spin between calls (spin_start) and the caller
+struct BatchJob {
+    const uint8_t *gate = nullptr, *up = nullptr, *down = nullptr;
+    int tg = 40, tu = 40, td = 40;
+    const float* x = nullptr;
+    float sg = 1.0f, su = 1.0f;
+    float* y = nullptr;   // [C]
+};
+void spin_start(int workers);
+void experts_batch(const BatchJob* J, int n, int C, int F, float gcap, float ucap);
+
 }  // namespace ik2::cpu

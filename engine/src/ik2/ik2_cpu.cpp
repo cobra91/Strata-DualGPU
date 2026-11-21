@@ -299,6 +299,88 @@ void rows(int type, const uint8_t* W, int K, int r0, int r1, const float* x, flo
     nvfp4_rows(W, K, r0, r1, x, out);
 }
 
+namespace {
+// The spin pool's state is one 64-bit word, generation << 32 | next task: a task is claimed by compare-and-swap only
+// while the word carries the claimer's generation (a worker late from a run never takes or skips one of the next),
+// the runs' descriptions in a ring of 4 by generation.
+struct SpinRun { void (*fn)(int, void*) = nullptr; void* ctx = nullptr; int n = 0; };
+struct SpinPool {
+    std::vector<std::thread> th;
+    std::atomic<uint64_t> state{0};
+    std::atomic<int> done{0};
+    uint32_t gen = 0;
+    SpinRun run[4];
+    bool started = false;
+} g_spin;
+void spin_claim(uint32_t g) {
+    uint64_t v = g_spin.state.load(std::memory_order_acquire);
+    for (;;) {
+        if ((uint32_t) (v >> 32) != g) return;
+        const SpinRun& r = g_spin.run[g & 3];
+        const int i = (int) (uint32_t) v;
+        if (i >= r.n) return;
+        if (g_spin.state.compare_exchange_weak(v, v + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            r.fn(i, r.ctx);
+            g_spin.done.fetch_add(1, std::memory_order_release);
+            v = g_spin.state.load(std::memory_order_acquire);
+        }
+    }
+}
+void spin_run(int n, void (*fn)(int, void*), void* ctx) {
+    const uint32_t g = ++g_spin.gen;
+    g_spin.run[g & 3] = SpinRun{fn, ctx, n};
+    g_spin.done.store(0, std::memory_order_relaxed);
+    g_spin.state.store((uint64_t) g << 32, std::memory_order_release);
+    spin_claim(g);
+    while (g_spin.done.load(std::memory_order_acquire) < n) _mm_pause();
+}
+template <class F>
+void spin_for(int n, F f) {
+    spin_run(n, [](int i, void* c) { (*static_cast<F*>(c))(i); }, &f);
+}
+}  // namespace
+
+void spin_start(int workers) {
+    if (g_spin.started) return;
+    g_spin.started = true;
+    for (int w = 0; w < workers; ++w)
+        g_spin.th.emplace_back([] {
+            uint32_t seen = (uint32_t) (g_spin.state.load() >> 32);
+            for (;;) {
+                uint32_t g;
+                while ((g = (uint32_t) (g_spin.state.load(std::memory_order_acquire) >> 32)) == seen) _mm_pause();
+                seen = g;
+                spin_claim(g);
+            }
+        });
+    for (auto& t : g_spin.th) t.detach();
+}
+void experts_batch(const BatchJob* J, int n, int C, int F, float gcap, float ucap) {
+    if (n <= 0) return;
+    static std::vector<float> gu;
+    if (gu.size() < (size_t) n * 2 * F) gu.resize((size_t) n * 2 * F);
+    constexpr int RP = 64;
+    const int pa = 2 * F / RP, pc = C / RP, pb = (F + 127) / 128;
+    spin_for(n * pa, [&](int i) {   // gate's rows [0, F), up's [F, 2F)
+        const int j = i / pa, r0 = (i % pa) * RP;
+        float* g = gu.data() + (size_t) j * 2 * F;
+        if (r0 < F) rows(J[j].tg, J[j].gate, C, r0, r0 + RP, J[j].x, g + r0);
+        else rows(J[j].tu, J[j].up, C, r0 - F, r0 - F + RP, J[j].x, g + r0);
+    });
+    spin_for(n * pb, [&](int i) {   // the activation in place of gate's rows
+        const int j = i / pb, f0 = (i % pb) * 128, f1 = std::min(F, f0 + 128);
+        float* g = gu.data() + (size_t) j * 2 * F;
+        for (int f = f0; f < f1; ++f) {
+            const float a = g[f] * J[j].sg, u = g[F + f] * J[j].su;
+            g[f] = gcap * std::tanh(a / gcap) * (1.0f / (1.0f + std::exp(-a))) * ucap * std::tanh(u / ucap);
+        }
+    });
+    spin_for(n * pc, [&](int i) {   // down's rows
+        const int j = i / pc, r0 = (i % pc) * RP;
+        rows(J[j].td, J[j].down, F, r0, r0 + RP, gu.data() + (size_t) j * 2 * F, J[j].y + r0);
+    });
+}
+
 void post_expert(Pool& pool, ExpertJob* job, int C, int F, float gcap, float ucap) {
     job->gu.resize((size_t) 2 * F);
     job->h.resize(F);

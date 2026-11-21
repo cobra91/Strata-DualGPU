@@ -1071,6 +1071,17 @@ struct ExpertCache {
         rebuild_free(P);
         return P.data + (size_t) s0 * P.slot_bytes;
     }
+    // slot s of pool p holds expert key now (IK2_DEVPLAN's copies written back), at the main queue's tail
+    void assign(int p, int s, int key, uint64_t t) {
+        Pool& P = pools[p];
+        if (P.owner[s] >= 0) loc[P.owner[s]] = -1;
+        unlink(P, s);
+        P.owner[s] = key;
+        loc[key] = s;
+        P.used[s] = t, P.sseq[s] = 0, P.freq[s] = 1;
+        push_back(P, 2, s);
+    }
+    void refree(int p) { rebuild_free(pools[p]); }
     void give_back(int p) {
         Pool& P = pools[p];
         P.n_active = P.n_slots - P.kv_res;
@@ -2362,6 +2373,287 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// IK2_DEVPLAN (default on with the CPU lane on one GPU, the experts streamed): a decode token's layers are enqueued
+// without the host waiting for each one's routing.  After the router, k_dp_plan decides on the GPU which picks are in
+// the cache (g_dp.tab: an expert's slot or null, from the cache's state), fills the expert kernels' tables (a miss: a
+// null blob, skipped) and writes the picks and the MoE input to a mapped host record; a host thread (dp_service)
+// computes the misses on the CPU lane into mapped rows and raises a counter; k_dp_wait waits for it only when the CPU
+// owes rows, k_dp_merge puts them in, the combine follows.  The cache does not change during such tokens.
+struct DevPlan {
+    bool want = true, ok = false, dirty = true;
+    std::thread th;
+    std::atomic<bool> run{false};
+    int R = 64, K = 0, C = 0, F = 0;
+    size_t rec_bytes = 0;
+    uint8_t *rec_h = nullptr, *rec_d = nullptr;   // mapped [R] records: int seq, l, ids [16], flags [16], pad; x [C]
+    float *ey_h = nullptr, *ey_d = nullptr;       // mapped [R][16][C]: the CPU's rows
+    volatile int* ctl = nullptr;                  // mapped: [0] planned (GPU), [1] done (GPU), [2] served (host)
+    int* ctl_d = nullptr;
+    int* seqd = nullptr;                          // device: [0] the counter, [1] the current
+    const uint8_t** tab = nullptr;                // device [n_layer * E]
+    const uint8_t** blob = nullptr;
+    int *tok = nullptr, *inv = nullptr, *mflag = nullptr;
+    float *sg = nullptr, *su = nullptr, *wt = nullptr;
+    float gcap = 0, ucap = 0;
+    uint64_t cpu_experts = 0, copies = 0, skipped = 0;
+    const Model* M = nullptr;
+    // the cache during such tokens: a mirror of its residency (slot -> key, -2 while a copy is on its way; key -> slot),
+    // recency, and the copies of misses (staged: see dp_advance); written back into the ExpertCache before another
+    // forward (quiesce: 1 asked by the host, 2 done by the service thread)
+    int pool = -1, n_active = 0, E = 0;
+    std::vector<int> owner, loc;
+    std::vector<uint64_t> last;
+    std::vector<char> busy;
+    std::vector<int> changed;
+    uint64_t tick = 0;
+    struct Copy { bool on = false; int s = -1, key = -1, l = 0, e = 0, stage = 0, need = 0; cudaEvent_t ev = nullptr; };
+    static constexpr int kQ = 48;
+    Copy q[kQ];
+    const uint8_t** tsrc = nullptr;   // pinned [kQ][2]: a table entry to copy (the slot, null)
+    std::atomic<int> quiesce{0};
+} g_dp;
+__device__ __forceinline__ int dp_ld_sys(const volatile int* p) {
+    int v;
+    asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+__global__ void k_dp_plan(const int* __restrict__ top, const float* __restrict__ w, const uint8_t* const* __restrict__ tab_l,
+                          int K, int C, const float* __restrict__ x, uint8_t* ring, size_t rec_bytes, int R, int l,
+                          int* seqd, volatile int* ctl, const uint8_t** blob, int* tok, int* inv, float* sg, float* su,
+                          float* wt, int* mflag) {
+    __shared__ int s_seq;
+    if (threadIdx.x == 0) { const int q = seqd[0] + 1; seqd[0] = q; seqd[1] = q; s_seq = q; }
+    __syncthreads();
+    const int seq = s_seq;
+    uint8_t* rec = ring + (size_t) (seq % R) * rec_bytes;
+    int* hd = (int*) rec;
+    float* xr = (float*) (rec + 256);
+    for (int i = threadIdx.x; i < C; i += blockDim.x) xr[i] = x[i];
+    if (threadIdx.x < K) {
+        const int k = threadIdx.x, e = top[k];
+        const uint8_t* p = tab_l[e];
+        blob[k] = p, tok[k] = 0, inv[k] = k, sg[k] = 1.0f, su[k] = 1.0f, wt[k] = w[k];
+        mflag[k] = p == nullptr;
+        hd[2 + k] = e, hd[18 + k] = p == nullptr;
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        hd[1] = l;
+        __threadfence_system();
+        *(volatile int*) &hd[0] = seq;
+        __threadfence_system();
+        ctl[0] = seq;
+    }
+}
+__global__ void k_dp_wait(const int* __restrict__ mflag, int K, const int* __restrict__ seqd, volatile int* ctl) {
+    if (threadIdx.x) return;
+    const int seq = seqd[1];
+    int any = 0;
+    for (int k = 0; k < K; ++k) any |= mflag[k];
+    if (any && dp_ld_sys(ctl + 2) < seq) {
+        unsigned long long t0, t1;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+        while (dp_ld_sys(ctl + 2) < seq) __nanosleep(256);
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
+        ctl[3] += (int) ((t1 - t0) / 1000);   // the GPU's wait for the CPU, us
+        ctl[4] += 1;
+    }
+    __threadfence_system();
+    ctl[1] = seq;
+}
+__global__ void k_dp_merge(float* __restrict__ y, const float* ey, const int* __restrict__ mflag,
+                           const int* __restrict__ seqd, int C, int R) {
+    const int k = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (!mflag[k] || i >= C) return;
+    y[(size_t) k * C + i] = __ldcv(ey + ((size_t) (seqd[1] % R) * 16 + k) * C + i);
+}
+bool g_dp_time = getenv("IK2_DP_TIME") != nullptr;
+double g_dp_t0 = 0, g_dp_t_enq = 0, g_dp_t_tok = 0;
+long g_dp_n = 0;
+bool dp_ready(cudaEvent_t e) {
+    const cudaError_t r = cudaEventQuery(e);
+    if (r == cudaSuccess) return true;
+    if (r != cudaErrorNotReady) CU(r);
+    return false;
+}
+// a copy's stages: 1 the old expert's table entry nulled (on the copy stream), 2 waiting for the GPU to pass every plan
+// that may have read it (its done counter at the planned one + 1, or the GPU idle), 3 the blocks and the new entry
+// queued, done once landed
+void dp_advance(bool idle) {
+    const Model& M = *g_dp.M;
+    ExpertCache& ECr = dev_cache(0);
+    auto& P = ECr.pools[g_dp.pool];
+    for (int qi = 0; qi < DevPlan::kQ; ++qi) {
+        auto& q = g_dp.q[qi];
+        if (!q.on) continue;
+        if (q.stage == 1 && dp_ready(q.ev)) { q.need = g_dp.ctl[0] + 1; q.stage = 2; }
+        if (q.stage == 2 && (idle || g_dp.ctl[1] >= q.need)) {
+            uint8_t* dst = P.data + (size_t) q.s * P.slot_bytes;
+            ECr.copy_in(M.L[q.l], q.e, dst, g_cs);
+            g_dp.tsrc[2 * qi] = dst;
+            CU(cudaMemcpyAsync(g_dp.tab + q.key, g_dp.tsrc + 2 * qi, sizeof(void*), cudaMemcpyHostToDevice, g_cs));
+            CU(cudaEventRecord(q.ev, g_cs));
+            q.stage = 3;
+        } else if (q.stage == 3 && dp_ready(q.ev)) {
+            g_dp.owner[q.s] = q.key;
+            g_dp.loc[q.key] = q.s;
+            g_dp.last[q.s] = g_dp.tick;
+            g_dp.busy[q.key] = 0;
+            g_dp.changed.push_back(q.s);
+            q.on = false;
+            ++g_dp.copies;
+        }
+    }
+}
+void dp_request(int l, int e) {   // a miss: its copy into the least recently used slot not in use
+    const int key = l * g_dp.E + e;
+    if (g_dp.loc[key] >= 0 || g_dp.busy[key]) return;
+    int qi = 0;
+    while (qi < DevPlan::kQ && g_dp.q[qi].on) ++qi;
+    if (qi == DevPlan::kQ) { ++g_dp.skipped; return; }
+    int v = -1;
+    for (int s2 = 0; s2 < g_dp.n_active; ++s2) {
+        if (g_dp.owner[s2] == -2 || g_dp.last[s2] == g_dp.tick) continue;
+        if (g_dp.owner[s2] < 0) { v = s2; break; }
+        if (v < 0 || g_dp.last[s2] < g_dp.last[v]) v = s2;
+    }
+    if (v < 0) return;
+    auto& q = g_dp.q[qi];
+    const cudaEvent_t ev = q.ev;
+    q = DevPlan::Copy{true, v, key, l, e, 1, 0, ev};
+    const int old = g_dp.owner[v];
+    g_dp.owner[v] = -2;
+    g_dp.busy[key] = 1;
+    if (old >= 0) {
+        g_dp.loc[old] = -1;
+        g_dp.tsrc[2 * qi + 1] = nullptr;
+        CU(cudaMemcpyAsync(g_dp.tab + old, g_dp.tsrc + 2 * qi + 1, sizeof(void*), cudaMemcpyHostToDevice, g_cs));
+    }
+    CU(cudaEventRecord(q.ev, g_cs));
+}
+// (the GPU idle) every copy landed, the residency written back into the ExpertCache
+void dp_drain() {
+    for (;;) {
+        bool any = false;
+        for (auto& q : g_dp.q) any |= q.on;
+        if (!any) break;
+        dp_advance(true);
+        CU(cudaStreamSynchronize(g_cs));
+    }
+    ExpertCache& ECr = dev_cache(0);
+    std::sort(g_dp.changed.begin(), g_dp.changed.end());
+    g_dp.changed.erase(std::unique(g_dp.changed.begin(), g_dp.changed.end()), g_dp.changed.end());
+    for (int s2 : g_dp.changed)
+        if (g_dp.owner[s2] >= 0) ECr.assign(g_dp.pool, s2, g_dp.owner[s2], ++ECr.tick);
+    ECr.refree(g_dp.pool);
+    g_dp.changed.clear();
+}
+// the host's side: each record in order, its misses on the CPU lane, then the counter
+void dp_service() {
+    const Model& M = *g_dp.M;
+    static ik2::cpu::BatchJob jobs[16];
+    int next = 1;
+    while (g_dp.run.load(std::memory_order_relaxed)) {
+        unsigned spin = 0;
+        while (g_dp.ctl[0] < next) {
+            if (!g_dp.run.load(std::memory_order_relaxed)) return;
+            if (g_dp.quiesce.load(std::memory_order_acquire) == 1) {   // (the GPU idle, every record served)
+                dp_drain();
+                g_dp.quiesce.store(2, std::memory_order_release);
+            }
+            dp_advance(false);
+            if (++spin < 200000) __builtin_ia32_pause();
+            else std::this_thread::yield();
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const uint8_t* rec = g_dp.rec_h + (size_t) (next % g_dp.R) * g_dp.rec_bytes;
+        const int* hd = (const int*) rec;
+        const float* xr = (const float*) (rec + 256);
+        const Layer& Ly = M.L[hd[1]];
+        float* ey = g_dp.ey_h + (size_t) (next % g_dp.R) * 16 * g_dp.C;
+        const uint64_t t = ++g_dp.tick;
+        for (int k = 0; k < g_dp.K; ++k)   // the hits' recency
+            if (!hd[18 + k]) {
+                const int s2 = g_dp.loc[hd[1] * g_dp.E + hd[2 + k]];
+                if (s2 >= 0) g_dp.last[s2] = t;
+            }
+        int n = 0;
+        for (int k = 0; k < g_dp.K; ++k) {
+            if (!hd[18 + k]) continue;
+            const int e = hd[2 + k];
+            auto& J = jobs[n++];
+            J.gate = Ly.host[0] + (size_t) e * Ly.stride[0];
+            J.up = Ly.host[1] + (size_t) e * Ly.stride[1];
+            J.down = Ly.host[2] + (size_t) e * Ly.stride[2];
+            J.tg = Ly.ty[0], J.tu = Ly.ty[1], J.td = Ly.ty[2];
+            J.x = xr, J.sg = 1.0f, J.su = 1.0f;
+            J.y = ey + (size_t) k * g_dp.C;
+        }
+        for (int k = 0; k < g_dp.K; ++k)   // the misses' copies (for the next tokens)
+            if (hd[18 + k]) dp_request(hd[1], hd[2 + k]);
+        dp_advance(false);
+        ik2::cpu::experts_batch(jobs, n, g_dp.C, g_dp.F, g_dp.gcap, g_dp.ucap);
+        g_dp.cpu_experts += n;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        g_dp.ctl[2] = next;
+        ++next;
+    }
+}
+void dp_init(const Model& M) {
+    const Config& c = M.c;
+    g_dp.M = &M, g_dp.K = c.K, g_dp.C = c.C, g_dp.F = c.F, g_dp.gcap = c.gate_cap, g_dp.ucap = c.up_cap;
+    g_dp.rec_bytes = 256 + (size_t) c.C * 4;
+    CU(cudaHostAlloc((void**) &g_dp.rec_h, g_dp.rec_bytes * g_dp.R, cudaHostAllocMapped));
+    std::memset(g_dp.rec_h, 0, g_dp.rec_bytes * g_dp.R);
+    CU(cudaHostGetDevicePointer((void**) &g_dp.rec_d, g_dp.rec_h, 0));
+    CU(cudaHostAlloc((void**) &g_dp.ey_h, (size_t) g_dp.R * 16 * c.C * 4, cudaHostAllocMapped));
+    CU(cudaHostGetDevicePointer((void**) &g_dp.ey_d, g_dp.ey_h, 0));
+    int* ct = nullptr;
+    CU(cudaHostAlloc((void**) &ct, 64, cudaHostAllocMapped));
+    std::memset(ct, 0, 64);
+    g_dp.ctl = ct;
+    CU(cudaHostGetDevicePointer((void**) &g_dp.ctl_d, ct, 0));
+    CU(cudaHostAlloc((void**) &g_dp.tsrc, DevPlan::kQ * 2 * sizeof(void*), cudaHostAllocDefault));
+    for (auto& q : g_dp.q) CU(cudaEventCreateWithFlags(&q.ev, cudaEventDisableTiming));
+    ik2::cpu::spin_start(g_pool->size());   // (the service thread is the batches' caller)
+    g_dp.run = true;
+    g_dp.th = std::thread(dp_service);
+    g_dp.th.detach();
+}
+// the device side's buffers, at load (before the expert cache takes what is left)
+void dp_alloc(const Config& c) {
+    g_dp.seqd = dalloc<int>(2);
+    CU(cudaMemset(g_dp.seqd, 0, 8));
+    g_dp.tab = dalloc<const uint8_t*>((size_t) c.n_layer * c.E);
+    g_dp.blob = dalloc<const uint8_t*>(16);
+    g_dp.tok = dalloc<int>(16), g_dp.inv = dalloc<int>(16), g_dp.mflag = dalloc<int>(16);
+    g_dp.sg = dalloc<float>(16), g_dp.su = dalloc<float>(16), g_dp.wt = dalloc<float>(16);
+}
+// the cache's residency into g_dp.tab (the GPU idle: the copies landed)
+void dp_sync_tab(const Model& M, ExpertCache& ECr) {
+    const Config& c = M.c;
+    std::vector<const uint8_t*> t((size_t) c.n_layer * c.E, nullptr);
+    for (int l = 0; l < c.n_layer; ++l) {
+        const int p = ECr.layer_pool[l];
+        if (p < 0) continue;
+        const auto& P = ECr.pools[p];
+        for (int e = 0; e < c.E; ++e) {
+            const int s2 = ECr.loc[(size_t) l * c.E + e];
+            if (s2 >= 0 && s2 < P.n_active) t[(size_t) l * c.E + e] = P.data + (size_t) s2 * P.slot_bytes;
+        }
+    }
+    CU(cudaMemcpy(g_dp.tab, t.data(), t.size() * sizeof(void*), cudaMemcpyHostToDevice));
+    // the mirror (one pool: the decode's layers)
+    g_dp.pool = ECr.layer_pool[0];
+    const auto& P = ECr.pools[g_dp.pool];
+    g_dp.E = c.E, g_dp.n_active = P.n_active;
+    g_dp.owner.assign(P.n_slots, -1), g_dp.loc.assign((size_t) c.n_layer * c.E, -1), g_dp.last.assign(P.n_slots, 0);
+    g_dp.busy.assign((size_t) c.n_layer * c.E, 0);
+    for (int s2 = 0; s2 < P.n_active; ++s2)
+        if (P.owner[s2] >= 0) g_dp.owner[s2] = P.owner[s2], g_dp.loc[P.owner[s2]] = s2, g_dp.last[s2] = P.used[s2] ? 1 : 0;
+}
 // --kv-grow (default on a card under 16 GB): the full-attention layers' K / V are not allocated for the whole --ctx at
 // load but kept in the top slots of the expert cache's pool, as many as the positions so far need, doubling; a growth
 // drops the experts in the slots it takes and moves the K / V there (through host memory: the regions overlap)
@@ -2422,6 +2714,22 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
              std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp) {
     kv_ensure(M, pos0 + T);
     const Config& c = M.c;
+    const bool dp_tok = g_dp.ok && T == 1 && dump.empty() && !g_prof && !g_rec && !g_taps && !g_trace;
+    if (dp_tok && g_dp_time) g_dp_t0 = now();
+    if (dp_tok && g_dp.dirty) {
+        CU(cudaDeviceSynchronize());
+        g_seq_done = g_seq_next - 1;
+        if (!g_dp.M) dp_init(M);
+        dp_sync_tab(M, dev_cache(0));
+        g_dp.dirty = false;
+    }
+    if (!dp_tok && g_dp.M && !g_dp.dirty) {   // (another forward may change the cache: the copies drained, written back)
+        CU(cudaDeviceSynchronize());
+        g_dp.quiesce.store(1, std::memory_order_release);
+        while (g_dp.quiesce.load(std::memory_order_acquire) != 2) std::this_thread::yield();
+        g_dp.quiesce.store(0, std::memory_order_release);
+    }
+    if (!dp_tok) g_dp.dirty = true;
     const int C = c.C;
     if ((g_fast || g_ep_fast) && T == 1 && dump.empty() && !g_prof && !g_rec && !g_taps && !g_trace && g_pop.empty() &&
         g_img.at(pos0) < 0) {
@@ -2544,6 +2852,21 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
         k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
+        if (dp_tok) {   // IK2_DEVPLAN: no wait for the routing (see k_dp_plan)
+            k_dp_plan<<<1, 256, 0, g_s>>>(rtop, rw, g_dp.tab + (size_t) l * c.E, c.K, C, W.xq, g_dp.rec_d, g_dp.rec_bytes,
+                                          g_dp.R, l, g_dp.seqd, g_dp.ctl_d, g_dp.blob, g_dp.tok, g_dp.inv, g_dp.sg,
+                                          g_dp.su, g_dp.wt, g_dp.mflag);
+            k::experts_gate_up_swiglu(g_dp.blob, g_dp.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, c.F, g_dp.sg,
+                                      g_dp.su, c.gate_cap, c.up_cap, W.h16, g_s);
+            k::experts_down(g_dp.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+            k_dp_wait<<<1, 32, 0, g_s>>>(g_dp.mflag, c.K, g_dp.seqd, g_dp.ctl_d);
+            k_dp_merge<<<dim3((unsigned) ((C + 255) / 256), (unsigned) c.K), 256, 0, g_s>>>(W.y32, g_dp.ey_d, g_dp.mflag,
+                                                                                           g_dp.seqd, C, g_dp.R);
+            k::moe_combine_f32(W.y32, g_dp.inv, g_dp.wt, T, c.K, C, W.tmp, false, g_s);
+            conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
+            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            continue;
+        }
         const bool cpu_lane = g_pool && g_overlap && !g_prof && T <= 8 && ik2::cpu::available_for(Ly.ty[0]) &&
                               ik2::cpu::available_for(Ly.ty[1]) && ik2::cpu::available_for(Ly.ty[2]);
         const bool fast_ep_token = g_ep_fast && g_ep && T <= 8 && g_overlap && !g_prof &&
@@ -3094,7 +3417,14 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         g_pf.lap(g_pf.rest);
         dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
     }
+    const double t_enq = dp_tok && g_dp_time ? now() : 0;
     run_head(M, T, all_logits, out_mode, nb, W.h, W, logits_out, argmax_out);
+    if (dp_tok && g_dp_time) {   // IK2_DP_TIME=1: the host's enqueue time of a token against the token's
+        g_dp_t_enq += t_enq - g_dp_t0, g_dp_t_tok += now() - g_dp_t0, ++g_dp_n;
+        if (g_dp_n % 64 == 0)
+            std::fprintf(stderr, "devplan time a token: %.2f ms enqueued, %.2f ms in all\n", g_dp_t_enq / g_dp_n * 1e3,
+                         g_dp_t_tok / g_dp_n * 1e3);
+    }
 #undef W
 #undef EC
 }
@@ -4183,6 +4513,21 @@ int run(int argc, char** argv) {
                     ik2::draft::bytes(drafter) / 1073741824.0, now() - t0);
     }
 
+    // IK2_DEVPLAN (see DevPlan): one GPU, the CPU lane, the experts' types on it, no per-expert scales
+    {
+        bool ok = !(getenv("IK2_DEVPLAN") && !std::atoi(getenv("IK2_DEVPLAN"))) && g_pool && n_gpu == 1 && !dual() &&
+                  !g_tp && !g_fast_want && c.K <= 16;
+        for (int l = 0; ok && l < c.n_layer; ++l) {
+            const Layer& Ly = M.L[l];
+            for (int r = 0; r < 3; ++r) ok = ok && ik2::cpu::available_for(Ly.ty[r]) && Ly.scale[r].empty();
+        }
+        if (ok) {
+            use_dev(0);
+            dp_alloc(c);
+            g_dp.ok = true;
+            std::printf("devplan: decode tokens enqueued without waiting for the routing (IK2_DEVPLAN=0: off)\n");
+        }
+    }
     // the work buffers and the expert cache, a set a GPU
     for (int d = 0; d < n_gpu; ++d) {
     use_dev(d);
@@ -5105,6 +5450,10 @@ int run(int argc, char** argv) {
     if (g_pool)
         std::printf("CPU lane: %d threads, %llu experts computed on the CPU (%.2f ms each at the end), %llu waited for\n",
                     g_pool->size(), (unsigned long long) g_n_cpu, g_t_cpu * 1e3, (unsigned long long) g_n_wait);
+    if (g_dp.M)
+        std::printf("devplan: %llu experts on the CPU, %llu copied in, %llu not (queue full); the GPU waited for the CPU "
+                    "%d times, %.1f ms in all\n", (unsigned long long) g_dp.cpu_experts, (unsigned long long) g_dp.copies,
+                    (unsigned long long) g_dp.skipped, g_dp.ctl[4], g_dp.ctl[3] / 1000.0);
     if (g_prof)
         std::printf("profile (all calls): attention %.2f s, router %.2f s, uploads %.2f s, experts %.2f s, rest %.2f s\n",
                     g_pf.attn, g_pf.route, g_pf.upload, g_pf.experts, g_pf.rest);
