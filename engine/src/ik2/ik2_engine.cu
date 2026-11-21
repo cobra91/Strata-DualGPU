@@ -1178,6 +1178,9 @@ struct Work {
     // blocks it added after its first, then its final stream); a layer's four messages (q's, k's, v's, the MoE's);
     // its three attention inputs before the messages.
     float *lp_pre = nullptr, *lp_bank = nullptr, *lp_msg = nullptr, *lp_in = nullptr;
+    // a looped core in a lent layer-major pass (forward_prefill_sup): the stream kept, the bank, the messages [4][T][C]
+    // and a sub-chunk's of them [4][512][C] (null outside such a pass)
+    float *lp_pre_s = nullptr, *lp_bank_s = nullptr, *lp_msg_s = nullptr, *lp_sub = nullptr;
     float* lp_msg_all = nullptr;   // a token's messages of a pass, every core layer's ([n_core][4][C]): one launch a pass
     float* lp_g = nullptr;   // the message gates' scratch [3][Tm][2 rank + 2]
     float *lp_a = nullptr, *lp_f = nullptr;   // ... of a chunk's: [3][Tm][rank] and [2][Tm][C]
@@ -2689,6 +2692,12 @@ void kv_ensure(Model& M, int need) {
     const int k_new = (int) ((total + P.slot_bytes - 1) / P.slot_bytes);
     if (P.n_slots - k_new < 2 * c.E + 80) die("--kv-grow: the K / V for " + std::to_string(ncap) + " tokens leaves too few expert slots");
     CU(cudaDeviceSynchronize());
+    if (g_dp.M && !g_dp.dirty) {   // (the device plan's table and mirror name slots this growth takes: drained, rebuilt)
+        g_dp.quiesce.store(1, std::memory_order_release);
+        while (g_dp.quiesce.load(std::memory_order_acquire) != 2) std::this_thread::yield();
+        g_dp.quiesce.store(0, std::memory_order_release);
+    }
+    g_dp.dirty = true;
     g_seq_done = g_seq_next - 1;
     std::vector<uint8_t> old;   // the K / V so far, through the host (the old and the new regions overlap)
     if (ob) {
@@ -3461,6 +3470,7 @@ struct BigScratch {
     size_t lg_cap = 0;
 };
 // the scratch of a T-token pass, carved from base (or only its size, base null)
+int g_sub_max = 512;   // a layer-major pass's attention sub-chunk (IK2_SUB)
 size_t big_carve(const Config& c, int T, size_t gu32_have, size_t lg_want, size_t lg_have, Work* W, uint8_t* base) {
     const size_t C = c.C, F = c.F, S = (size_t) T * c.K, nblk = c.n_layer / c.block + 1;
     const size_t Tr = std::max<size_t>(64, T);
@@ -3489,6 +3499,13 @@ size_t big_carve(const Config& c, int T, size_t gu32_have, size_t lg_want, size_
     float* wtr = (float*) take(S * 4);
     int* gidx = (int*) take(S * 4);
     int* inv = (int*) take(S * 4);
+    float *lpre = nullptr, *lbank = nullptr, *lmsg = nullptr, *lsub = nullptr;
+    if (c.n_pass > 1) {   // a looped core's pass state (see Work::lp_pre_s)
+        lpre = (float*) take(T * C * 4);
+        lbank = (float*) take((size_t) ((c.core1 - c.core0) / c.block) * T * C * 4);
+        lmsg = (float*) take(4 * T * C * 4);
+        lsub = (float*) take((size_t) 4 * g_sub_max * C * 4);
+    }
     // the attention's logits and probabilities, room for kAttnRows queries at the prompt's end (lg_want of each)
     const bool new_lg = lg_want > lg_have;
     float* lg = new_lg ? (float*) take(lg_want * 4) : nullptr;
@@ -3501,12 +3518,14 @@ size_t big_carve(const Config& c, int T, size_t gu32_have, size_t lg_want, size_
         if (new_lg) W->lg = lg, W->lg16 = lg16, W->lg_cap = lg_want;
         W->blk_ld = (size_t) T;
         W->T_sup = T;
+        W->lp_pre_s = lpre, W->lp_bank_s = lbank, W->lp_msg_s = lmsg, W->lp_sub = lsub;
     }
     return off;
 }
 // Tokens a pass for a prompt of n new tokens: W.T_sup, or more with a lent scratch (then big_end gives it back).
 int big_begin(const Model& M, Work& W, ExpertCache& EC, int n, int ctx_end, BigScratch& bs) {
     bs.pool = -1;
+    kv_ensure(const_cast<Model&>(M), ctx_end);   // (--kv-grow takes the pool's top slots: before any are lent)
     if (W.T_sup <= 0 || dual() || (getenv("IK2_BORROW") && !std::atoi(getenv("IK2_BORROW")))) return W.T_sup;
     const Config& c = M.c;
     // the attention's scratch for 256 queries against the whole context: few, large GEMMs (the default ~400 MB left
@@ -3570,6 +3589,7 @@ void big_end(Work& W, ExpertCache& EC, BigScratch& bs) {
     W.ex16 = bs.ex16, W.h16 = bs.h16, W.pos = bs.pos, W.route_d = bs.route_d, W.gidx = bs.gidx, W.inv = bs.inv;
     W.blk_ld = bs.blk_ld, W.T_sup = bs.T_sup;
     W.lg = bs.lg, W.lg16 = bs.lg16, W.lg_cap = bs.lg_cap;
+    W.lp_pre_s = W.lp_bank_s = W.lp_msg_s = W.lp_sub = nullptr;
     EC.give_back(bs.pool);
     bs.pool = -1;
 }
@@ -3578,6 +3598,10 @@ void big_end(Work& W, ExpertCache& EC, BigScratch& bs) {
 // a decode token's graph for position pos into exec slot (captured, not run)
 void tg_capture(Model& M, int pos, int slot) {
     kv_ensure(M, pos + 1);   // (a growth synchronizes: not inside a capture)
+    if (g_dp.dirty) {   // (a growth made the plan's table stale: this token runs without a graph, which rebuilds it)
+        g_dp.exec_pos[slot] = -1;
+        return;
+    }
     g_tg_capturing = true;
     CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeThreadLocal));
     const int tok = 0;
@@ -3610,6 +3634,23 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
     use_dev(M.L[0].dev);
     Work& W = dev_work(g_cur);
     ExpertCache& EC = dev_cache(g_cur);
+    const bool looped = c.n_pass > 1;
+    if (looped && !W.lp_msg_s) {   // (no lent pass for a looped model: forward()'s chunks)
+        for (int p0 = 0; p0 < T; p0 += W.Tm) {
+            const int n = std::min(W.Tm, T - p0);
+            forward(M, tok + p0, n, pos0 + p0, false, p0 + n == T ? out_mode : OutMode::kNone, std::string(), logits_out,
+                    argmax_out, t_exp);
+        }
+        return;
+    }
+    kv_ensure(M, pos0 + T);
+    if (g_dp.M && !g_dp.dirty) {   // (the device plan's copies drained and written back first: this changes the cache)
+        CU(cudaDeviceSynchronize());
+        g_dp.quiesce.store(1, std::memory_order_release);
+        while (g_dp.quiesce.load(std::memory_order_acquire) != 2) std::this_thread::yield();
+        g_dp.quiesce.store(0, std::memory_order_release);
+    }
+    g_dp.dirty = true;
 
     // Embed and norm all T tokens in sub-chunks of <= W.Tm
     {
@@ -3630,7 +3671,9 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
     // (enough tokens that a layer uses most of its experts; below, the misses copied after the routing cost less than
     // prefetching experts that turn out unused - a 119-token turn took 3.4 s with 2E, 1.9 s without)
     const bool pf = (size_t) T * c.K >= (size_t) 8 * c.E;
-    EC.scan = pf && !(getenv("IK2_SCAN") && !std::atoi(getenv("IK2_SCAN")));
+    // (not for a looped model: a pass comes back to the core's layers, and evicting its own experts first could take a
+    //  slot a revisit has just been given as a hit - wrong values; KL 0.48 against forward()'s chunks)
+    EC.scan = pf && !looped && !(getenv("IK2_SCAN") && !std::atoi(getenv("IK2_SCAN")));
     if (dual()) dev_cache(1).scan = EC.scan;
     // (under EP each GPU prefetches the experts it owns, by GPU 0's picks so far)
     // One layer ahead: two or three layers in flight cost more than they hide - their slots squeeze the cache (2x RTX
@@ -3649,18 +3692,63 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
     };
     if (pf)
         for (int ll = 0; ll < depth; ++ll) prefetch(ll, ll + 1);
-    int nb = 0;
-    for (int vis = 0; vis < c.n_visit; ++vis) {   // (no loop here: a looped model's prompts go through forward())
+    int nb = 0, nb_pre = 0, n_bank = 0;
+    const size_t TC = (size_t) T * C;
+    for (int vis = 0; vis < c.n_visit; ++vis) {
         const int l = M.V[vis].l;
         Layer& Ly = bind_visit(M, vis);
         g_pf.start();
+        // a looped core (as forward()): its first pass keeps the stream it is given; a later pass starts again from it
+        // and reads the pass before through messages, from that pass's bank (its blocks after the first, its stream)
+        const float* msg = nullptr;
+        if (looped && l == c.core0) {
+            if (M.V[vis].pass == 0) {
+                nb_pre = nb;
+                CU(cudaMemcpyAsync(W.lp_pre_s, W.h, TC * 4, cudaMemcpyDeviceToDevice, g_s));
+            } else {
+                n_bank = 0;
+                for (int i = nb_pre + 1; i < nb; ++i, ++n_bank)
+                    CU(cudaMemcpyAsync(W.lp_bank_s + (size_t) n_bank * TC, W.blocks + (size_t) i * W.blk_ld * C, TC * 4,
+                                       cudaMemcpyDeviceToDevice, g_s));
+                CU(cudaMemcpyAsync(W.lp_bank_s + (size_t) n_bank * TC, W.h, TC * 4, cudaMemcpyDeviceToDevice, g_s));
+                ++n_bank;
+                CU(cudaMemcpyAsync(W.h, W.lp_pre_s, TC * 4, cudaMemcpyDeviceToDevice, g_s));
+                nb = nb_pre;
+            }
+        }
+        if (looped && M.V[vis].pass > 0) {
+            k::ResStates st{};
+            for (int i = 0; i < n_bank; ++i) st.st[i] = W.lp_bank_s + (size_t) i * TC;
+            k::attn_res(st, n_bank, Ly.lp_query, 2, T, C, 1e-6f, W.lp_msg_s, g_s);
+            k::attn_res(st, n_bank, Ly.lp_query + (size_t) 2 * C, 2, T, C, 1e-6f, W.lp_msg_s + 2 * TC, g_s);
+            msg = W.lp_msg_s;
+        }
         for (int off = 0; off < T; off += sub_chunk) {
             const int ts = std::min(sub_chunk, T - off);
+            const float* msg_s = nullptr;
+            if (msg) {   // (the sub-chunk's messages, [4][ts][C] as run_layer_attn reads them)
+                for (int j = 0; j < 4; ++j)
+                    CU(cudaMemcpyAsync(W.lp_sub + (size_t) j * ts * C, msg + j * TC + (size_t) off * C, (size_t) ts * C * 4,
+                                       cudaMemcpyDeviceToDevice, g_s));
+                msg_s = W.lp_sub;
+            }
             run_layer_attn(M, Ly, l, ts, pos0 + off, W.h + (size_t) off * C, W.pos + off, nb, off,
-                           W.r + (size_t) off * C, W);
+                           W.r + (size_t) off * C, W, msg_s);
         }
         if (l % c.block == 0) ++nb;
-        {
+        if (msg) {   // the MoE's input gated by its message before the norm
+            k::ResStates st{};
+            for (int i = 0; i < nb; ++i) st.st[i] = W.blocks + (size_t) i * W.blk_ld * C;
+            st.st[nb] = W.r;
+            k::attn_res(st, nb + 1, Ly.ffn_res_score, 1, T, C, 1e-6f, W.tmp, g_s);
+            for (int off = 0; off < T; off += sub_chunk) {
+                const int ts = std::min(sub_chunk, T - off);
+                float* xo = W.tmp + (size_t) off * C;
+                const k::LoopGate gt{xo, msg + 3 * TC + (size_t) off * C, Ly.lp_down[3], Ly.lp_forget[3], Ly.lp_gain[3], xo};
+                loop_gates_chunk(W, &gt, 1, ts, C, c.rank, 1e-6f);
+            }
+            k::rms_f16(W.tmp, Ly.ffn_norm, T, C, c.eps, W.xq16_sup, W.tmp, g_s);
+        } else {
             k::ResStates st{};
             for (int i = 0; i < nb; ++i) st.st[i] = W.blocks + (size_t) i * W.blk_ld * C;
             st.st[nb] = W.r;
@@ -4037,6 +4125,7 @@ int run(int argc, char** argv) {
     g_cpu_lazy = !getenv("IK2_CPU_LAZY") || std::atoi(getenv("IK2_CPU_LAZY"));
     if (getenv("IK2_LAZY_MAX")) g_lazy_max = std::max(0, std::atoi(getenv("IK2_LAZY_MAX")));
     if (getenv("IK2_TOKGRAPH")) g_dp.graph = std::atoi(getenv("IK2_TOKGRAPH")) != 0;
+    if (getenv("IK2_SUB")) g_sub_max = std::max(64, std::atoi(getenv("IK2_SUB")));
     if (n_gpu > 2 && getenv("IK2_DENSE")) die("IK2_DENSE with --gpus > 2");
 
     // Do the experts all fit in VRAM beside the dense weights and the K / V cache (Inkling-2-Mini's 14.7 GiB on a 24 GB
@@ -4586,6 +4675,10 @@ int run(int argc, char** argv) {
     // (a looped model's prompts go through forward(): forward_prefill_sup has no loop yet)
     // ... nor the resident path's models: a pass borrows cache slots, which would evict experts
     W.T_sup = ((n_gpu == 1 || dual()) && draft_path.empty() && c.n_pass == 1 && !g_fast_want && fr >= (20ULL << 30)) ? (fr >= (60ULL << 30) ? 16384 : 4096) : 0;
+    // a looped model on one GPU: layer-major passes too, as long as the expert cache lends them (IK2_LOOP_SUP=0: off)
+    if (!W.T_sup && c.n_pass > 1 && n_gpu == 1 && draft_path.empty() && !g_fast_want &&
+        !(getenv("IK2_LOOP_SUP") && !std::atoi(getenv("IK2_LOOP_SUP"))))
+        W.T_sup = std::max(chunk, 1);
     // IK2_SUP=N: tokens a layer-major prefill pass (each pass streams every expert not in the cache once)
     if (W.T_sup > 0 && getenv("IK2_SUP")) W.T_sup = std::max(W.Tm, std::atoi(getenv("IK2_SUP")));
     const size_t Tm = W.Tm, S8 = Tm * c.K;
@@ -5122,7 +5215,7 @@ int run(int argc, char** argv) {
             bool cancelled = false;
             if (L < ids.size()) {
                 const int T_sup = g_dev[0].W.T_sup;
-                const int sub_chunk = std::min(g_dev[0].W.Tm, 512);
+                const int sub_chunk = std::min(g_dev[0].W.Tm, g_sub_max);
                 if (T_sup > 0 && (n_gpu == 1 || dual()) && (int) (ids.size() - L) > 64) {
                     BigScratch bs;
                     const int T_pass = big_begin(M, g_dev[0].W, dev_cache(0), (int) (ids.size() - L), (int) ids.size(), bs);
@@ -5283,7 +5376,7 @@ int run(int argc, char** argv) {
     const bool all = !dump.empty();
     int first_best = -1;
     const int T_sup = g_dev[0].W.T_sup;
-    const int sub_chunk = std::min(g_dev[0].W.Tm, 512);
+    const int sub_chunk = std::min(g_dev[0].W.Tm, g_sub_max);
     if (T_sup > 0 && (n_gpu == 1 || dual()) && !drafter && !all && (int) prompt.size() > 64) {
         BigScratch bs;
         const int T_pass = big_begin(M, g_dev[0].W, dev_cache(0), (int) prompt.size(), (int) prompt.size(), bs);
@@ -5378,6 +5471,7 @@ int run(int argc, char** argv) {
         if (g_dp.ok && g_dp.graph && !lo && i > 0 && !g_dp.dirty) {   // IK2_TOKGRAPH
             const int sl = i & 1;
             if (g_dp.exec_pos[sl] != pos) tg_capture(M, pos, sl);
+            if (g_dp.exec_pos[sl] != pos) goto plain;   // (not captured: see tg_capture)
             const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
             Work& W0 = dev_work(0);
             k::decode_host(M.embd_type, M.embd + (size_t) tok * rb, c.C, W0.emb_h);
@@ -5389,6 +5483,7 @@ int run(int argc, char** argv) {
             best = W0.argmax_h[0];
             continue;
         }
+    plain:
         forward(M, &tok, 1, pos, false, lo ? OutMode::kLogits : OutMode::kArgmax, std::string(),
                 logits, &ag, t_exp);
         if (lo) {
