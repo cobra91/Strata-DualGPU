@@ -894,10 +894,20 @@ constexpr int kFaBN = 64, kFaD = 128, kFaLd = kFaD + 8;   // (row pad: conflict-
 constexpr float kLog2e = 1.4426950408889634f;
 
 __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    // Turing (sm_75) has m16n8k8: k 0..7 is {a0, a1} x b0, k 8..15 {a2, a3} x b1 (the same fragments' halves)
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(b0));
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[2]), "r"(a[3]), "r"(b1));
+#else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
                  "{%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
 }
 __device__ __forceinline__ void ldsm_x4_t(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* p) {
     const unsigned a = (unsigned) __cvta_generic_to_shared(p);
@@ -911,6 +921,19 @@ __device__ __forceinline__ void ldsm_x4(uint32_t& r0, uint32_t& r1, uint32_t& r2
                  : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
                  : "r"(a));
 }
+// cp.async is sm_80 and on; before it (Turing) the copies are plain loads and stores, done when issued (the
+// callers' __syncthreads after a wait still orders them)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+__device__ __forceinline__ void cp_async16(void* dst, const void* src, bool valid) {
+    *reinterpret_cast<int4*>(dst) = valid ? *reinterpret_cast<const int4*>(src) : make_int4(0, 0, 0, 0);
+}
+__device__ __forceinline__ void cp_async4(void* dst, const void* src, bool valid) {
+    *reinterpret_cast<int*>(dst) = valid ? *reinterpret_cast<const int*>(src) : 0;
+}
+__device__ __forceinline__ void cp_async_commit() {}
+template <int N>
+__device__ __forceinline__ void cp_async_wait() {}
+#else
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool valid) {
     const unsigned a = (unsigned) __cvta_generic_to_shared(dst);
     const int n = valid ? 16 : 0;   // (0: the 16 bytes zero-filled)
@@ -926,6 +949,7 @@ template <int N>
 __device__ __forceinline__ void cp_async_wait() {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
+#endif
 
 // one 64-key tile of K and V (rows kt .. kt+63; rows at or past k_end zero-filled) into smem, NT threads
 template <int NT>
@@ -1007,6 +1031,13 @@ __device__ __forceinline__ void fa_tile_from_raw(uint16_t* Ks, uint16_t* Vs, con
 constexpr int kFaBld = 72;   // (a bias row in shared memory; 72: 2-way bank conflicts at most for the float2 reads)
 constexpr int kFaNW = 4;     // warps a block (8: the same speed in a test, and past sm_89/sm_120's shared memory)
 constexpr int kFaSmem = 4 * kFaBN * kFaLd * (int) sizeof(uint16_t) + kFaNW * 16 * kFaBld * (int) sizeof(float);
+// Turing (sm_75, 64 KB a block): one K / V tile, refilled after its use (its cp.async is synchronous anyway)
+constexpr int kFaSmem1 = 2 * kFaBN * kFaLd * (int) sizeof(uint16_t) + kFaNW * 16 * kFaBld * (int) sizeof(float);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+constexpr bool kFaOne = true;
+#else
+constexpr bool kFaOne = false;
+#endif
 // Hopper (sm_90a) warpgroup MMA: the four warps of a 128-thread block as one warpgroup, 64 rows.
 // D[64 x 64] (+)= A[64 x 16] (registers, the mma.m16n8k16 A fragments of each warp's 16 rows) x B (smem
 // descriptor; tnsp: B stored N-major), F16 in, F32 accumulate; d[j * 4 + i] as mma's C fragment of n8 block j
@@ -1102,10 +1133,11 @@ attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __r
     extern __shared__ __align__(16) uint16_t fa_sm[];
     constexpr bool F8 = sizeof(KVT) == 1;        // (FP8: one FP16 tile, and the bytes of two [2][kFaRaw] after it)
     uint16_t* Ks = fa_sm;                        // [2][kFaBN][kFaLd]
-    uint16_t* Vs = fa_sm + (F8 ? 1 : 2) * kFaBN * kFaLd;   // [2][kFaBN][kFaLd]
+    constexpr bool ONE = kFaOne && !F8 && !WG;   // (one tile buffer: Turing)
+    uint16_t* Vs = fa_sm + (F8 || ONE ? 1 : 2) * kFaBN * kFaLd;   // [2][kFaBN][kFaLd] ([kFaBN][kFaLd] for ONE)
     uint8_t* Rs = (uint8_t*) (fa_sm + 2 * kFaBN * kFaLd);
-    constexpr int kTileLd = WG ? kWgTile : F8 ? 0 : kFaBN * kFaLd;   // (halves from one buffer to the other)
-    float* Bw = (float*) (fa_sm + 4 * kFaBN * kFaLd) + (threadIdx.x >> 5) * 16 * kFaBld;   // this warp's [16][kFaBld]
+    constexpr int kTileLd = WG ? kWgTile : F8 || ONE ? 0 : kFaBN * kFaLd;   // (halves from one buffer to the other)
+    float* Bw = (float*) (fa_sm + (ONE ? 2 : 4) * kFaBN * kFaLd) + (threadIdx.x >> 5) * 16 * kFaBld;   // [16][kFaBld]
     if constexpr (WG) {   // [2][kWgTile] each, 1024-byte aligned (the swizzle's atoms), inside the same 68 KB
         uint16_t* a = (uint16_t*) (((uintptr_t) fa_sm + 1023) & ~(uintptr_t) 1023);
         Ks = a, Vs = a + 2 * kWgTile;
@@ -1173,7 +1205,7 @@ attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __r
             }
         }
         cp_async_commit();
-        if (t + 1 < t1) {
+        if (!ONE && t + 1 < t1) {
             if constexpr (WG)
                 fa_load_tile_wg<NW * 32>(Ks + (buf ^ 1) * kTileLd, Vs + (buf ^ 1) * kTileLd, kc, vc, kv_cap,
                                          KD, g, k_lo + (t + 1) * kFaBN, k_hi, tid);
@@ -1311,6 +1343,8 @@ attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __r
             }
         }
         if constexpr (!F8) __syncthreads();   // (the buffer is refilled next iteration; FP8's FP16 tile is written
+        if constexpr (ONE)   // (the one buffer read by every warp: refilled now, seen after the next barrier)
+            if (t + 1 < t1) fa_load_tile<NW * 32>(Ks, Vs, kc, vc, kv_cap, KD, g, k_lo + (t + 1) * kFaBN, k_hi, tid);
     }                                         //  past the next iteration's barrier)
     la += __shfl_xor_sync(0xffffffffu, la, 1);
     la += __shfl_xor_sync(0xffffffffu, la, 2);
@@ -1979,6 +2013,15 @@ __device__ const uint32_t d_iq3xxs_grid[256] = {IK2_IQ3XXS_GRID};
 static const uint32_t h_iq3xxs_grid[256] = {IK2_IQ3XXS_GRID};
 __device__ const int8_t d_iq4nl[16] = {IK2_IQ4NL_VALUES};
 static const int8_t h_iq4nl[16] = {IK2_IQ4NL_VALUES};
+__device__ const uint32_t d_iq3s_grid[512] = {IK2_IQ3S_GRID};
+static const uint32_t h_iq3s_grid[512] = {IK2_IQ3S_GRID};
+__host__ __device__ __forceinline__ uint32_t iq3s_grid_at(int i) {
+#ifdef __CUDA_ARCH__
+    return __ldg(d_iq3s_grid + i);
+#else
+    return h_iq3s_grid[i];
+#endif
+}
 __host__ __device__ __forceinline__ uint32_t iq3xxs_grid_at(int i) {
 #ifdef __CUDA_ARCH__
     return __ldg(d_iq3xxs_grid + i);
@@ -2041,6 +2084,24 @@ __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, s
         const uint32_t g = iq3xxs_grid_at(b[2 + 8 * ib32 + 2 * l + (j >> 2)]);
         const float w = (float) ((g >> (8 * (j & 3))) & 0xFFu);
         return db * w * ((signs >> j) & 1u ? -1.0f : 1.0f);
+    }
+    if (type == kIQ3_S) {   // d, qs [64], qh [8], signs [32], scales [4] (4 bits a sub-block of 32)
+        const uint8_t* b = blocks + (v / 256) * 110;
+        const int i = (int) (v % 256), ib = i / 32, l = (i % 32) / 8, j = i % 8;
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const float db = d * (float) (1 + 2 * ((b[106 + ib / 2] >> (4 * (ib % 2))) & 0xF));
+        const int qh = b[66 + ib];
+        const int gi = b[2 + 8 * ib + 2 * l + (j >> 2)] | (((qh >> (2 * l + (j >> 2))) & 1) << 8);
+        const uint32_t g = iq3s_grid_at(gi);
+        const float w = (float) ((g >> (8 * (j & 3))) & 0xFFu);
+        return db * w * ((b[74 + 4 * ib + l] >> j) & 1 ? -1.0f : 1.0f);
+    }
+    if (type == kIQ4_NL) {   // d, qs [16] (values 0..15 in the low nibbles, 16..31 in the high)
+        const uint8_t* b = blocks + (v / 32) * 18;
+        const int j = (int) (v % 32);
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const uint8_t q = b[2 + (j & 15)];
+        return d * (float) iq4nl_at(j < 16 ? (q & 0xF) : (q >> 4));
     }
     if (type == kIQ4_XS) {   // d, scales_h, scales_l [4], qs [128]
         const uint8_t* b = blocks + (v / 256) * 136;
@@ -2184,6 +2245,37 @@ __device__ __forceinline__ float iq4xs_sub_dot(const uint8_t* b, int ib, const f
     }
     return d * (float) (ls - 32) * a;
 }
+// IQ3_S block b (110 bytes, 2-aligned), sub-block ib (32 values)
+__device__ __forceinline__ float iq3s_sub_dot(const uint8_t* b, int ib, const float4 (&xv)[8]) {
+    const float d = half_bits_to_float(__ldg((const uint16_t*) b));
+    const float db = d * (float) (1 + 2 * ((__ldg(b + 106 + (ib >> 1)) >> (4 * (ib & 1))) & 0xF));
+    const uint32_t qh = __ldg(b + 66 + ib);
+    const uint16_t* qs = (const uint16_t*) (b + 2 + 8 * ib);
+    const uint16_t* sp = (const uint16_t*) (b + 74 + 4 * ib);
+    const uint32_t sg = (uint32_t) __ldg(sp) | ((uint32_t) __ldg(sp + 1) << 16);
+    float a = 0.0f;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint32_t qq = __ldg(qs + l);
+        const uint32_t g1 = __ldg(d_iq3s_grid + ((qq & 0xFFu) | ((qh << (8 - 2 * l)) & 256u)));
+        const uint32_t g2 = __ldg(d_iq3s_grid + ((qq >> 8) | ((qh << (7 - 2 * l)) & 256u)));
+        const uint32_t s8 = sg >> (8 * l);
+        a += sdot4_u8(g1, s8, xv[2 * l]) + sdot4_u8(g2, s8 >> 4, xv[2 * l + 1]);
+    }
+    return db * a;
+}
+// IQ4_NL block b (18 bytes, 2-aligned: one sub-block of 32)
+__device__ __forceinline__ float iq4nl_sub_dot(const uint8_t* b, const float4 (&xv)[8]) {
+    const uint16_t* q16 = (const uint16_t*) (b + 2);
+    const float d = half_bits_to_float(__ldg((const uint16_t*) b));
+    float a = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const uint32_t w = (uint32_t) __ldg(q16 + 2 * k) | ((uint32_t) __ldg(q16 + 2 * k + 1) << 16);
+        a += dot_u32_f4(iq4nl_lut4(w, false), xv[k]) + dot_u32_f4(iq4nl_lut4(w, true), xv[4 + k]);
+    }
+    return d * a;
+}
 __device__ __forceinline__ void load_xv8(const float* x, float4 (&xv)[8]) {
 #pragma unroll
     for (int k = 0; k < 8; ++k) xv[k] = *(const float4*) (x + 4 * k);
@@ -2308,6 +2400,13 @@ __device__ float row_dot(int type, const uint8_t* w, const float* xs, int K) {
             load_xv8(xs + sb * 36, xv);
             acc += iq3 ? iq3xxs_sub_dot(w + (size_t) (sb >> 3) * 98, sb & 7, xv)
                        : iq4xs_sub_dot(w + (size_t) (sb >> 3) * 136, sb & 7, xv);
+        }
+    } else if (type == kIQ3_S || type == kIQ4_NL) {
+        const bool iq3 = type == kIQ3_S;
+        for (int sb = lane; sb < K / 32; sb += 32) {
+            float4 xv[8];
+            load_xv8(xs + sb * 36, xv);
+            acc += iq3 ? iq3s_sub_dot(w + (size_t) (sb >> 3) * 110, sb & 7, xv) : iq4nl_sub_dot(w + (size_t) sb * 18, xv);
         }
     } else {
         for (int i = lane; i < K; i += 32) acc += decode_value(type, w, (size_t) i) * xs[xp(i)];
@@ -2483,6 +2582,15 @@ __device__ void row_dot_2(int type, const uint8_t* wg, const uint8_t* wu, const 
             const size_t off = (size_t) (sb >> 3) * bb;
             ag += iq3 ? iq3xxs_sub_dot(wg + off, sb & 7, xv) : iq4xs_sub_dot(wg + off, sb & 7, xv);
             au += iq3 ? iq3xxs_sub_dot(wu + off, sb & 7, xv) : iq4xs_sub_dot(wu + off, sb & 7, xv);
+        }
+    } else if (type == kIQ3_S || type == kIQ4_NL) {
+        const bool iq3 = type == kIQ3_S;
+        for (int sb = lane; sb < K / 32; sb += 32) {
+            float4 xv[8];
+            load_xv8(xs + sb * 36, xv);
+            const size_t off = iq3 ? (size_t) (sb >> 3) * 110 : (size_t) sb * 18;
+            ag += iq3 ? iq3s_sub_dot(wg + off, sb & 7, xv) : iq4nl_sub_dot(wg + off, xv);
+            au += iq3 ? iq3s_sub_dot(wu + off, sb & 7, xv) : iq4nl_sub_dot(wu + off, xv);
         }
     } else {
         for (int i = lane; i < K; i += 32) {
@@ -4300,15 +4408,18 @@ void attn_flash_launch(const uint16_t* q16, int q_ld, const KVT* kc, const KVT* 
                        int Tq, int qpos0, float qk_scale, const float* bias, int extent, int window, int n_split,
                        float* o_part, float2* ml_part, cudaStream_t s) {
     static bool attr[16] = {};   // (per device: the attribute is a device's, and the layer split runs on several)
+    static int major[16] = {};
     int dev = 0;
     cudaGetDevice(&dev);
+    if (dev < 16 && !major[dev]) cudaDeviceGetAttribute(&major[dev], cudaDevAttrComputeCapabilityMajor, dev);
+    const int smem = (dev < 16 && major[dev] < 8 && sizeof(KVT) != 1 && !WG) ? kFaSmem1 : kFaSmem;
     if (dev < 16 && !attr[dev]) {
-        cudaFuncSetAttribute(attn_flash_f16_kernel<NW, WG, KVT>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFaSmem);
+        cudaFuncSetAttribute(attn_flash_f16_kernel<NW, WG, KVT>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         check("attn_flash (shared memory)");
         attr[dev] = true;
     }
     const dim3 grid((unsigned) ((Tq + 16 * NW - 1) / (16 * NW)), (unsigned) H, (unsigned) n_split);
-    attn_flash_f16_kernel<NW, WG, KVT><<<grid, NW * 32, kFaSmem, s>>>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0,
+    attn_flash_f16_kernel<NW, WG, KVT><<<grid, NW * 32, smem, s>>>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0,
                                                                      qk_scale, bias, extent, window, n_split, o_part,
                                                                      ml_part);
     check("attn_flash");
@@ -4604,11 +4715,12 @@ void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* bas
 
 int block_values(int type) {
     return type == kNVFP4 ? 64 : type == kQ8_0 ? 32
-         : type == kQ5_K || type == kQ6_K || type == kIQ3_XXS || type == kIQ4_XS ? 256 : 0;
+         : type == kQ5_K || type == kQ6_K || type == kIQ3_XXS || type == kIQ4_XS || type == kIQ3_S ? 256
+         : type == kIQ4_NL ? 32 : 0;
 }
 size_t block_bytes(int type) {
     return type == kNVFP4 ? 36 : type == kQ8_0 ? 34 : type == kQ5_K ? 176 : type == kQ6_K ? 210
-         : type == kIQ3_XXS ? 98 : type == kIQ4_XS ? 136 : 0;
+         : type == kIQ3_XXS ? 98 : type == kIQ4_XS ? 136 : type == kIQ3_S ? 110 : type == kIQ4_NL ? 18 : 0;
 }
 
 template <int WARPS, int ROWS>

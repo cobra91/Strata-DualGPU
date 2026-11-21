@@ -3402,7 +3402,12 @@ int run(int argc, char** argv) {
     Shards S(model);
     Model M;
     Config& c = M.c;
-    const std::string a = "inkling2.";
+    // the architecture: "inkling2" (PR #32187 and unsloth's files), or "inkling2_loop" (llama.cpp's merged Mini
+    // layout, #32694: block_count counts layers, loop.count / loop.start / loop.end, a layer's message queries and
+    // gates under blk.N)
+    const auto* arch = S.get("general.architecture");
+    const bool loop_arch = arch && arch->s == "inkling2_loop";
+    const std::string a = loop_arch ? "inkling2_loop." : "inkling2.";
     // a key under PR #32187's name, else under llama.cpp master's; a value master writes a visit (an array of equal
     // values) read as one
     auto key = [&](const char* k1, const char* k2 = nullptr) -> double {
@@ -3436,7 +3441,12 @@ int run(int argc, char** argv) {
     c.logit_cap = (float) key("final_logit_softcapping");
     // the loop (Inkling-2-Mini): block_count counts the layer visits, the core's layers once a pass
     if (S.get(a + "num_loops")) c.n_pass = (int) key("num_loops");
+    if (loop_arch && S.get(a + "loop.count")) c.n_pass = (int) key("loop.count");
     if (c.n_pass > 1) {
+        if (loop_arch) {
+            c.core0 = (int) key("loop.start"), c.core1 = (int) key("loop.end"), c.rank = (int) key("loop.gate_rank");
+            c.n_visit += (c.n_pass - 1) * (c.core1 - c.core0);   // (its block_count: the layers)
+        } else
         c.core0 = (int) key("loop.core_start"), c.core1 = (int) key("loop.core_end"), c.rank = (int) key("loop.gate_rank");
         if (c.core0 <= 0 || c.core1 <= c.core0 || c.core0 % c.block || (c.core1 - c.core0) % c.block || c.rank <= 0)
             die("the looped core must start after the first block and span whole blocks");
@@ -3445,9 +3455,10 @@ int run(int argc, char** argv) {
     c.n_layer = c.n_visit - (c.n_pass - 1) * n_core;
     {   // the pattern is a visit's; a layer's is its first visit's (the same in every pass)
         const auto* sp = S.get(a + "attention.sliding_window_pattern");
-        if (!sp || (int) sp->items.size() != c.n_visit) die("sliding_window_pattern");
+        const bool per_layer = sp && (int) sp->items.size() == c.n_layer && c.n_layer != c.n_visit;   // (inkling2_loop)
+        if (!sp || ((int) sp->items.size() != c.n_visit && !per_layer)) die("sliding_window_pattern");
         for (int l = 0; l < c.n_layer; ++l)
-            c.sliding.push_back(sp->items[l < c.core1 ? l : l + (c.n_pass - 1) * n_core].u != 0);
+            c.sliding.push_back(sp->items[per_layer || l < c.core1 ? l : l + (c.n_pass - 1) * n_core].u != 0);
     }
     // (a row of an expert is whole blocks of its type: checked per tensor below; 64 covers NVFP4 and Q8_0)
     if (c.D != 128 || c.H % c.KV || c.C % 64 || c.F % 64) die("unexpected shapes");
@@ -3651,7 +3662,7 @@ int run(int argc, char** argv) {
     M.embd_norm = load_f32(S, "token_embd_norm.weight", C);   // (on GPU 0, where the embedding rows go)
     std::vector<float> lp_q, lp_kv;   // a looped core's message queries, [2 n_core][C] each
     std::vector<float> lp_all;
-    if (c.n_pass > 1) {
+    if (c.n_pass > 1 && !loop_arch) {   // (inkling2_loop: blk.N.loop_msg_query, a layer's 4 in this order already)
         lp_q = host_f32(S, "loop_res_query.weight", (size_t) 2 * n_core * C);
         lp_kv = host_f32(S, "loop_kv_res_query.weight", (size_t) 2 * n_core * C);
     }
@@ -3759,8 +3770,8 @@ int run(int argc, char** argv) {
             const int nr = (int) pr.second.size();
             if (ti->elements() != (uint64_t) c.E * c.F * C * nr) die(n + ": shape");
             if (!k::block_values((int) ti->type)) die(n + ": type " + ti->type_name() + " not decoded here");
-            if (C % k::block_values((int) ti->type) || c.F % k::block_values((int) ti->type))
-                die(n + ": a row is not whole " + ti->type_name() + " blocks");
+            const int row_k = pr.first == "down" ? c.F : (int) C;   // gate / up rows are C long, down's F
+            if (row_k % k::block_values((int) ti->type)) die(n + ": a row is not whole " + ti->type_name() + " blocks");
             const size_t per = tensor_bytes(*ti) / c.E;
             std::vector<float> sc;
             const std::string sn = b + "ffn_" + pr.first + "_exps.scale";
@@ -3778,8 +3789,9 @@ int run(int argc, char** argv) {
         }
         if (c.n_pass > 1 && l >= c.core0 && l < c.core1) {   // the core: its later passes' message gates and queries
             static const char* mod[4] = {"attn", "k", "v", "mlp"};
+            static const char* mod_loop[4] = {"q", "k", "v", "ffn"};   // (inkling2_loop: loop_<m>_ctrl_*)
             for (int m = 0; m < 4; ++m) {
-                const std::string p = b + "loop_" + mod[m] + "_";
+                const std::string p = loop_arch ? b + "loop_" + mod_loop[m] + "_ctrl_" : b + "loop_" + mod[m] + "_";
                 Ly.lp_down[m] = load_f32(S, p + "down.weight", (size_t) c.rank * 2 * C);
                 for (int fg = 0; fg < 2; ++fg) {   // (the file's [C][rank] by rank, [rank][C]: k::loop_gate's layout)
                     const auto w = host_f32(S, p + (fg ? "gain.weight" : "forget.weight"), C * c.rank);
@@ -3792,10 +3804,13 @@ int run(int argc, char** argv) {
             // loop_res_query: rows 2 i (q's) and 2 i + 1 (the MoE's) of core layer i; loop_kv_res_query: k's and v's
             const size_t i = (size_t) (l - c.core0);
             std::vector<float> q(4 * C);
+            if (loop_arch) q = host_f32(S, b + "loop_msg_query.weight", 4 * C);   // rows q, k, v, the MoE's
+            else {
             std::memcpy(q.data(), lp_q.data() + 2 * i * C, C * 4);
             std::memcpy(q.data() + C, lp_kv.data() + 2 * i * C, C * 4);
             std::memcpy(q.data() + 2 * C, lp_kv.data() + (2 * i + 1) * C, C * 4);
             std::memcpy(q.data() + 3 * C, lp_q.data() + (2 * i + 1) * C, C * 4);
+            }
             Ly.lp_query = dev_f32(q);
             lp_all.insert(lp_all.end(), q.begin(), q.end());
             if (l == c.core1 - 1) M.lp_query_all = dev_f32(lp_all);
