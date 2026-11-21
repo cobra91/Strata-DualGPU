@@ -4156,6 +4156,38 @@ __global__ void decode_f16_iq_kernel(int type, const uint8_t* blocks, size_t nsu
     if (sb >= nsub) return;
     const int ib = (int) (sb & 7);
     float y[32];
+    if (type == kIQ3_S || type == kIQ4_NL) {   // (IQ3_S: 110-byte blocks of 8 sub-blocks; IQ4_NL: an 18-byte block each)
+        if (type == kIQ3_S) {
+            const uint8_t* b = blocks + (sb >> 3) * 110;
+            const float db = half_bits_to_float(__ldg((const uint16_t*) b)) *
+                             (float) (1 + 2 * ((__ldg(b + 106 + (ib >> 1)) >> (4 * (ib & 1))) & 0xF));
+            const uint32_t qh = __ldg(b + 66 + ib);
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const uint32_t g1 = __ldg(d_iq3s_grid + (__ldg(b + 2 + 8 * ib + 2 * l) | ((qh << (8 - 2 * l)) & 256u)));
+                const uint32_t g2 = __ldg(d_iq3s_grid + (__ldg(b + 3 + 8 * ib + 2 * l) | ((qh << (7 - 2 * l)) & 256u)));
+                const uint32_t sg = __ldg(b + 74 + 4 * ib + l);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    y[8 * l + j] = db * (float) ((g1 >> (8 * j)) & 0xFFu) * ((sg >> j) & 1u ? -1.0f : 1.0f);
+                    y[8 * l + 4 + j] = db * (float) ((g2 >> (8 * j)) & 0xFFu) * ((sg >> (4 + j)) & 1u ? -1.0f : 1.0f);
+                }
+            }
+        } else {
+            const uint8_t* b = blocks + sb * 18;
+            const float d = half_bits_to_float(__ldg((const uint16_t*) b));
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const uint8_t v = __ldg(b + 2 + j);
+                y[j] = d * (float) d_iq4nl[v & 0xF];
+                y[16 + j] = d * (float) d_iq4nl[v >> 4];
+            }
+        }
+        uint32_t* o = (uint32_t*) (out + sb * 32);
+#pragma unroll
+        for (int j = 0; j < 16; ++j) o[j] = (uint32_t) f2h(y[2 * j]) | ((uint32_t) f2h(y[2 * j + 1]) << 16);
+        return;
+    }
     if (type == kIQ3_XXS) {
         const uint8_t* b = blocks + (sb >> 3) * 98;
         const float d = half_bits_to_float(__ldg((const uint16_t*) b));
@@ -5181,8 +5213,8 @@ void decode_f16(int type, const uint8_t* blocks, size_t n, uint16_t* out, cudaSt
         check("decode_f16_q8");
         return;
     }
-    if ((type == kIQ3_XXS || type == kIQ4_XS) && n % 256 == 0 && (((uintptr_t) out & 3) == 0) &&
-        (((uintptr_t) blocks & (type == kIQ4_XS ? 3 : 1)) == 0)) {
+    if ((((type == kIQ3_XXS || type == kIQ4_XS || type == kIQ3_S) && n % 256 == 0) || (type == kIQ4_NL && n % 32 == 0)) &&
+        (((uintptr_t) out & 3) == 0) && (((uintptr_t) blocks & (type == kIQ4_XS ? 3 : 1)) == 0)) {
         decode_f16_iq_kernel<<<grid(n / 32), kBlk, 0, s>>>(type, blocks, n / 32, out);
         check("decode_f16_iq");
         return;
