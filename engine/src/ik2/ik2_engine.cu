@@ -1782,6 +1782,14 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
         }
         for (int e : X.miss_exps) X.slot_ptrs[e] = XC.get(Ly, l, e, tick, cst, nullptr, false, true);
 
+        // the layer's routing tables first: the host-to-device copies share one copy engine in order, and these small
+        // ones queued behind the misses' (megabytes each) held every expert's kernels back until the last miss landed
+        CU(cudaMemcpyAsync(X.gidx, gidx, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
+        CU(cudaMemcpyAsync(X.inv, inv, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
+        CU(cudaMemcpyAsync(X.sg, sg, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
+        CU(cudaMemcpyAsync(X.su, su, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
+        CU(cudaMemcpyAsync(X.wtr, wtr, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
+        CU(cudaMemsetAsync(X.tmp, 0, (size_t) T * C * 4, g_s));
         const int n_miss = (int) X.miss_exps.size();
         const int n_batches = (n_miss + Work::kMissBatch - 1) / Work::kMissBatch;
         for (int b = 0; b < n_batches; ++b) {
@@ -1795,12 +1803,6 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
         XC.t_up += now() - tu;
         g_pf.lap(g_pf.upload);
 
-        CU(cudaMemcpyAsync(X.gidx, gidx, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
-        CU(cudaMemcpyAsync(X.inv, inv, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
-        CU(cudaMemcpyAsync(X.sg, sg, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
-        CU(cudaMemcpyAsync(X.su, su, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
-        CU(cudaMemcpyAsync(X.wtr, wtr, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
-        CU(cudaMemsetAsync(X.tmp, 0, (size_t) T * C * 4, g_s));
 
         // Each expert: its tokens gathered, gate/up, SwiGLU, down, then added into tmp with their weights. The experts run
         // in index order whatever is cached (each waiting for its copies), so the sums' order and the result do not
