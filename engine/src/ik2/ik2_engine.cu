@@ -3589,6 +3589,12 @@ int run(int argc, char** argv) {
     g_graph = !(getenv("IK2_GRAPH") && !std::atoi(getenv("IK2_GRAPH")));
     g_attn_mma = c.D == 128 && c.H / c.KV <= 8 ? (getenv("IK2_ATTN_MMA") ? std::atoi(getenv("IK2_ATTN_MMA")) : 1) : 0;
     g_mma_split = k::attn_decode_mma_blocks(c.KV);
+    {   // a small card streaming its experts: the dense weights as blocks too (an FP16 output head alone is ~0.9 GiB
+        // of a cache that holds ~3 GiB: RTX 2060 SUPER 8 GB, Inkling-2-Mini IQ3_S, 654 -> 908 slots, TG 14.0 -> 20.7)
+        size_t fr1 = 0, tot1 = 0;
+        CU(cudaMemGetInfo(&fr1, &tot1));
+        if (!getenv("IK2_DENSE") && tot1 < (16ull << 30)) g_dense_q8 = true;
+    }
     const bool can_resident = (n_gpu == 1 || (dual() && g_ep)) && !g_pool;
     if (can_resident) {
         size_t exp_b = 0, dense_b = 0, kv_b = 0;
