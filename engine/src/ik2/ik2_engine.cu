@@ -4725,7 +4725,11 @@ int run(int argc, char** argv) {
     W.vconv = dalloc<float>(Tm * KD);
     W.rr = dalloc<float>(Tm * c.H * c.d_rel), W.sink = dalloc<float>(Tm * c.H);
     W.dyn = dalloc<float>(2 * Tm * c.KV * 4);   // (a full layer's dynamic taps: k's, and on the resident path v's beside)
-    W.lg_cap = std::max((size_t) 8 * c.H * (size_t) ctx + (size_t) 8 * c.H * 128 * 130, (size_t) 64 << 20);
+    // (at least 256 MiB, which the prompt attention's non-flash path batches its queries into; with the flash path's
+    //  prompts a small card keeps only what a decode token's attention needs, plus 16 MiB - IK2_LG_MIN_MB)
+    const size_t lg_floor = (size_t) (getenv("IK2_LG_MIN_MB") ? std::atoi(getenv("IK2_LG_MIN_MB"))
+                                                              : (small_card && g_flash && !g_kv_fp8 ? 16 : 256)) << 18;
+    W.lg_cap = std::max((size_t) 8 * c.H * (size_t) ctx + (size_t) 8 * c.H * 128 * 130, lg_floor);
     W.lg = dalloc<float>(W.lg_cap);
     W.blocks = dalloc<float>((size_t) (c.n_layer / c.block + 1) * T_buf * C);
     W.x16 = dalloc<uint16_t>(Tm * std::max(C, HD)), W.xk16 = dalloc<uint16_t>(Tm * C), W.xv16 = dalloc<uint16_t>(Tm * C);
