@@ -317,6 +317,9 @@ ik2::cpu::Pool* g_pool = nullptr;
 double g_t_cpu = 0.5e-3, g_t_up = 0.36e-3;   // seconds an expert: the pool's (measured as it runs), the link's
 uint64_t g_n_cpu = 0, g_n_wait = 0;
 bool g_cpu_lazy = true;   // IK2_CPU_LAZY=0: a CPU-computed expert is not copied in afterwards (the link carries less)
+// IK2_LAZY_MAX: lazy copy batches in flight at most; past it a CPU-computed expert is not copied in (its copies would
+// queue ahead of the next layers' urgent ones on the one host-to-device copy engine)
+int g_lazy_max = 1 << 30;
 constexpr int kRing = 256;
 cudaEvent_t g_ring[kRing];                   // a lazy batch's end on the copy stream, by sequence number
 uint64_t g_seq_next = 1, g_seq_done = 0;
@@ -2850,6 +2853,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             }
             const uint32_t stp = W.stamp;
             lazy_poll();
+            const bool lazy_ok = g_cpu_lazy && g_seq_next - 1 - g_seq_done < (uint64_t) g_lazy_max;
             double acc_up = 0, acc_cpu = 0;
             int urgent[64], lazy[64];
             int n_urgent = 0, n_lazy = 0;
@@ -2870,7 +2874,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 // a miss: the CPU's or the link's, whichever is free first
                 if (cpu_lane && acc_cpu + g_t_cpu <= acc_up + g_t_up) {
                     late[i] = 2, acc_cpu += g_t_cpu;
-                    if (g_cpu_lazy) {   // a slot for its blocks, copied in afterwards
+                    if (lazy_ok) {   // a slot for its blocks, copied in afterwards
                         where[i] = EC.get(Ly, l, e, tick, cst, nullptr, false, false);
                         slot_of[i] = EC.last_handle;
                         lazy[n_lazy++] = i;
@@ -3316,6 +3320,7 @@ namespace ik2 {
 int run(int argc, char** argv) {
     std::string model, toks, dump, draft_path;
     int gen = 16, chunk = 2048, ctx = 262144, threads = 8, n_gpu = 1;
+    bool threads_given = false;
     bool serve = false, serve_strata = true;   // (--serve: the engine protocol; --serve-ik2: the @-line one)
     std::vector<int> eos_ids;                 // --eos a,b: the tokens a request ends at (the engine protocol)
     double cache_gb = 60;
@@ -3345,7 +3350,7 @@ int run(int argc, char** argv) {
         else if (a == "--vram-reserve-mib") vram_reserve_mib = std::atof(next().c_str());
         else if (a == "--ctx" || a == "--max-context") ctx = std::atoi(next().c_str());   // (--max-context: serve/server.py's name)
         else if (a == "--cache-gb" || a == "--expert-vram") cache_gb = std::atof(next().c_str());
-        else if (a == "--threads" || a == "--cpu-threads" || a == "--pool-workers") threads = std::atoi(next().c_str());
+        else if (a == "--threads" || a == "--cpu-threads" || a == "--pool-workers") threads = std::atoi(next().c_str()), threads_given = true;
         else if (a == "--gpus") n_gpu = std::atoi(next().c_str());
         else if (a == "--draft") draft_path = next();
         else if (a == "--serve") serve = true;
@@ -3576,10 +3581,28 @@ int run(int argc, char** argv) {
     for (auto& e : g_ring) CU(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     // (off by default: on an RTX PRO 6000 node's Xeon 6737P an NVFP4 expert takes 0.73 ms on 7 threads against 0.33 ms
     //  over PCIe, and the lane measured 16.4 against 16.8 tok/s - IK2_CPU=1 to try it)
-    if (getenv("IK2_CPU") && std::atoi(getenv("IK2_CPU")) && ik2::cpu::available_any() && threads > 1 && n_gpu == 1)
+    // A card under 16 GB streams most of its experts over a slower link: the lane on by default (IK2_CPU=0: off), on
+    // half the hardware threads, the link's expert taken as 1 ms (IK2_UP_MS) and no lazy copies (IK2_LAZY_MAX) - a
+    // CPU-computed expert's copy queues ahead of the next layers' urgent ones on the one host-to-device engine
+    // (RTX 2060 SUPER, PCIe 3.0 x8, Ryzen 9 3900X, Inkling-2-Mini IQ3_S: TG 18.9 -> 28.8 tok/s)
+    bool small_card = false;
+    {
+        size_t fr2 = 0, tot2 = 0;
+        CU(cudaMemGetInfo(&fr2, &tot2));
+        small_card = n_gpu == 1 && tot2 < (16ull << 30);
+    }
+    const bool cpu_want = getenv("IK2_CPU") ? std::atoi(getenv("IK2_CPU")) != 0 : small_card;
+    if (small_card && cpu_want && !threads_given)
+        threads = std::max(threads, (int) std::thread::hardware_concurrency() / 2);
+    if (cpu_want && ik2::cpu::available_any() && threads > 1 && n_gpu == 1)
         g_pool = new ik2::cpu::Pool(threads - 1);
+    if (small_card && g_pool) {
+        g_t_up = 1e-3;
+        g_lazy_max = 0;
+    }
     if (getenv("IK2_UP_MS")) g_t_up = std::atof(getenv("IK2_UP_MS")) * 1e-3;
     g_cpu_lazy = !getenv("IK2_CPU_LAZY") || std::atoi(getenv("IK2_CPU_LAZY"));
+    if (getenv("IK2_LAZY_MAX")) g_lazy_max = std::max(0, std::atoi(getenv("IK2_LAZY_MAX")));
     if (n_gpu > 2 && getenv("IK2_DENSE")) die("IK2_DENSE with --gpus > 2");
 
     // Do the experts all fit in VRAM beside the dense weights and the K / V cache (Inkling-2-Mini's 14.7 GiB on a 24 GB
