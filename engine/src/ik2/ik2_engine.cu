@@ -2470,7 +2470,13 @@ __global__ void k_dp_plan(const int* __restrict__ top, const float* __restrict__
                           int* seqd, volatile int* ctl, const uint8_t** blob, int* tok, int* inv, float* sg, float* su,
                           float* wt, int* mflag) {
     __shared__ int s_seq;
-    if (threadIdx.x == 0) { const int q = seqd[0] + 1; seqd[0] = q; seqd[1] = q; s_seq = q; }
+    if (threadIdx.x == 0) {
+        const int q = seqd[0] + 1;
+        seqd[0] = q, seqd[1] = q, s_seq = q;
+        // (the ring's record q % R free: the host done with plan q - R - a plan without misses does not wait for the
+        // host, so a run of them could otherwise lap a record still being read)
+        while (dp_ld_sys(ctl + 2) < q - R) __nanosleep(256);
+    }
     __syncthreads();
     const int seq = s_seq;
     uint8_t* rec = ring + (size_t) (seq % R) * rec_bytes;
@@ -2504,7 +2510,7 @@ __global__ void k_dp_wait(const int* __restrict__ mflag, int K, const int* __res
         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
         while (dp_ld_sys(ctl + 2) < seq) __nanosleep(256);
         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
-        ctl[3] += (int) ((t1 - t0) / 1000);   // the GPU's wait for the CPU, us
+        ctl[3] = (int) min(2147483647ull, (unsigned long long) ctl[3] + (t1 - t0) / 1000);   // the GPU's wait, us (saturating)
         ctl[4] += 1;
     }
     __threadfence_system();
@@ -2596,6 +2602,17 @@ void dp_drain() {
         if (g_dp.owner[s2] >= 0) ECr.assign(g_dp.pool, s2, g_dp.owner[s2], ++ECr.tick);
     ECr.refree(g_dp.pool);
     g_dp.changed.clear();
+}
+// the device plan's copies drained and its mirror written back into the cache, before the host changes the cache
+// (a forward of several tokens, a growth of the K / V, slots lent); then the plan is rebuilt at its next token
+void dp_quiesce() {
+    if (g_dp.M && !g_dp.dirty) {
+        CU(cudaDeviceSynchronize());
+        g_dp.quiesce.store(1, std::memory_order_release);
+        while (g_dp.quiesce.load(std::memory_order_acquire) != 2) std::this_thread::yield();
+        g_dp.quiesce.store(0, std::memory_order_release);
+    }
+    g_dp.dirty = true;
 }
 // the host's side: each record in order, its misses on the CPU lane, then the counter
 void dp_service() {
@@ -2722,9 +2739,12 @@ void kv_ensure(Model& M, int need) {
     const int p = EC.layer_pool[M.V[full[0]].l];
     if (p < 0) die("--kv-grow: no pool");
     auto& P = EC.pools[p];
+    auto slots_for = [&](int cap) { return (int) ((2 * full.size() * (size_t) cap * tb + P.slot_bytes - 1) / P.slot_bytes); };
+    if (P.n_slots - slots_for(ncap) < 2 * c.E + 80)   // (the doubling does not fit: as few positions as asked for)
+        ncap = std::max(need, std::min((need + 255) / 256 * 256, g_kv_ctx));
     const size_t ob = (size_t) g_kv_cap_full * tb, nb = (size_t) ncap * tb;
     const size_t total = 2 * full.size() * nb;
-    const int k_new = (int) ((total + P.slot_bytes - 1) / P.slot_bytes);
+    const int k_new = slots_for(ncap);
     if (P.n_slots - k_new < 2 * c.E + 80)
         die("--kv-grow: the K / V for " + std::to_string(ncap) + " tokens leaves too few expert slots (this card holds the "
             "full layers' K / V for about " + std::to_string((int) ((size_t) std::max(0, P.n_slots - 2 * c.E - 80) * P.slot_bytes /
@@ -3566,6 +3586,7 @@ int big_begin(const Model& M, Work& W, ExpertCache& EC, int n, int ctx_end, BigS
     bs.pool = -1;
     kv_ensure(const_cast<Model&>(M), ctx_end);   // (--kv-grow takes the pool's top slots: before any are lent)
     if (W.T_sup <= 0 || dual() || (getenv("IK2_BORROW") && !std::atoi(getenv("IK2_BORROW")))) return W.T_sup;
+    dp_quiesce();   // (no copy of the plan's may land in a slot about to be lent)
     const Config& c = M.c;
     // the attention's scratch for 256 queries against the whole context: few, large GEMMs (the default ~400 MB left
     // room for only ~20 queries a step at 100k tokens) - also lent for a short prompt at the end of a long context
@@ -3765,8 +3786,8 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
         for (int off = 0; off < T; off += sub_chunk) {
             const int ts = std::min(sub_chunk, T - off);
             const float* msg_s = nullptr;
-            if (msg) {   // (the sub-chunk's messages, [4][ts][C] as run_layer_attn reads them)
-                for (int j = 0; j < 4; ++j)
+            if (msg) {   // (the sub-chunk's q / k / v messages, [3][ts][C] as run_layer_attn reads them; the MoE's
+                for (int j = 0; j < 3; ++j)  //  row 3 is read from lp_msg_s below)
                     CU(cudaMemcpyAsync(W.lp_sub + (size_t) j * ts * C, msg + j * TC + (size_t) off * C, (size_t) ts * C * 4,
                                        cudaMemcpyDeviceToDevice, g_s));
                 msg_s = W.lp_sub;
@@ -3961,8 +3982,12 @@ int run(int argc, char** argv) {
         else if (kv == "i8" || kv == "int8") g_kv_i8 = true;
         else die("unknown IK2_KV=" + kv + " (expected fp8, i8 or f16)");
         if (g_kv_fp8) {   // (the prompt attention's FP8 tiles need more shared memory than a block gets before sm_80)
-            int mj = 0;
-            CU(cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, 0));
+            int mj = 99;
+            for (int d = 0; d < std::max(1, n_gpu); ++d) {   // (every GPU that may hold layers)
+                int m = 0;
+                CU(cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d));
+                mj = std::min(mj, m);
+            }
             if (mj < 8) {
                 std::printf("IK2_KV=fp8: not on a compute capability %d GPU (the prefill attention needs sm_80); FP16 K / V\n", mj);
                 g_kv_fp8 = false;
@@ -4232,6 +4257,10 @@ int run(int argc, char** argv) {
         const bool fits = exp_b_dev0 + dense_b + kv_b + reserve <= fr0 && exp_b_dev0 <= (size_t) (cache_gb * 1073741824.0);
         if (fits && !getenv("IK2_DENSE")) g_dense_q8 = true;
         g_fast_want = fits && g_dense_q8 && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")));
+        if (g_fast_want && g_kv_grow) {   // (the resident tables point into every slot: none may become K / V)
+            if (kv_grow_arg > 0) std::printf("--kv-grow: not with every expert resident; off\n");
+            g_kv_grow = false;
+        }
         std::printf("experts %.1f GiB (%s), dense weights %.1f GiB as blocks, K / V cache %.1f GiB, %.1f GiB free: %s\n",
                     exp_b / 1073741824.0, dual() ? "split across 2 GPUs" : "1 GPU",
                     dense_b / 1073741824.0, kv_b / 1073741824.0, fr0 / 1073741824.0,
@@ -4737,6 +4766,9 @@ int run(int argc, char** argv) {
     {
         bool ok = !(getenv("IK2_DEVPLAN") && !std::atoi(getenv("IK2_DEVPLAN"))) && g_pool && n_gpu == 1 && !dual() &&
                   !g_tp && !g_fast_want && c.K <= 16;
+        // (its mirror is one pool's: every layer's experts the same slot size, as ExpertCache::init groups them)
+        for (int l = 1; ok && l < c.n_layer; ++l)
+            ok = (M.L[l].eb[0] + M.L[l].eb[1] + M.L[l].eb[2] + 255) / 256 == (M.L[0].eb[0] + M.L[0].eb[1] + M.L[0].eb[2] + 255) / 256;
         for (int l = 0; ok && l < c.n_layer; ++l) {
             const Layer& Ly = M.L[l];
             for (int r = 0; r < 3; ++r) ok = ok && ik2::cpu::available_for(Ly.ty[r]) && Ly.scale[r].empty();
@@ -4758,8 +4790,8 @@ int run(int argc, char** argv) {
     W.nk_max = std::min(ctx, ctx);
     // Tokens a layer-major prefill pass (every expert not in VRAM streams in once a pass): 16384 when there is room
     // (a pass's scratch is ~280 KB a token: 4.6 GB, taken from the expert cache), else 4096.
-    // (a looped model's prompts go through forward(): forward_prefill_sup has no loop yet)
-    // ... nor the resident path's models: a pass borrows cache slots, which would evict experts
+    // (a looped model's prompts: below - layer-major passes on one GPU, while the cache lends their scratch)
+    // ... not the resident path's models: a pass borrows cache slots, which would evict experts
     W.T_sup = ((n_gpu == 1 || dual()) && draft_path.empty() && c.n_pass == 1 && !g_fast_want && fr >= (20ULL << 30)) ? (fr >= (60ULL << 30) ? 16384 : 4096) : 0;
     // a looped model on one GPU: layer-major passes too, as long as the expert cache lends them (IK2_LOOP_SUP=0: off)
     if (!W.T_sup && c.n_pass > 1 && n_gpu == 1 && draft_path.empty() && !g_fast_want &&

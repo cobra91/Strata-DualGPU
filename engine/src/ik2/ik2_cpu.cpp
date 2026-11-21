@@ -310,7 +310,9 @@ namespace {
 // The spin pool's state is one 64-bit word, generation << 32 | next task: a task is claimed by compare-and-swap only
 // while the word carries the claimer's generation (a worker late from a run never takes or skips one of the next),
 // the runs' descriptions in a ring of 4 by generation.
-struct SpinRun { void (*fn)(int, void*) = nullptr; void* ctx = nullptr; int n = 0; };
+// (n atomic: a worker late from an earlier run may read it while the caller rewrites the slot four runs on - its CAS
+// then fails on the generation; fn and ctx are read only after a CAS that succeeded, ordered by it)
+struct SpinRun { void (*fn)(int, void*) = nullptr; void* ctx = nullptr; std::atomic<int> n{0}; };
 struct SpinPool {
     std::vector<std::thread> th;
     std::atomic<uint64_t> state{0};
@@ -325,7 +327,7 @@ void spin_claim(uint32_t g) {
         if ((uint32_t) (v >> 32) != g) return;
         const SpinRun& r = g_spin.run[g & 3];
         const int i = (int) (uint32_t) v;
-        if (i >= r.n) return;
+        if (i >= r.n.load(std::memory_order_relaxed)) return;
         if (g_spin.state.compare_exchange_weak(v, v + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
             r.fn(i, r.ctx);
             g_spin.done.fetch_add(1, std::memory_order_release);
@@ -336,7 +338,9 @@ void spin_claim(uint32_t g) {
 void spin_run(int n, void (*fn)(int, void*), void* ctx) {
     if (n <= 0) return;
     const uint32_t g = ++g_spin.gen;
-    g_spin.run[g & 3] = SpinRun{fn, ctx, n};
+    SpinRun& r = g_spin.run[g & 3];
+    r.fn = fn, r.ctx = ctx;
+    r.n.store(n, std::memory_order_relaxed);
     g_spin.done.store(0, std::memory_order_relaxed);
     g_spin.state.store((uint64_t) g << 32, std::memory_order_release);
     spin_claim(g);
