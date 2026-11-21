@@ -732,6 +732,7 @@ struct ExpertCache {
         size_t slot_bytes = 0;
         int n_slots = 0, prob_cap = 0, n_layers = 0;
         int n_active = 0;               // slots in use as cache; [n_active, n_slots) lent out (lend)
+        int kv_res = 0;                 // the last kv_res slots: the full layers' K / V (--kv-grow), never given back
         uint8_t* data = nullptr;
         std::vector<int> owner;         // slot -> expert idx (l * E + e), -1 if free
         std::vector<uint64_t> used;     // slot -> last tick
@@ -1072,7 +1073,7 @@ struct ExpertCache {
     }
     void give_back(int p) {
         Pool& P = pools[p];
-        P.n_active = P.n_slots;
+        P.n_active = P.n_slots - P.kv_res;
         rebuild_free(P);
     }
     bool has(int l, int e) const { return loc[l * E + e] >= 0; }
@@ -2361,8 +2362,65 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
     }
 }
 
+// --kv-grow (default on a card under 16 GB): the full-attention layers' K / V are not allocated for the whole --ctx at
+// load but kept in the top slots of the expert cache's pool, as many as the positions so far need, doubling; a growth
+// drops the experts in the slots it takes and moves the K / V there (through host memory: the regions overlap)
+bool g_kv_grow = false;
+int g_kv_cap_full = 0;
+int g_kv_ctx = 0;        // --ctx   // the full layers' K / V capacity now (tokens)
+void kv_ensure(Model& M, int need) {
+    if (!g_kv_grow || need <= g_kv_cap_full) return;
+    const Config& c = M.c;
+    const size_t KD = (size_t) c.KV * c.D, eb = g_kv_fp8 ? 1 : 2;
+    int ncap = std::max(need, std::max(2 * g_kv_cap_full, g_kv_fp8 ? 4096 : 2048));
+    ncap = std::min((ncap + 255) / 256 * 256, M.V.empty() ? ncap : g_kv_ctx);
+    if (ncap < need) die("--kv-grow: past --ctx");
+    std::vector<int> full;
+    for (int v = 0; v < (int) M.V.size(); ++v) if (!M.L[M.V[v].l].sliding) full.push_back(v);
+    if (full.empty()) return;
+    ExpertCache& EC = dev_cache(0);
+    const int p = EC.layer_pool[M.V[full[0]].l];
+    if (p < 0) die("--kv-grow: no pool");
+    auto& P = EC.pools[p];
+    const size_t ob = (size_t) g_kv_cap_full * KD * eb, nb = (size_t) ncap * KD * eb;
+    const size_t total = 2 * full.size() * nb;
+    const int k_new = (int) ((total + P.slot_bytes - 1) / P.slot_bytes);
+    if (P.n_slots - k_new < 2 * c.E + 80) die("--kv-grow: the K / V for " + std::to_string(ncap) + " tokens leaves too few expert slots");
+    CU(cudaDeviceSynchronize());
+    g_seq_done = g_seq_next - 1;
+    std::vector<uint8_t> old;   // the K / V so far, through the host (the old and the new regions overlap)
+    if (ob) {
+        old.resize(2 * full.size() * ob);
+        for (size_t i = 0; i < full.size(); ++i) {
+            const Visit& Vi = M.V[full[i]];
+            const void* kp = g_kv_fp8 ? (const void*) Vi.kc8 : (const void*) Vi.kc;
+            const void* vp = g_kv_fp8 ? (const void*) Vi.vc8 : (const void*) Vi.vc;
+            CU(cudaMemcpy(old.data() + (2 * i) * ob, kp, ob, cudaMemcpyDeviceToHost));
+            CU(cudaMemcpy(old.data() + (2 * i + 1) * ob, vp, ob, cudaMemcpyDeviceToHost));
+        }
+    }
+    EC.lend(p, P.n_active - (P.n_slots - k_new));   // the experts in the new slots dropped
+    P.kv_res = k_new;
+    uint8_t* base = P.data + (size_t) (P.n_slots - k_new) * P.slot_bytes;
+    for (size_t i = 0; i < full.size(); ++i) {
+        Visit& Vi = M.V[full[i]];
+        uint8_t* kp = base + (2 * i) * nb;
+        uint8_t* vp = base + (2 * i + 1) * nb;
+        if (ob) {
+            CU(cudaMemcpy(kp, old.data() + (2 * i) * ob, ob, cudaMemcpyHostToDevice));
+            CU(cudaMemcpy(vp, old.data() + (2 * i + 1) * ob, ob, cudaMemcpyHostToDevice));
+        }
+        if (g_kv_fp8) Vi.kc8 = kp, Vi.vc8 = vp;
+        else Vi.kc = (uint16_t*) kp, Vi.vc = (uint16_t*) vp;
+        Vi.kv_cap = ncap;
+    }
+    std::printf("kv-grow: the full layers' K / V for %d tokens (%.2f GiB, %d expert slots; %d left)\n", ncap,
+                total / 1073741824.0, k_new, P.n_slots - k_new);
+    g_kv_cap_full = ncap;
+}
 void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode out_mode, const std::string& dump,
              std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp) {
+    kv_ensure(M, pos0 + T);
     const Config& c = M.c;
     const int C = c.C;
     if ((g_fast || g_ep_fast) && T == 1 && dump.empty() && !g_prof && !g_rec && !g_taps && !g_trace && g_pop.empty() &&
@@ -3321,6 +3379,7 @@ int run(int argc, char** argv) {
     std::string model, toks, dump, draft_path;
     int gen = 16, chunk = 2048, ctx = 262144, threads = 8, n_gpu = 1;
     bool threads_given = false;
+    int kv_grow_arg = -1;   // --kv-grow 0 / 1 (default: on a card under 16 GB)
     bool serve = false, serve_strata = true;   // (--serve: the engine protocol; --serve-ik2: the @-line one)
     std::vector<int> eos_ids;                 // --eos a,b: the tokens a request ends at (the engine protocol)
     double cache_gb = 60;
@@ -3348,6 +3407,7 @@ int run(int argc, char** argv) {
             else chunk = std::max(1, std::atoi(v.c_str()));
         }
         else if (a == "--vram-reserve-mib") vram_reserve_mib = std::atof(next().c_str());
+        else if (a == "--kv-grow") kv_grow_arg = std::atoi(next().c_str());
         else if (a == "--ctx" || a == "--max-context") ctx = std::atoi(next().c_str());   // (--max-context: serve/server.py's name)
         else if (a == "--cache-gb" || a == "--expert-vram") cache_gb = std::atof(next().c_str());
         else if (a == "--threads" || a == "--cpu-threads" || a == "--pool-workers") threads = std::atoi(next().c_str()), threads_given = true;
@@ -3596,7 +3656,9 @@ int run(int argc, char** argv) {
         threads = std::max(threads, (int) std::thread::hardware_concurrency() / 2);
     if (cpu_want && ik2::cpu::available_any() && threads > 1 && n_gpu == 1)
         g_pool = new ik2::cpu::Pool(threads - 1);
-    if (small_card && g_pool) g_lazy_max = 0;   // (and the link's expert time measured once the cache is up)
+    if (small_card && g_pool) g_lazy_max = 0;
+    g_kv_grow = kv_grow_arg >= 0 ? kv_grow_arg != 0 : small_card;
+    g_kv_ctx = ctx;   // (and the link's expert time measured once the cache is up)
     if (getenv("IK2_UP_MS")) g_t_up = std::atof(getenv("IK2_UP_MS")) * 1e-3;
     g_cpu_lazy = !getenv("IK2_CPU_LAZY") || std::atoi(getenv("IK2_CPU_LAZY"));
     if (getenv("IK2_LAZY_MAX")) g_lazy_max = std::max(0, std::atoi(getenv("IK2_LAZY_MAX")));
@@ -3855,7 +3917,8 @@ int run(int argc, char** argv) {
         const Layer& Ly = M.L[Vi.l];
         use_dev(Ly.dev);
         Vi.kv_cap = Ly.sliding ? std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : ctx;
-        if (g_kv_fp8) {
+        if (g_kv_grow && !Ly.sliding) Vi.kv_cap = 0;   // (kv_ensure: in the expert pool, as the positions need)
+        else if (g_kv_fp8) {
             Vi.kc8 = dalloc<uint8_t>((size_t) Vi.kv_cap * KD);
             Vi.vc8 = dalloc<uint8_t>((size_t) Vi.kv_cap * KD);
         } else {
