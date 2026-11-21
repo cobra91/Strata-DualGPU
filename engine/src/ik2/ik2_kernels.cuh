@@ -184,9 +184,11 @@ void experts_gate_up(const uint8_t* const* blob, const int* tok, int S, int ty_g
 /// FP16 (gate / up: x as two limbs, x16 [2][C] = hi, lo with x = hi + lo - to_f16_limbs, or route_token's x_limbs;
 /// down: h [S][F]), a code times its scale exact in FP16, the sum FP32.  C and F multiples of 64.
 void to_f16_limbs(const float* x, size_t n, uint16_t* y, cudaStream_t s);
+void to_f16_limbs_tokens(const float* x, int T, int C, uint16_t* y, cudaStream_t s);
 bool experts_mma_fits(int ty_gate, int ty_up, int ty_down, int C, int F);
 void experts_gate_up_swiglu_mma(const uint8_t* const* blob, int S, size_t eb0, const uint16_t* x16, int C, int F,
-                                const float* sg, const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s);
+                                const float* sg, const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s,
+                                const int* tok = nullptr);
 void experts_down_mma(const uint8_t* const* blob, int S, size_t off_down, const uint16_t* h, int C, int F, float* y,
                       cudaStream_t s);
 void experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_down, const uint16_t* h, int C, int F,
@@ -310,6 +312,27 @@ void route_token(const float* logits, const float* bias, int E, int K, float sca
                  const float* sg_t, const float* su_t, const float* sd_t, int* top, float* w, const uint8_t** blob,
                  int* tok, int* inv, float* sg, float* su, float* wt, cudaStream_t s, const float* x = nullptr,
                  int width = 0, uint16_t* x_limbs = nullptr);
+
+/// EP token dispatch: select resident expert pointer and scales for S slots on device d.
+/// If tab[top[i]] is null (owned by peer GPU), blob[i] is null.
+void ep_select_token(const int* top, const float* w, const uint8_t* const* tab,
+                     const float* sg_t, const float* su_t, const float* sd_t,
+                     int S, const uint8_t** blob, int* tok, int* inv,
+                     float* sg, float* su, float* wt, cudaStream_t s, int K = 2);
+
+/// EP token combine: combine S output rows from GPU 0 (y0) and GPU 1 (y1) using blob0 to determine owner.
+/// If blob0[k] != nullptr, slot k was computed on GPU 0 (y0[k]); else on GPU 1 (y1[k]).
+void ep_combine_token(const float* y0, const float* y1, const uint8_t* const* blob0,
+                      const float* wt, int S, int C, float* out, cudaStream_t s);
+
+/// EP block combine: combine S output rows from GPU 0 (y0) and GPU 1 (y1) across T tokens and K experts.
+void ep_combine_block(const float* y0, const float* y1, const uint8_t* const* blob0,
+                      const float* wt, int T, int K, int C, float* out, cudaStream_t s);
+
+/// Fused EP combine + short conv epilogue (conv4_res) in one launch.
+void ep_combine_conv(const float* y0, const float* y1, const uint8_t* const* blob0,
+                     const float* wt, int S, int C, float* hist, const float* w,
+                     const float* res, float* out, cudaStream_t s);
 /// prep_qkv_r_f16 / _fp8 of one token whose position is at pos (device): the cache slot from it, and with log_scale
 /// (a full layer) q's and r's tau.  q16 (given): an FP16 copy of the clipped q, [H][D] (attn_decode_mma's).
 /// sink_w (given): the token's sinks in the same launch, sink_y [H] = sink_w [H][sink_k] (FP16) . sink_x (mv_f16's).

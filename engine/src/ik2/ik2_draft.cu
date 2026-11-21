@@ -144,7 +144,8 @@ struct DLayer {
 };
 
 struct Drafter {
-    int C = 4608, H = 48, KV = 8, F = 18432, R = 256, V = 0, ctx = 0;
+    int C = 2304, H = 24, KV = 8, F = 9216, R = 256, V = 0, ctx = 0;
+    int n_layers = 3, n_taps = 4;
     float eps = 1e-6f, theta = 1e6f;
     std::vector<DLayer> L;
     float *alpha, *norm, *mask, *mk_dflare, *rnn_b;
@@ -258,35 +259,73 @@ const std::vector<int>& tap_layers() {
     return v;
 }
 
+int taps(const Drafter* d) { return d ? d->n_taps : 8; }
+
 Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cudaStream_t s) {
     const StFile f = st_open(path);
     auto* d = new Drafter;
     d->C = C, d->ctx = ctx, d->blas = blas, d->s = s;
+
+    auto find_tensor = [&](const std::string& n1, const std::string& n2 = "") -> std::string {
+        if (f.t.find(n1) != f.t.end()) return n1;
+        if (!n2.empty() && f.t.find(n2) != f.t.end()) return n2;
+        return "";
+    };
+
+    std::string fw_name = find_tensor("fuse_weight");
+    if (fw_name.empty()) throw std::runtime_error("drafter: no fuse_weight");
+    const auto& fw_t = f.t.at(fw_name);
+    if (fw_t.shape.size() != 2) throw std::runtime_error("drafter: invalid fuse_weight shape");
+    const int num_fuse_rows = (int) fw_t.shape[0];
+    const int num_taps = (int) fw_t.shape[1];
+    d->n_taps = num_taps;
+    d->n_layers = num_fuse_rows - 1;
+
+    std::string w1_name = find_tensor("markov_head.markov_w1.weight");
+    if (w1_name.empty() || f.t.at(w1_name).shape.size() != 2) throw std::runtime_error("drafter: no markov_w1");
+    d->V = (int) f.t.at(w1_name).shape[0];
+    d->R = (int) f.t.at(w1_name).shape[1];
+
+    std::string q_name = find_tensor("layers.0.self_attn.q_proj.weight");
+    if (q_name.empty() || f.t.at(q_name).shape.size() != 2) throw std::runtime_error("drafter: no q_proj.weight");
+    d->H = (int) (f.t.at(q_name).shape[0] / 128);
+
+    std::string k_name = find_tensor("layers.0.self_attn.k_proj.weight");
+    if (k_name.empty() || f.t.at(k_name).shape.size() != 2) throw std::runtime_error("drafter: no k_proj.weight");
+    d->KV = (int) (f.t.at(k_name).shape[0] / 128);
+
+    std::string g_name = find_tensor("layers.0.mlp.gate_proj.weight");
+    if (g_name.empty() || f.t.at(g_name).shape.size() != 2) throw std::runtime_error("drafter: no gate_proj.weight");
+    d->F = (int) f.t.at(g_name).shape[0];
+
     const int64_t H = d->H, KV = d->KV, F = d->F, R = d->R;
+
+    // fuse_weight [num_fuse_rows][num_taps] -> softmax over each row
     {
-        auto it = f.t.find("markov_head.markov_w1.weight");
-        if (it == f.t.end() || it->second.shape.size() != 2) throw std::runtime_error("drafter: no markov_w1");
-        d->V = (int) it->second.shape[0];
-    }
-    // fuse_weight [6][8] -> softmax over each row
-    {
-        const auto fw = st_bf16(f, "fuse_weight", {6, kTaps});
+        const auto fw = st_bf16(f, fw_name, {num_fuse_rows, num_taps});
         std::vector<float> a(fw.size());
-        for (int r = 0; r < 6; ++r) {
+        for (int r = 0; r < num_fuse_rows; ++r) {
             float m = -1e30f, sum = 0;
-            for (int t = 0; t < kTaps; ++t) m = std::max(m, bf(fw[r * kTaps + t]));
-            for (int t = 0; t < kTaps; ++t) sum += (a[r * kTaps + t] = std::exp(bf(fw[r * kTaps + t]) - m));
-            for (int t = 0; t < kTaps; ++t) a[r * kTaps + t] /= sum;
+            for (int t = 0; t < num_taps; ++t) m = std::max(m, bf(fw[r * num_taps + t]));
+            for (int t = 0; t < num_taps; ++t) sum += (a[r * num_taps + t] = std::exp(bf(fw[r * num_taps + t]) - m));
+            for (int t = 0; t < num_taps; ++t) a[r * num_taps + t] /= sum;
         }
         d->alpha = dalloc<float>(a.size());
         cu(cudaMemcpy(d->alpha, a.data(), a.size() * 4, cudaMemcpyHostToDevice), "alpha");
     }
-    const int local_ids[] = {0, 1, 3, 4};
-    d->L.resize(5);
-    for (int i = 0; i < 5; ++i) {
+
+    std::vector<int> local_ids;
+    if (d->n_layers == 3) {
+        local_ids = {0, 2};
+    } else {
+        local_ids = {0, 1, 3, 4};
+    }
+
+    d->L.resize(d->n_layers);
+    for (int i = 0; i < d->n_layers; ++i) {
         DLayer& l = d->L[i];
         const std::string b = "layers." + std::to_string(i) + ".";
-        l.local = std::find(std::begin(local_ids), std::end(local_ids), i) != std::end(local_ids);
+        l.local = std::find(local_ids.begin(), local_ids.end(), i) != local_ids.end();
         l.in_norm = up32(d, st_bf16(f, b + "input_layernorm.weight", {C}));
         l.post_norm = up32(d, st_bf16(f, b + "post_attention_layernorm.weight", {C}));
         l.dflare = up32(d, st_bf16(f, b + "dflare_norm.weight", {C}));
@@ -310,14 +349,23 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
         l.vc = dalloc<float>((size_t) ctx * KV * 128);
         d->vram += (size_t) ctx * KV * 128 * 8;
     }
-    d->norm = up32(d, st_bf16(f, "norm.weight", {C}));
+
+    std::string norm_name = find_tensor("norm.weight", "output_norm.weight");
+    if (norm_name.empty()) throw std::runtime_error("drafter: no norm.weight");
+    d->norm = up32(d, st_bf16(f, norm_name, {C}));
+
     d->mask = up32(d, st_bf16(f, "mask_embed", {C}));
-    d->mk_dflare = up32(d, st_bf16(f, "markov_head.dflare_norm.weight", {C}));
-    d->w1 = up16(d, st_bf16(f, "markov_head.markov_w1.weight", {d->V, R}));
+
+    std::string mk_dflare_name = find_tensor("markov_head.dflare_norm.weight", "dspark_norm.weight");
+    if (mk_dflare_name.empty()) throw std::runtime_error("drafter: no markov dflare_norm");
+    d->mk_dflare = up32(d, st_bf16(f, mk_dflare_name, {C}));
+
+    d->w1 = up16(d, st_bf16(f, w1_name, {d->V, R}));
     d->rnn_w = up16(d, st_bf16(f, "markov_head.rnn_proj.weight", {3 * R, 2 * R + 2 * C}));
     d->rnn_b = up32(d, st_bf16(f, "markov_head.rnn_proj.bias", {3 * R}));
     d->hout_w = st_bf16(f, "markov_head.hidden_out.weight", {C, R});
     d->hout_b = st_bf16(f, "markov_head.hidden_out.bias", {C});
+
     // work buffers
     const size_t T = kBlock;
     d->x = dalloc<float>(T * C), d->res = dalloc<float>(T * C), d->h = dalloc<float>(T * C);
@@ -374,13 +422,13 @@ void fold(Drafter* d, const uint16_t* lm_f16, int n_rows) {
 }
 
 void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos0) {
-    const int C = d->C, KD = d->KV * 128;
+    const int C = d->C, KD = d->KV * 128, n_taps = d->n_taps;
     for (int a = 0; a < m; a += kMixRows) {
         const int n = std::min(kMixRows, m - a);
         iota_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, d->s>>>(d->ctx_pos, pos0 + a, n);
         for (auto& l : d->L) {
             const int li = (int) (&l - d->L.data());
-            k::mix_rms(taps + (size_t) (r0 + a) * C, kTaps, (size_t) ld * C, n, C, d->alpha + li * kTaps, l.dflare,
+            k::mix_rms(taps + (size_t) (r0 + a) * C, n_taps, (size_t) ld * C, n, C, d->alpha + li * n_taps, l.dflare,
                        d->eps, d->mix, d->s);
             k::to_bf16(d->mix, (size_t) n * C, d->hb, d->s);
             float* kd = l.kc + (size_t) (pos0 + a) * KD;
@@ -393,7 +441,8 @@ void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos
 }
 
 void set_f_rnn(Drafter* d, const float* taps, int ld, int row) {
-    k::mix_rms(taps + (size_t) row * d->C, kTaps, (size_t) ld * d->C, 1, d->C, d->alpha + 5 * kTaps, d->mk_dflare,
+    const int markov_row = (int) d->L.size();
+    k::mix_rms(taps + (size_t) row * d->C, d->n_taps, (size_t) ld * d->C, 1, d->C, d->alpha + markov_row * d->n_taps, d->mk_dflare,
                d->eps, d->f_rnn, d->s);
 }
 

@@ -29,12 +29,15 @@ namespace ik2::draft {
 
 struct Drafter;
 
-/// The target's layers whose stream is a tap (at their start), the final normed hidden being tap 7.
+/// The target's layers whose stream is a tap (at their start), the final normed hidden being tap 7 (or 3 for looped model).
 const std::vector<int>& tap_layers();
 constexpr int kTaps = 8, kBlock = 8;
 
+/// Number of taps the loaded drafter expects (4 for Mini, 8 for Small).
+int taps(const Drafter* d);
+
 /// Loads mtp.safetensors (path) onto the current device; ctx: positions the context caches hold.  C: the target's
-/// width (4608).  Throws (std::runtime_error) on a file it does not understand.
+/// width (2304 for Mini, 4608 for Small).  Throws (std::runtime_error) on a file it does not understand.
 Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cudaStream_t s);
 /// The Markov head's bias folded through the target's output head (FP16 [n_rows][C], on the device).
 void fold(Drafter* d, const uint16_t* lm_f16, int n_rows);

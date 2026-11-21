@@ -260,6 +260,9 @@ struct Layer {
     const uint8_t** tab_blob = nullptr;
     float* tab_sc[3] = {};
     std::vector<const uint8_t*> tab_h;             // (tab_blob on the host: a short prompt's groups)
+    // multi-GPU EP resident tables: local expert pointers on device d (null if owned by peer)
+    const uint8_t** ep_tab_blob[2] = {nullptr, nullptr};
+    float* ep_tab_sc[2][3] = {};
     // the state: of the visit being run (bind_visit)
     uint16_t *kc = nullptr, *vc = nullptr;         // FP16 [kv_cap][KV * D] (IK2_KV=f16)
     uint8_t *kc8 = nullptr, *vc8 = nullptr;        // FP8 E4M3 [kv_cap][KV * D] (IK2_KV=fp8)
@@ -348,7 +351,17 @@ int g_pop_E_ep = 0;
 // expert e of every layer belongs to GPU e & 1, each GPU with its own cache over all layers and its own PCIe link.
 // In decode a layer's picks go to their GPUs at once, both links copying the misses side by side.
 bool g_ep = false;
+bool g_ep_fast = false;
 cudaEvent_t g_ep_x, g_ep_cp[2], g_ep_done;
+struct EpStaging {
+    void* h_xq = nullptr;
+    void* h_route = nullptr;
+    void* h_y = nullptr;
+    float* d_xq[2] = {};
+    int* d_route[2] = {};
+    float* d_y[2] = {};
+};
+EpStaging g_ep_stage;
 // IK2_TP=1 with --gpus 2: the experts tensor-parallel instead. GPU d holds half of every expert: rows [d F/2, ..) of
 // gate and up and rows [d C/2, ..) of down, so every miss is half on each link. A layer: each GPU its half of h
 // (gate/up/SwiGLU), the halves swapped (P2P), each GPU its half of the output rows (down), concatenated on GPU 0.
@@ -1170,11 +1183,12 @@ uint64_t g_cnt_hist[4] = {0, 0, 0, 0};
 uint64_t g_src_hist[4] = {0, 0, 0, 0};
 extern "C" void on_usr1(int) { g_cancel = 1; }
 
-// Speculative decoding: g_taps [8][g_taps_ld][C] gets the drafter's taps of every position a forward call runs (the
+// Speculative decoding: g_taps [g_taps_n][g_taps_ld][C] gets the drafter's taps of every position a forward call runs (the
 // stream at the start of layers 5, 11, .., 41, the final normed hidden); with g_rec each short conv's history and
 // inputs are kept, so that a verify window's rejected part can be taken back (rollback()).
 float* g_taps = nullptr;
 int g_taps_ld = 0;
+int g_taps_n = 0;
 bool g_rec = false;
 void conv_rec(Layer& Ly, int which, const float* x, const float* hist, int T, int Cc) {
     if (!g_rec) return;
@@ -1958,12 +1972,12 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
             outs.y32[0] = (g_taps || g_dense_q8) ? W.xq : nullptr;
             k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, T, C, 1e-6f, c.eps, outs, g_s);
             if (g_taps)
-                CU(cudaMemcpyAsync(g_taps + (size_t) 7 * g_taps_ld * C, W.xq, TC * 4, cudaMemcpyDeviceToDevice, g_s));
+                CU(cudaMemcpyAsync(g_taps + (size_t) (g_taps_n - 1) * g_taps_ld * C, W.xq, TC * 4, cudaMemcpyDeviceToDevice, g_s));
         } else {
             k::attn_res(st, nb + 1, M.out_res_score, 1, T, C, 1e-6f, W.tmp, g_s);
             k::rms(W.tmp, M.out_norm, T, C, c.eps, W.xq, g_s);
             if (g_taps)
-                CU(cudaMemcpyAsync(g_taps + (size_t) 7 * g_taps_ld * C, W.xq, TC * 4, cudaMemcpyDeviceToDevice, g_s));
+                CU(cudaMemcpyAsync(g_taps + (size_t) (g_taps_n - 1) * g_taps_ld * C, W.xq, TC * 4, cudaMemcpyDeviceToDevice, g_s));
             if (out_mode != OutMode::kNone) k::to_f16(W.xq + (size_t) (T - 1) * C, (size_t) C, W.x16, g_s);
         }
         if (out_mode != OutMode::kNone) {
@@ -2012,6 +2026,7 @@ int g_mma_split = 1;        // its blocks a K / V head (k::attn_decode_mma_block
 struct FastGraph {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
+    bool disabled = false;
 };
 FastGraph g_fgraph[4];      // by OutMode
 
@@ -2175,19 +2190,81 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         // (NVFP4 experts go through the tensor cores, their input as two FP16 limbs the router's launch writes)
         static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
         const bool exp_tc = exp_mma && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
-        k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
-                       Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
-                       exp_tc ? (uint16_t*) W.gu32 : nullptr);
-        if (exp_tc) {
-            k::experts_gate_up_swiglu_mma(W.blob, c.K, Ly.eb[0], (const uint16_t*) W.gu32, C, c.F, W.sg, W.su,
+        if (!g_ep_fast) {
+            k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
+                           Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
+                           exp_tc ? (uint16_t*) W.gu32 : nullptr);
+            if (exp_tc) {
+                k::experts_gate_up_swiglu_mma(W.blob, c.K, Ly.eb[0], (const uint16_t*) W.gu32, C, c.F, W.sg, W.su,
+                                              c.gate_cap, c.up_cap, W.h16, g_s);
+                k::experts_down_mma(W.blob, c.K, Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+            } else {
+                k::experts_gate_up_swiglu(W.blob, W.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, c.F, W.sg, W.su,
                                           c.gate_cap, c.up_cap, W.h16, g_s);
-            k::experts_down_mma(W.blob, c.K, Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+                k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+            }
+            k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
         } else {
-            k::experts_gate_up_swiglu(W.blob, W.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, c.F, W.sg, W.su,
-                                      c.gate_cap, c.up_cap, W.h16, g_s);
-            k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+            const int S = c.K;
+            const int F = c.F;
+            k::route(W.rlog, Ly.probs_b, 1, c.E, c.K, c.route_scale, rtop, rw, g_s);
+
+            // 1. Send xq and route_d from GPU 0 to GPU 1
+            if (g_ep_stage.d_xq[0]) {
+                CU(cudaMemcpyAsync(g_ep_stage.d_xq[0], dev_work(0).xq, (size_t) C * 4, cudaMemcpyDeviceToDevice, g_s));
+                CU(cudaMemcpyAsync(g_ep_stage.d_route[0], dev_work(0).route_d, (size_t) S * 8, cudaMemcpyDeviceToDevice, g_s));
+            } else {
+                CU(cudaMemcpyPeerAsync(dev_work(1).xq, 1, dev_work(0).xq, 0, (size_t) C * 4, g_s));
+                CU(cudaMemcpyPeerAsync(dev_work(1).route_d, 1, dev_work(0).route_d, 0, (size_t) S * 8, g_s));
+            }
+            CU(cudaEventRecord(g_ep_x, g_s));
+
+            // Helper to run experts on a device
+            auto run_dev_exp = [&](int /*d*/, Work& Wd, cudaStream_t strm) {
+                if (exp_tc) {
+                    k::to_f16_limbs(Wd.xq, (size_t) C, (uint16_t*) Wd.gu32, strm);
+                    k::experts_gate_up_swiglu_mma(Wd.blob, S, Ly.eb[0], (const uint16_t*) Wd.gu32, C, F, Wd.sg, Wd.su,
+                                                  c.gate_cap, c.up_cap, Wd.h16, strm);
+                    k::experts_down_mma(Wd.blob, S, Ly.eb[0] + Ly.eb[1], Wd.h16, C, F, Wd.y32, strm);
+                } else {
+                    k::experts_gate_up_swiglu(Wd.blob, Wd.tok, S, Ly.ty[0], Ly.ty[1], Ly.eb[0], Wd.xq, C, F, Wd.sg, Wd.su,
+                                              c.gate_cap, c.up_cap, Wd.h16, strm);
+                    k::experts_down(Wd.blob, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], Wd.h16, C, F, Wd.y32, strm);
+                }
+            };
+
+            // 2. GPU 1: wait for xq & route_d, select resident experts, compute experts, copy result to GPU 0
+            use_dev(1);
+            CU(cudaStreamWaitEvent(g_s, g_ep_x, 0));
+            if (g_ep_stage.d_xq[1]) {
+                CU(cudaMemcpyAsync(dev_work(1).xq, g_ep_stage.d_xq[1], (size_t) C * 4, cudaMemcpyDeviceToDevice, g_s));
+                k::ep_select_token(g_ep_stage.d_route[1], (const float*)(g_ep_stage.d_route[1] + S), Ly.ep_tab_blob[1],
+                                   Ly.ep_tab_sc[1][0], Ly.ep_tab_sc[1][1], Ly.ep_tab_sc[1][2],
+                                   S, dev_work(1).blob, dev_work(1).tok, dev_work(1).inv, dev_work(1).sg, dev_work(1).su, dev_work(1).wt, g_s);
+            } else {
+                k::ep_select_token(dev_work(1).route_d, (const float*)(dev_work(1).route_d + S), Ly.ep_tab_blob[1],
+                                   Ly.ep_tab_sc[1][0], Ly.ep_tab_sc[1][1], Ly.ep_tab_sc[1][2],
+                                   S, dev_work(1).blob, dev_work(1).tok, dev_work(1).inv, dev_work(1).sg, dev_work(1).su, dev_work(1).wt, g_s);
+            }
+            run_dev_exp(1, dev_work(1), g_s);
+            if (g_ep_stage.d_y[1]) {
+                CU(cudaMemcpyAsync(g_ep_stage.d_y[1], dev_work(1).y32, (size_t) S * C * 4, cudaMemcpyDeviceToDevice, g_s));
+            } else {
+                CU(cudaMemcpyPeerAsync(dev_work(0).y32 + (size_t) S * C, 0, dev_work(1).y32, 1, (size_t) S * C * 4, g_s));
+            }
+            CU(cudaEventRecord(g_ep_done, g_s));
+
+            // 3. GPU 0: select resident experts, compute experts, wait for GPU 1, combine & conv
+            use_dev(0);
+            k::ep_select_token(dev_work(0).route_d, (const float*)(dev_work(0).route_d + S), Ly.ep_tab_blob[0],
+                               Ly.ep_tab_sc[0][0], Ly.ep_tab_sc[0][1], Ly.ep_tab_sc[0][2],
+                               S, dev_work(0).blob, dev_work(0).tok, dev_work(0).inv, dev_work(0).sg, dev_work(0).su, dev_work(0).wt, g_s);
+            run_dev_exp(0, dev_work(0), g_s);
+            CU(cudaStreamWaitEvent(g_s, g_ep_done, 0));
+            const float* y_peer = g_ep_stage.d_y[0] ? g_ep_stage.d_y[0] : (dev_work(0).y32 + (size_t) S * C);
+            k::ep_combine_conv(dev_work(0).y32, y_peer, dev_work(0).blob, dev_work(0).wt,
+                               S, C, Ly.h_mlp, Ly.sc_mlp, dev_work(0).r, dev_work(0).h, g_s);
         }
-        k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
     }
     if (out_mode == OutMode::kNone) return;
     {   // the head
@@ -2216,6 +2293,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
 void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>& logits_out,
                 std::vector<int>* argmax_out) {
     const Config& c = M.c;
+    use_dev(0);
     Work& W = dev_work(0);
     const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
     k::decode_host(M.embd_type, M.embd + (size_t) tok * rb, c.C, W.emb_h);
@@ -2224,13 +2302,43 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
         fast_token_launches(M, W, out_mode);
     } else {
         FastGraph& G = g_fgraph[(int) out_mode];
-        if (!G.exec) {   // the first token of this kind: its launches recorded
-            CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal));
-            fast_token_launches(M, W, out_mode);
-            CU(cudaStreamEndCapture(g_s, &G.graph));
-            CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
+        if (!G.exec && !G.disabled) {
+            cudaError_t ce = cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal);
+            if (ce == cudaSuccess) {
+                fast_token_launches(M, W, out_mode);
+                ce = cudaStreamEndCapture(g_s, &G.graph);
+                if (ce == cudaSuccess) {
+                    ce = cudaGraphInstantiate(&G.exec, G.graph, 0);
+                    if (ce == cudaSuccess) {
+                        std::printf("resident%s: CUDA graph captured and instantiated!\n",
+                                    g_ep_fast ? " EP" : "");
+                        std::fflush(stdout);
+                    } else {
+                        std::printf("resident: graph instantiate failed (%s), fallback to direct launches\n",
+                                    cudaGetErrorString(ce));
+                        std::fflush(stdout);
+                        cudaGraphDestroy(G.graph);
+                        G.graph = nullptr;
+                        G.disabled = true;
+                        (void) cudaGetLastError();
+                    }
+                } else {
+                    std::printf("resident: graph end capture failed (%s), fallback to direct launches\n",
+                                cudaGetErrorString(ce));
+                    std::fflush(stdout);
+                    G.disabled = true;
+                    (void) cudaGetLastError();
+                }
+            } else {
+                G.disabled = true;
+                (void) cudaGetLastError();
+            }
         }
-        CU(cudaGraphLaunch(G.exec, g_s));
+        if (G.exec) {
+            CU(cudaGraphLaunch(G.exec, g_s));
+        } else {
+            fast_token_launches(M, W, out_mode);
+        }
     }
     CU(cudaStreamSynchronize(g_s));
     if (out_mode == OutMode::kArgmax) {
@@ -2252,7 +2360,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
              std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp) {
     const Config& c = M.c;
     const int C = c.C;
-    if (g_fast && T == 1 && dump.empty() && !g_prof && !g_rec && !g_taps && !g_trace && g_pop.empty() &&
+    if ((g_fast || g_ep_fast) && T == 1 && dump.empty() && !g_prof && !g_rec && !g_taps && !g_trace && g_pop.empty() &&
         g_img.at(pos0) < 0) {
         fast_token(M, tok[0], pos0, out_mode, logits_out, argmax_out);
         return;
@@ -2268,12 +2376,12 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         const size_t rb = (size_t) C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
         for (int t = 0; t < T; ++t)
             k::decode_host(M.embd_type, M.embd + (size_t) tok[t] * rb, C, W.emb_h + (size_t) t * C);
-        CU(cudaMemcpyAsync(W.tmp, W.emb_h, (size_t) T * C * 4, cudaMemcpyHostToDevice, g_s));
-        k::rms(W.tmp, M.embd_norm, T, C, c.eps, W.h, g_s);
-        place_pictures(W.h, T, pos0, C, g_s);
         for (int t = 0; t < T; ++t) W.pos_h[t] = pos0 + t;
-        CU(cudaMemcpyAsync(W.pos, W.pos_h, (size_t) T * 4, cudaMemcpyHostToDevice, g_s));
     }
+    CU(cudaMemcpyAsync(W.tmp, W.emb_h, (size_t) T * C * 4, cudaMemcpyHostToDevice, g_s));
+    k::rms(W.tmp, M.embd_norm, T, C, c.eps, W.h, g_s);
+    place_pictures(W.h, T, pos0, C, g_s);
+    CU(cudaMemcpyAsync(W.pos, W.pos_h, (size_t) T * 4, cudaMemcpyHostToDevice, g_s));
     int nb = 0;
     const size_t TC = (size_t) T * C;
     auto blk = [&](int i) { return W.blocks + (size_t) i * W.blk_ld * C; };
@@ -2332,9 +2440,20 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             k::attn_res(st, n_bank, Ly.lp_query + (size_t) 2 * C, 2, T, C, 1e-6f, W.lp_msg + 2 * TC, g_s);
             msg = W.lp_msg;
         }
-        // (the drafter's taps 0 .. 6: the stream at the start of layers 5, 11, .., 41 - without a loop)
-        if (g_taps && c.n_pass == 1 && l % 6 == 5 && l < c.n_layer - 1)
-            CU(cudaMemcpyAsync(g_taps + (size_t) (l / 6) * g_taps_ld * C, W.h, TC * 4, cudaMemcpyDeviceToDevice, g_s));
+        // the drafter's taps
+        if (g_taps) {
+            int tap_idx = -1;
+            if (c.n_pass > 1) {
+                if (vis == 5) tap_idx = 0;
+                else if (vis == 23) tap_idx = 1;
+                else if (vis == 41) tap_idx = 2;
+            } else {
+                if (vis % 6 == 5 && vis < c.n_visit - 1) tap_idx = vis / 6;
+            }
+            if (tap_idx >= 0 && tap_idx < g_taps_n) {
+                CU(cudaMemcpyAsync(g_taps + (size_t) tap_idx * g_taps_ld * C, W.h, TC * 4, cudaMemcpyDeviceToDevice, g_s));
+            }
+        }
         run_layer_attn(M, Ly, l, T, pos0, W.h, W.pos, nb, 0, W.r, W, msg);
         dump_f("blk." + std::to_string(vis) + ".attn_out", W.r, TC);
         if (l % c.block == 0) ++nb;
@@ -2362,23 +2481,29 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
         k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
-        CU(cudaMemcpyAsync(W.route_h, W.route_d, (size_t) S * 8, cudaMemcpyDeviceToHost, g_s));
         const bool cpu_lane = g_pool && g_overlap && !g_prof && T <= 8 && Ly.ty[0] == k::kNVFP4 &&
                               Ly.ty[1] == k::kNVFP4 && Ly.ty[2] == k::kNVFP4;
-        if (cpu_lane) CU(cudaMemcpyAsync(W.x_h, W.xq, TC * 4, cudaMemcpyDeviceToHost, g_s));
-        CU(cudaStreamSynchronize(g_s));
-        const int* top = W.route_h;
-        const float* w = (const float*) (W.route_h + S);
-        pop_count(l, top, S);
-        g_pf.lap(g_pf.route);
-        if (!dump.empty()) {   // the experts picked, [T][K] int32 (compare with the reference's blk.L.picks)
-            FILE* f = std::fopen((dump + "/blk." + std::to_string(vis) + ".picks.i32").c_str(), "wb");
-            if (f) std::fwrite(top, 4, (size_t) S, f), std::fclose(f);
-        }
-        if (g_trace) {
-            const int hdr[3] = {l, T, c.K};
-            std::fwrite(hdr, 4, 3, g_trace);
-            std::fwrite(top, 4, S, g_trace);
+        const bool fast_ep_token = g_ep_fast && g_ep && T <= 8 && g_overlap && !g_prof &&
+                                   dump.empty() && !g_trace && g_pop.empty();
+        const int* top = nullptr;
+        const float* w = nullptr;
+        if (!fast_ep_token) {
+            CU(cudaMemcpyAsync(W.route_h, W.route_d, (size_t) S * 8, cudaMemcpyDeviceToHost, g_s));
+            if (cpu_lane) CU(cudaMemcpyAsync(W.x_h, W.xq, TC * 4, cudaMemcpyDeviceToHost, g_s));
+            CU(cudaStreamSynchronize(g_s));
+            top = W.route_h;
+            w = (const float*) (W.route_h + S);
+            pop_count(l, top, S);
+            g_pf.lap(g_pf.route);
+            if (!dump.empty()) {   // the experts picked, [T][K] int32 (compare with the reference's blk.L.picks)
+                FILE* f = std::fopen((dump + "/blk." + std::to_string(vis) + ".picks.i32").c_str(), "wb");
+                if (f) std::fwrite(top, 4, (size_t) S, f), std::fclose(f);
+            }
+            if (g_trace) {
+                const int hdr[3] = {l, T, c.K};
+                std::fwrite(hdr, 4, 3, g_trace);
+                std::fwrite(top, 4, S, g_trace);
+            }
         }
         if (g_tp && T == 1 && g_overlap && !g_prof) {   // tensor-parallel experts, one token
             const double te0 = now();
@@ -2484,6 +2609,79 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
             k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
+            continue;
+        }
+        if (fast_ep_token) {
+            const int F = c.F;
+            static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
+            const bool exp_tc = exp_mma && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, F);
+
+            // 1. Send xq (TC*4 B) and route_d (S*8 B) from GPU 0 to GPU 1
+            if (g_ep_stage.d_xq[0]) {
+                CU(cudaMemcpyAsync(g_ep_stage.d_xq[0], dev_work(0).xq, (size_t) T * C * 4, cudaMemcpyDeviceToDevice, g_s));
+                CU(cudaMemcpyAsync(g_ep_stage.d_route[0], dev_work(0).route_d, (size_t) S * 8, cudaMemcpyDeviceToDevice, g_s));
+            } else {
+                CU(cudaMemcpyPeerAsync(dev_work(1).xq, 1, dev_work(0).xq, 0, (size_t) T * C * 4, g_s));
+                CU(cudaMemcpyPeerAsync(dev_work(1).route_d, 1, dev_work(0).route_d, 0, (size_t) S * 8, g_s));
+            }
+            CU(cudaEventRecord(g_ep_x, g_s));
+
+            // Helper to run experts on a device
+            auto run_dev_exp = [&](int /*d*/, Work& Wd, cudaStream_t strm) {
+                if (exp_tc) {
+                    k::to_f16_limbs_tokens(Wd.xq, T, C, (uint16_t*) Wd.gu32, strm);
+                    k::experts_gate_up_swiglu_mma(Wd.blob, S, Ly.eb[0], (const uint16_t*) Wd.gu32, C, F, Wd.sg, Wd.su,
+                                                  c.gate_cap, c.up_cap, Wd.h16, strm, Wd.tok);
+                    k::experts_down_mma(Wd.blob, S, Ly.eb[0] + Ly.eb[1], Wd.h16, C, F, Wd.y32, strm);
+                } else {
+                    k::experts_gate_up_swiglu(Wd.blob, Wd.tok, S, Ly.ty[0], Ly.ty[1], Ly.eb[0], Wd.xq, C, F, Wd.sg, Wd.su,
+                                              c.gate_cap, c.up_cap, Wd.h16, strm);
+                    k::experts_down(Wd.blob, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], Wd.h16, C, F, Wd.y32, strm);
+                }
+            };
+
+            // 2. GPU 1: wait for xq & route_d, select resident experts, compute experts, copy result to GPU 0
+            use_dev(1);
+            CU(cudaStreamWaitEvent(g_s, g_ep_x, 0));
+            const int* r_top1 = g_ep_stage.d_route[1] ? g_ep_stage.d_route[1] : dev_work(1).route_d;
+            const float* r_w1 = g_ep_stage.d_route[1] ? (const float*)(g_ep_stage.d_route[1] + S) : (const float*)(dev_work(1).route_d + S);
+            if (g_ep_stage.d_xq[1]) {
+                CU(cudaMemcpyAsync(dev_work(1).xq, g_ep_stage.d_xq[1], (size_t) T * C * 4, cudaMemcpyDeviceToDevice, g_s));
+            }
+            k::ep_select_token(r_top1, r_w1, Ly.ep_tab_blob[1],
+                               Ly.ep_tab_sc[1][0], Ly.ep_tab_sc[1][1], Ly.ep_tab_sc[1][2],
+                               S, dev_work(1).blob, dev_work(1).tok, dev_work(1).inv, dev_work(1).sg, dev_work(1).su, dev_work(1).wt, g_s, c.K);
+            run_dev_exp(1, dev_work(1), g_s);
+            if (g_ep_stage.d_y[1]) {
+                CU(cudaMemcpyAsync(g_ep_stage.d_y[1], dev_work(1).y32, (size_t) S * C * 4, cudaMemcpyDeviceToDevice, g_s));
+            } else {
+                CU(cudaMemcpyPeerAsync(dev_work(0).y32 + (size_t) S * C, 0, dev_work(1).y32, 1, (size_t) S * C * 4, g_s));
+            }
+            CU(cudaEventRecord(g_ep_done, g_s));
+
+            // 3. GPU 0: select resident experts, compute experts, wait for GPU 1, combine & conv
+            use_dev(0);
+            k::ep_select_token(dev_work(0).route_d, (const float*)(dev_work(0).route_d + S), Ly.ep_tab_blob[0],
+                               Ly.ep_tab_sc[0][0], Ly.ep_tab_sc[0][1], Ly.ep_tab_sc[0][2],
+                               S, dev_work(0).blob, dev_work(0).tok, dev_work(0).inv, dev_work(0).sg, dev_work(0).su, dev_work(0).wt, g_s, c.K);
+            run_dev_exp(0, dev_work(0), g_s);
+            CU(cudaStreamWaitEvent(g_s, g_ep_done, 0));
+            const float* y_peer = g_ep_stage.d_y[0] ? g_ep_stage.d_y[0] : (dev_work(0).y32 + (size_t) S * C);
+            if (T == 1 && !g_rec) {
+                k::ep_combine_conv(dev_work(0).y32, y_peer, dev_work(0).blob, dev_work(0).wt,
+                                   S, C, Ly.h_mlp, Ly.sc_mlp, dev_work(0).r, dev_work(0).h, g_s);
+            } else {
+                if (T == 1) {
+                    k::ep_combine_token(dev_work(0).y32, y_peer, dev_work(0).blob, dev_work(0).wt,
+                                        S, C, dev_work(0).tmp, g_s);
+                } else {
+                    k::ep_combine_block(dev_work(0).y32, y_peer, dev_work(0).blob, dev_work(0).wt,
+                                        T, c.K, C, dev_work(0).tmp, g_s);
+                }
+                conv_rec(Ly, 3, dev_work(0).tmp, Ly.h_mlp, T, C);
+                k::conv4_res(dev_work(0).tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, dev_work(0).r, dev_work(0).h, g_s);
+            }
+            dump_f("blk." + std::to_string(vis) + ".out", dev_work(0).h, TC);
             continue;
         }
         if (g_ep && T == 1 && g_overlap && !g_prof) {
@@ -3259,8 +3457,6 @@ int run(int argc, char** argv) {
     if (c.n_pass > 1) {
         std::printf("looped: layers %d .. %d run %d times - %d layer visits a token; message gates of rank %d\n", c.core0,
                     c.core1 - 1, c.n_pass, c.n_visit, c.rank);
-        // if (n_gpu != 1) die("a looped model: one GPU so far (--gpus 1)");
-        if (!draft_path.empty()) die("--draft: not for a looped model yet");
     }
     if (getenv("IK2_POP_OUT")) g_pop.assign((size_t) c.n_layer * c.E, 0), g_pop_E = c.E;
     g_tp_F = c.F, g_tp_C = c.C;
@@ -3337,6 +3533,29 @@ int run(int argc, char** argv) {
         CU(cudaEventCreateWithFlags(&g_tp_h[1], cudaEventDisableTiming));
         std::printf("%s over 2 GPUs (peer access %s)\n", g_tp ? "experts tensor-parallel" : "expert parallel",
                     p01 && p10 ? "on" : "off: copies through the host");
+        // Pinned mapped staging for inter-GPU zero-copy activation transfer
+        auto alloc_mapped = [&](size_t bytes, void** h_ptr, void** d0_ptr, void** d1_ptr) {
+            cudaError_t e = cudaHostAlloc(h_ptr, bytes, cudaHostAllocPortable | cudaHostAllocMapped);
+            if (e != cudaSuccess) { (void) cudaGetLastError(); *h_ptr = nullptr; return false; }
+            CU(cudaSetDevice(0));
+            e = cudaHostGetDevicePointer(d0_ptr, *h_ptr, 0);
+            if (e != cudaSuccess) { (void) cudaGetLastError(); return false; }
+            CU(cudaSetDevice(1));
+            e = cudaHostGetDevicePointer(d1_ptr, *h_ptr, 0);
+            if (e != cudaSuccess) { (void) cudaGetLastError(); return false; }
+            return true;
+        };
+        const int max_S = 64;
+        const int max_T = 8;
+        bool stage_ok = alloc_mapped((size_t) max_T * c.C * sizeof(float), &g_ep_stage.h_xq, (void**) &g_ep_stage.d_xq[0], (void**) &g_ep_stage.d_xq[1]) &&
+                        alloc_mapped((size_t) max_S * 8, &g_ep_stage.h_route, (void**) &g_ep_stage.d_route[0], (void**) &g_ep_stage.d_route[1]) &&
+                        alloc_mapped((size_t) max_S * c.C * sizeof(float), &g_ep_stage.h_y, (void**) &g_ep_stage.d_y[0], (void**) &g_ep_stage.d_y[1]);
+        if (stage_ok) {
+            std::printf("zero-copy mapped EP staging enabled (%zu KB)\n",
+                        ((size_t) max_T * c.C * sizeof(float) + (size_t) max_S * 8 + (size_t) max_S * c.C * sizeof(float)) / 1024);
+        } else {
+            std::printf("zero-copy mapped EP staging disabled (fallback to standard transfer)\n");
+        }
     }
     use_dev(0);
     g_overlap = !getenv("IK2_OVERLAP") || std::atoi(getenv("IK2_OVERLAP"));
@@ -3347,7 +3566,7 @@ int run(int argc, char** argv) {
         g_pool = new ik2::cpu::Pool(threads - 1);
     if (getenv("IK2_UP_MS")) g_t_up = std::atof(getenv("IK2_UP_MS")) * 1e-3;
     g_cpu_lazy = !getenv("IK2_CPU_LAZY") || std::atoi(getenv("IK2_CPU_LAZY"));
-    if (n_gpu > 1 && getenv("IK2_DENSE")) die("IK2_DENSE with --gpus > 1");
+    if (n_gpu > 2 && getenv("IK2_DENSE")) die("IK2_DENSE with --gpus > 2");
 
     // Do the experts all fit in VRAM beside the dense weights and the K / V cache (Inkling-2-Mini's 14.7 GiB on a 24 GB
     // card)?  Then they all stay there: the dense weights are kept as the GGUF's blocks unless IK2_DENSE says otherwise
@@ -3356,7 +3575,8 @@ int run(int argc, char** argv) {
     g_graph = !(getenv("IK2_GRAPH") && !std::atoi(getenv("IK2_GRAPH")));
     g_attn_mma = c.D == 128 && c.H / c.KV <= 8 ? (getenv("IK2_ATTN_MMA") ? std::atoi(getenv("IK2_ATTN_MMA")) : 1) : 0;
     g_mma_split = k::attn_decode_mma_blocks(c.KV);
-    if (n_gpu == 1 && !g_pool) {
+    const bool can_resident = (n_gpu == 1 || (dual() && g_ep)) && !g_pool;
+    if (can_resident) {
         size_t exp_b = 0, dense_b = 0, kv_b = 0;
         for (const auto& kv : S.by_name) {
             const auto& t = *kv.second.second;
@@ -3371,11 +3591,13 @@ int run(int argc, char** argv) {
         size_t fr0 = 0, tot0 = 0;
         CU(cudaMemGetInfo(&fr0, &tot0));
         const size_t reserve = (size_t) 3 << 29;   // (the work buffers and a quarter of a GiB of room: 1.5 GiB)
-        const bool fits = exp_b + dense_b + kv_b + reserve <= fr0 && exp_b <= (size_t) (cache_gb * 1073741824.0);
+        const size_t exp_b_dev0 = dual() ? (exp_b / 2) : exp_b;
+        const bool fits = exp_b_dev0 + dense_b + kv_b + reserve <= fr0 && exp_b_dev0 <= (size_t) (cache_gb * 1073741824.0);
         if (fits && !getenv("IK2_DENSE")) g_dense_q8 = true;
         g_fast_want = fits && g_dense_q8 && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")));
-        std::printf("experts %.1f GiB, dense weights %.1f GiB as blocks, K / V cache %.1f GiB, %.1f GiB free: %s\n",
-                    exp_b / 1073741824.0, dense_b / 1073741824.0, kv_b / 1073741824.0, fr0 / 1073741824.0,
+        std::printf("experts %.1f GiB (%s), dense weights %.1f GiB as blocks, K / V cache %.1f GiB, %.1f GiB free: %s\n",
+                    exp_b / 1073741824.0, dual() ? "split across 2 GPUs" : "1 GPU",
+                    dense_b / 1073741824.0, kv_b / 1073741824.0, fr0 / 1073741824.0,
                     fits ? "every expert stays in VRAM" : "the experts in host memory, a cache of them in VRAM");
     }
 
@@ -3819,8 +4041,20 @@ int run(int argc, char** argv) {
     // the drafter (before the expert cache takes what VRAM is left)
     ik2::draft::Drafter* drafter = nullptr;
     if (!draft_path.empty()) {
-        if (n_gpu != 1) die("--draft: one GPU only so far");
-        if (!M.out_w.f16) die("--draft needs the output head in FP16 (not IK2_DENSE=q8)");
+        if (n_gpu > 2 || (n_gpu == 2 && !g_ep)) die("--draft: single GPU or dual-GPU EP only so far");
+        use_dev(0);
+        if (!M.out_w.f16) {
+            const auto* t = S.info("output.weight");
+            const size_t nb = tensor_bytes(*t);
+            if (nb > g_stage_bytes) {
+                if (g_stage) cudaFree(g_stage);
+                g_stage = dalloc<uint8_t>(g_stage_bytes = nb);
+            }
+            CU(cudaMemcpy(g_stage, S.data("output.weight"), nb, cudaMemcpyHostToDevice));
+            M.out_w.f16 = dalloc<uint16_t>((size_t) c.n_rows * c.C);
+            k::decode_f16(M.out_w.type, g_stage, (size_t) c.n_rows * c.C, M.out_w.f16, g_s);
+            CU(cudaStreamSynchronize(g_s));
+        }
         const double t0 = now();
         try {
             drafter = ik2::draft::load(draft_path, c.C, ctx, g_blas, g_s);
@@ -3828,8 +4062,9 @@ int run(int argc, char** argv) {
         } catch (const std::exception& e) {
             die(e.what());
         }
+        g_taps_n = ik2::draft::taps(drafter);
         g_taps_ld = std::max(chunk, ik2::draft::kBlock);
-        g_taps = dalloc<float>((size_t) ik2::draft::kTaps * g_taps_ld * c.C);
+        g_taps = dalloc<float>((size_t) g_taps_n * g_taps_ld * c.C);
         for (auto& Vi : M.V) {
             const size_t cc[4] = {KD, KD, C, C};
             for (int i = 0; i < 4; ++i) {
@@ -3846,7 +4081,7 @@ int run(int argc, char** argv) {
     use_dev(d);
     CU(cudaMemGetInfo(&fr, &tot));
     Work& W = g_dev[d].W;
-    W.Tm = std::max(chunk, 1);
+    W.Tm = std::max({chunk, 1, ik2::draft::kBlock});
     W.ctx = ctx;
     W.nk_max = std::min(ctx, ctx);
     // Tokens a layer-major prefill pass (every expert not in VRAM streams in once a pass): 16384 when there is room
@@ -4068,6 +4303,49 @@ int run(int argc, char** argv) {
         }
     }
     std::fflush(stdout);
+    }
+    if (g_ep && n_gpu == 2) {
+        bool ep_all = true;
+        for (int d = 0; d < 2; ++d) {
+            auto& EC = dev_cache(d);
+            for (int l = 0; l < c.n_layer; ++l) {
+                for (int e = 0; e < c.E; ++e) {
+                    if (ep_owner(l, e) == d && !EC.has(l, e)) {
+                        ep_all = false;
+                        break;
+                    }
+                }
+                if (!ep_all) break;
+            }
+        }
+        if (ep_all) {
+            for (int d = 0; d < 2; ++d) {
+                use_dev(d);
+                auto& EC = dev_cache(d);
+                for (int l = 0; l < c.n_layer; ++l) {
+                    Layer& Ly = M.L[l];
+                    const auto& P = EC.pools[EC.layer_pool[l]];
+                    std::vector<const uint8_t*> tab(c.E, nullptr);
+                    for (int e = 0; e < c.E; ++e) {
+                        if (ep_owner(l, e) == d) {
+                            tab[e] = P.data + (size_t) EC.loc[(size_t) l * c.E + e] * P.slot_bytes;
+                        }
+                    }
+                    Ly.ep_tab_blob[d] = dalloc<const uint8_t*>(c.E);
+                    CU(cudaMemcpy((void*) Ly.ep_tab_blob[d], tab.data(), (size_t) c.E * sizeof(void*), cudaMemcpyHostToDevice));
+                    for (int r = 0; r < 3; ++r) {
+                        if (!Ly.scale[r].empty()) Ly.ep_tab_sc[d][r] = dev_f32(Ly.scale[r]);
+                    }
+                }
+            }
+            use_dev(0);
+            g_ep_fast = true;
+            std::printf("resident: every expert in VRAM across 2 GPUs; zero-wait GPU EP dispatch enabled\n");
+            std::fflush(stdout);
+        } else {
+            std::printf("resident EP path off: not all owned experts resident in VRAM\n");
+            std::fflush(stdout);
+        }
     }
     // the caches' counters, summed over the GPUs
     auto ec_sum = [&](auto f) {
@@ -4592,6 +4870,7 @@ int run(int argc, char** argv) {
                     100.0 * agree / std::max<size_t>(1, std::min<size_t>(force.size(), out.size())));
 
     if (drafter) {
+        use_dev(0);
         // draft 7 after the anchor, verify the 8 in one call, keep the agreeing prefix and the target's next token
         float *raw = dalloc<float>(c.C), *anchor_h = dalloc<float>(c.C);
         auto argmax_row = [&](const float* r) { return (int) (std::max_element(r, r + c.n_vocab) - r); };
@@ -4600,6 +4879,7 @@ int run(int argc, char** argv) {
         const int B = ik2::draft::kBlock;
         const bool margin_check = getenv("IK2_MARGIN") != nullptr;
         while ((int) out.size() < gen && P + B <= ctx) {
+            use_dev(0);
             const double t0 = now();
             embed_row(M, anchor, raw, anchor_h);
             int dr[ik2::draft::kBlock - 1];
@@ -4663,7 +4943,15 @@ int run(int argc, char** argv) {
             }
             int n = 0;
             while (n < B - 1 && dr[n] == g[n]) ++n;
+            if (getenv("IK2_DEBUG_DRAFT")) {
+                std::printf("step %d pos %d anchor %d: dr=[", n_steps, P, anchor);
+                for (int j = 0; j < B - 1; ++j) std::printf("%d%s", dr[j], j + 2 < B ? " " : "");
+                std::printf("] g=[");
+                for (int j = 0; j < B; ++j) std::printf("%d%s", g[j], j + 1 < B ? " " : "");
+                std::printf("] match=%d\n", n);
+            }
             if (n + 1 < B) rollback(M, n + 1);
+            use_dev(0);
             ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n + 1, P);
             ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n);
             for (int j = 0; j < n && (int) out.size() < gen; ++j) out.push_back(dr[j]);
