@@ -3596,10 +3596,7 @@ int run(int argc, char** argv) {
         threads = std::max(threads, (int) std::thread::hardware_concurrency() / 2);
     if (cpu_want && ik2::cpu::available_any() && threads > 1 && n_gpu == 1)
         g_pool = new ik2::cpu::Pool(threads - 1);
-    if (small_card && g_pool) {
-        g_t_up = 1e-3;
-        g_lazy_max = 0;
-    }
+    if (small_card && g_pool) g_lazy_max = 0;   // (and the link's expert time measured once the cache is up)
     if (getenv("IK2_UP_MS")) g_t_up = std::atof(getenv("IK2_UP_MS")) * 1e-3;
     g_cpu_lazy = !getenv("IK2_CPU_LAZY") || std::atoi(getenv("IK2_CPU_LAZY"));
     if (getenv("IK2_LAZY_MAX")) g_lazy_max = std::max(0, std::atoi(getenv("IK2_LAZY_MAX")));
@@ -4264,6 +4261,28 @@ int run(int argc, char** argv) {
         std::printf("  pool %zu: %d slots of %.1f MiB (%.1f GiB, %d layers)\n", p, EC.pools[p].n_slots,
                     EC.pools[p].slot_bytes / 1048576.0,
                     (double) EC.pools[p].n_slots * EC.pools[p].slot_bytes / 1073741824.0, EC.pools[p].n_layers);
+    // the link's time an expert for the CPU lane's choice: one slot copied in from pinned host memory, timed (the
+    // estimate 0.36 ms is PCIe 5's; an RTX 2060 SUPER on PCIe 3.0 x8 takes ~0.55 ms a 3.6 MiB expert)
+    if (small_card && g_pool && !getenv("IK2_UP_MS") && !EC.pools.empty() && EC.pools[0].n_slots > 0 && M.L[0].host[0]) {
+        const auto& P0 = EC.pools[0];
+        float best = 1e9f;
+        cudaEvent_t e0, e1;
+        CU(cudaEventCreate(&e0));
+        CU(cudaEventCreate(&e1));
+        for (int i = 0; i < 4; ++i) {
+            CU(cudaEventRecord(e0, g_s));
+            CU(cudaMemcpyAsync(P0.data, M.L[0].host[0], P0.slot_bytes, cudaMemcpyHostToDevice, g_s));
+            CU(cudaEventRecord(e1, g_s));
+            CU(cudaEventSynchronize(e1));
+            float ms = 0;
+            CU(cudaEventElapsedTime(&ms, e0, e1));
+            best = std::min(best, ms);
+        }
+        CU(cudaEventDestroy(e0));
+        CU(cudaEventDestroy(e1));
+        g_t_up = 1.1 * best * 1e-3;   // (+10%: the copies queue behind each other in a layer)
+        std::printf("CPU lane: the link takes %.2f ms an expert (%.1f GB/s)\n", g_t_up * 1e3, P0.slot_bytes / (best * 1e6));
+    }
     const char* wf = getenv("IK2_WARM");
     if ((wf && *wf) || g_ep) {   // the cache filled with the most picked experts (IK2_POP_OUT's file or all owned for EP)
         FILE* in = (wf && *wf) ? std::fopen(wf, "rb") : nullptr;
