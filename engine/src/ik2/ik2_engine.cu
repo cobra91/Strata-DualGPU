@@ -8,7 +8,7 @@
 //
 //   * The dense weights (attention, router, head) decoded once to FP16 in VRAM (the router in F32); cuBLAS' FP16 GEMMs
 //     with F32 sums.  The attention (relative bias, sinks, sliding window, L2 clips) fused: an mma.sync kernel, and a
-//     wgmma one on Hopper (sm_90a); the KV cache in FP16 (IK2_KV=fp8: E4M3).
+//     wgmma one on Hopper (sm_90a); the KV cache in int8 with a scale per 64 (IK2_KV=f16, fp8: E4M3).
 //   * The routed experts as the GGUF holds them, all in pinned host memory (~323 GiB for UD-Q4_K_XL), and a cache of
 //     them in VRAM (--cache-gb, at most what the GPU has room for).  A prompt goes through layer by layer in passes of
 //     up to 16384 tokens, so each pass streams every expert it misses once, the next layer's prefetched while this one
@@ -265,7 +265,7 @@ struct Layer {
     float* ep_tab_sc[2][3] = {};
     // the state: of the visit being run (bind_visit)
     uint16_t *kc = nullptr, *vc = nullptr;         // FP16 [kv_cap][KV * D] (IK2_KV=f16)
-    uint8_t *kc8 = nullptr, *vc8 = nullptr;        // FP8 E4M3 [kv_cap][KV * D] (IK2_KV=fp8)
+    uint8_t *kc8 = nullptr, *vc8 = nullptr;        // FP8 E4M3 [kv_cap][KV * D] (IK2_KV=fp8), int8 rows (the default)
     int kv_cap = 0;
     float *h_k, *h_v, *h_attn, *h_mlp;             // conv histories [3][C']
     float *rec_old[4] = {}, *rec_x[4] = {};        // (speculative) the convs' histories and inputs of a verify window
@@ -421,6 +421,15 @@ bool g_dense_q8 = false;
 // top-1 token (KL mean 8.5e-4) and FP8 changed 5 (KL 8.3e-3): Inkling's router is full of near-ties, so FP8's 1.5% in
 // layer 0's attention output already moves 7 of 48 tokens' experts.  The full layers' cache is 32 KB a token in FP16.
 bool g_kv_fp8 = false;
+bool g_kv_i8 = false;   // IK2_KV=i8: kc8 / vc8 hold rows of k::kv_row_bytes_i8(KD) bytes (int8 codes, a scale per 64)
+inline size_t kv_tok_b(size_t KD) { return g_kv_i8 ? k::kv_row_bytes_i8((int) KD) : KD * (g_kv_fp8 ? 1 : 2); }
+inline bool kv_b8() { return g_kv_fp8 || g_kv_i8; }   // (the cache in kc8 / vc8)
+template <class L>
+void kv_unpack(const L& Ly, int cap, int k0, int nk, size_t KD, float k_inv, float v_inv, uint16_t* ko, uint16_t* vo,
+               cudaStream_t s) {
+    if (g_kv_i8) k::unpack_kv_i8_to_f16((const int8_t*) Ly.kc8, (const int8_t*) Ly.vc8, cap, k0, nk, (int) KD, ko, vo, s);
+    else k::unpack_kv_fp8_to_f16(Ly.kc8, Ly.vc8, cap, k0, nk, (int) KD, k_inv, v_inv, ko, vo, s);
+}
 // Q8_0 blocks (2 bytes of FP16 scale, 32 int8 values) taken apart into m.q8 / m.q8d on the device; false if the
 // matrix cannot be kept so (another type, or K not a multiple of 128)
 bool upload_planar(Mat& m, const std::vector<const uint8_t*>& parts, const std::vector<size_t>& part_values) {
@@ -1536,7 +1545,11 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const float k_scale = c.qk_clip <= 28.0f ? 16.0f : 1.0f;
     const float v_scale = 32.0f;
     const float k_inv = 1.0f / k_scale, v_inv = 1.0f / v_scale;
-    if (g_kv_fp8) {
+    if (g_kv_i8) {
+        k::prep_qkv_r_i8(q_p, Ly.q_clip, W.kconv, (int8_t*) Ly.kc8, W.vconv, (int8_t*) Ly.vc8, r_p, Ly.r_clip, T, c.H,
+                         c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha,
+                         c.n_floor, pos0, Ly.kv_cap, g_s);
+    } else if (g_kv_fp8) {
         k::prep_qkv_r_fp8(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel,
                           c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
                           Ly.kv_cap, k_scale, v_scale, g_s);
@@ -1554,7 +1567,10 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const float qk_scale = 1.0f / std::sqrt((float) c.D);
     const int attn_kv_cap = Ly.sliding ? Ly.kv_cap : 0;
     if (T == 1) {
-        if (g_kv_fp8) {
+        if (g_kv_i8) {
+            k::attn_decode_i8(q_p, r_p, sink_p, (const int8_t*) Ly.kc8, (const int8_t*) Ly.vc8, attn_kv_cap, c.H, c.KV,
+                              c.D, k0, nk, pos0, qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+        } else if (g_kv_fp8) {
             k::attn_decode_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0,
                                qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
         } else {
@@ -1562,7 +1578,10 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                                Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
         }
     } else if (T <= 8 && g_group && g_group_attn) {
-        if (g_kv_fp8) {
+        if (g_kv_i8) {
+            k::attn_multi_i8(q_p, r_p, sink_p, (const int8_t*) Ly.kc8, (const int8_t*) Ly.vc8, attn_kv_cap, T, c.H, c.KV,
+                             k0, nk, pos0, qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+        } else if (g_kv_fp8) {
             k::attn_multi_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, T, c.H, c.KV, k0, nk, pos0,
                               qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
         } else {
@@ -1597,7 +1616,11 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                                 CUDA_R_32F, extent, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
                 const int k_lo = Ly.sliding ? std::max(0, pos0 + ts - c.window + 1) : 0;
                 const int ns = k::attn_flash_splits(Tq, c.H, pos0 + ts + Tq - k_lo, g_n_sm);
-                if (g_kv_fp8)
+                if (g_kv_i8)
+                    k::attn_flash_i8(W.x16 + (size_t) ts * HD, HD, (const int8_t*) Ly.kc8, (const int8_t*) Ly.vc8,
+                                     attn_kv_cap, c.H, c.KV, c.D, Tq, pos0 + ts, qk_scale, W.relb, extent, window,
+                                     sink_p + (size_t) ts * c.H, W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s);
+                else if (g_kv_fp8)
                     k::attn_flash_fp8(W.x16 + (size_t) ts * HD, HD, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, Tq,
                                       pos0 + ts, qk_scale * k_inv, v_inv, W.relb, extent, window,
                                       sink_p + (size_t) ts * c.H, W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s);
@@ -1614,10 +1637,10 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             if (W.relb) Tq = std::min(Tq, Work::kRelbRows);
             const int nk_s = pos0 + ts + Tq - k0_s;
             const long long qn = (long long) Tq * nk_s;
-            if (g_kv_fp8) {
+            if (kv_b8()) {
                 for (int k_off = 0; k_off < nk_s; k_off += W.kv_tmp_cap) {
                     const int nk_c = std::min(W.kv_tmp_cap, nk_s - k_off);
-                    k::unpack_kv_fp8_to_f16(Ly.kc8, Ly.vc8, attn_kv_cap, k0_s + k_off, nk_c, KD, k_inv, v_inv, W.kv_k16,
+                    kv_unpack(Ly, attn_kv_cap, k0_s + k_off, nk_c, KD, k_inv, v_inv, W.kv_k16,
                                             W.kv_v16, g_s);
                     for (int g = 0; g < c.KV; ++g) {
                         const uint16_t* Kp = W.kv_k16 + (size_t) g * c.D;
@@ -1632,7 +1655,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                 for (int k_off = 0; k_off < nk_s; k_off += W.kv_tmp_cap) {
                     const int nk_c = std::min(W.kv_tmp_cap, nk_s - k_off);
                     if (nk_s > W.kv_tmp_cap) {
-                        k::unpack_kv_fp8_to_f16(Ly.kc8, Ly.vc8, attn_kv_cap, k0_s + k_off, nk_c, KD, k_inv, v_inv,
+                        kv_unpack(Ly, attn_kv_cap, k0_s + k_off, nk_c, KD, k_inv, v_inv,
                                                 W.kv_k16, W.kv_v16, g_s);
                     }
                     const float beta = k_off == 0 ? zero : one;
@@ -2160,7 +2183,19 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         const int ring = Ly.sliding ? Ly.kv_cap : 0;
         const int ns = Ly.sliding ? std::min(g_mma_split, std::max(1, (c.window + 63) / 64)) : g_mma_split;
         uint16_t* q16 = mma ? W.x16 : nullptr;
-        if (g_kv_fp8) {
+        if (g_kv_i8) {
+            k::prep_qkv_r_i8_at(q_p, Ly.q_clip, W.kconv, (int8_t*) Ly.kc8, W.vconv, (int8_t*) Ly.vc8, r_p, Ly.r_clip, c.H,
+                                c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor,
+                                Ly.kv_cap, q16, g_s, Ly.sink16, W.xq, C, W.sink);
+            if (mma)
+                k::attn_decode_mma_i8(q16, r_p, W.sink, (const int8_t*) Ly.kc8, (const int8_t*) Ly.vc8, ring, c.H, c.KV,
+                                      W.pos, 0, ns, qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p,
+                                      W.x16, g_s);
+            else
+                k::attn_decode_i8_at(q_p, r_p, W.sink, (const int8_t*) Ly.kc8, (const int8_t*) Ly.vc8,
+                                     Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P, qk_scale, Ly.rel_proj, c.d_rel,
+                                     extent, window, W.lg, W.o, g_s);
+        } else if (g_kv_fp8) {
             k::prep_qkv_r_fp8_at(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
                                  c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap,
                                  k_scale, v_scale, q16, g_s, Ly.sink16, W.xq, C, W.sink);
@@ -2676,8 +2711,8 @@ int g_kv_ctx = 0;        // --ctx   // the full layers' K / V capacity now (toke
 void kv_ensure(Model& M, int need) {
     if (!g_kv_grow || need <= g_kv_cap_full) return;
     const Config& c = M.c;
-    const size_t KD = (size_t) c.KV * c.D, eb = g_kv_fp8 ? 1 : 2;
-    int ncap = std::max(need, std::max(2 * g_kv_cap_full, g_kv_fp8 ? 4096 : 2048));
+    const size_t KD = (size_t) c.KV * c.D, tb = kv_tok_b(KD);   // (bytes a token's K, or V, row)
+    int ncap = std::max(need, std::max(2 * g_kv_cap_full, kv_b8() ? 4096 : 2048));
     ncap = std::min((ncap + 255) / 256 * 256, M.V.empty() ? ncap : g_kv_ctx);
     if (ncap < need) die("--kv-grow: past --ctx");
     std::vector<int> full;
@@ -2687,13 +2722,13 @@ void kv_ensure(Model& M, int need) {
     const int p = EC.layer_pool[M.V[full[0]].l];
     if (p < 0) die("--kv-grow: no pool");
     auto& P = EC.pools[p];
-    const size_t ob = (size_t) g_kv_cap_full * KD * eb, nb = (size_t) ncap * KD * eb;
+    const size_t ob = (size_t) g_kv_cap_full * tb, nb = (size_t) ncap * tb;
     const size_t total = 2 * full.size() * nb;
     const int k_new = (int) ((total + P.slot_bytes - 1) / P.slot_bytes);
     if (P.n_slots - k_new < 2 * c.E + 80)
         die("--kv-grow: the K / V for " + std::to_string(ncap) + " tokens leaves too few expert slots (this card holds the "
             "full layers' K / V for about " + std::to_string((int) ((size_t) std::max(0, P.n_slots - 2 * c.E - 80) * P.slot_bytes /
-                                                                   (2 * full.size() * KD * eb))) + " tokens; a smaller --ctx)");
+                                                                   (2 * full.size() * tb))) + " tokens; a smaller --ctx)");
     if (P.n_active < P.n_slots - P.kv_res) die("--kv-grow: a growth while slots are lent (internal)");
     CU(cudaDeviceSynchronize());
     if (g_dp.M && !g_dp.dirty) {   // (the device plan's table and mirror name slots this growth takes: drained, rebuilt)
@@ -2708,8 +2743,8 @@ void kv_ensure(Model& M, int need) {
         old.resize(2 * full.size() * ob);
         for (size_t i = 0; i < full.size(); ++i) {
             const Visit& Vi = M.V[full[i]];
-            const void* kp = g_kv_fp8 ? (const void*) Vi.kc8 : (const void*) Vi.kc;
-            const void* vp = g_kv_fp8 ? (const void*) Vi.vc8 : (const void*) Vi.vc;
+            const void* kp = kv_b8() ? (const void*) Vi.kc8 : (const void*) Vi.kc;
+            const void* vp = kv_b8() ? (const void*) Vi.vc8 : (const void*) Vi.vc;
             CU(cudaMemcpy(old.data() + (2 * i) * ob, kp, ob, cudaMemcpyDeviceToHost));
             CU(cudaMemcpy(old.data() + (2 * i + 1) * ob, vp, ob, cudaMemcpyDeviceToHost));
         }
@@ -2725,7 +2760,7 @@ void kv_ensure(Model& M, int need) {
             CU(cudaMemcpy(kp, old.data() + (2 * i) * ob, ob, cudaMemcpyHostToDevice));
             CU(cudaMemcpy(vp, old.data() + (2 * i + 1) * ob, ob, cudaMemcpyHostToDevice));
         }
-        if (g_kv_fp8) Vi.kc8 = kp, Vi.vc8 = vp;
+        if (kv_b8()) Vi.kc8 = kp, Vi.vc8 = vp;
         else Vi.kc = (uint16_t*) kp, Vi.vc = (uint16_t*) vp;
         Vi.kv_cap = ncap;
     }
@@ -3916,11 +3951,15 @@ int run(int argc, char** argv) {
         g_group_exp = v == 1 || v >= 3, g_group_attn = v >= 2;
     }
     g_dense_q8 = getenv_str("IK2_DENSE") == "q8";
+    // the K / V cache: int8 by default (a scale per 64 values; half FP16's bytes, KL ~0.008 median of FP16's on
+    // Inkling-2-Mini: about the cost of rounding to 11 bits), IK2_KV=f16 / fp8 otherwise
+    g_kv_i8 = !getenv("IK2_KV");
     if (getenv("IK2_KV")) {
         const std::string kv = getenv_str("IK2_KV");
         if (kv == "f16" || kv == "fp16") g_kv_fp8 = false;
         else if (kv == "fp8" || kv == "e4m3") g_kv_fp8 = true;
-        else die("unknown IK2_KV=" + kv + " (expected fp8 or f16)");
+        else if (kv == "i8" || kv == "int8") g_kv_i8 = true;
+        else die("unknown IK2_KV=" + kv + " (expected fp8, i8 or f16)");
         if (g_kv_fp8) {   // (the prompt attention's FP8 tiles need more shared memory than a block gets before sm_80)
             int mj = 0;
             CU(cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, 0));
@@ -4184,7 +4223,7 @@ int run(int argc, char** argv) {
         }
         for (int l = 0; l < c.n_layer; ++l) {
             const size_t cap = c.sliding[l] ? (size_t) std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : (size_t) ctx;
-            kv_b += (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * cap * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
+            kv_b += (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * cap * kv_tok_b((size_t) c.KV * c.D) * 2;
         }
         size_t fr0 = 0, tot0 = 0;
         CU(cudaMemGetInfo(&fr0, &tot0));
@@ -4416,9 +4455,9 @@ int run(int argc, char** argv) {
         use_dev(Ly.dev);
         Vi.kv_cap = Ly.sliding ? std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : ctx;
         if (g_kv_grow && !Ly.sliding) Vi.kv_cap = 0;   // (kv_ensure: in the expert pool, as the positions need)
-        else if (g_kv_fp8) {
-            Vi.kc8 = dalloc<uint8_t>((size_t) Vi.kv_cap * KD);
-            Vi.vc8 = dalloc<uint8_t>((size_t) Vi.kv_cap * KD);
+        else if (kv_b8()) {
+            Vi.kc8 = dalloc<uint8_t>((size_t) Vi.kv_cap * kv_tok_b(KD));
+            Vi.vc8 = dalloc<uint8_t>((size_t) Vi.kv_cap * kv_tok_b(KD));
         } else {
             Vi.kc = dalloc<uint16_t>((size_t) Vi.kv_cap * KD);
             Vi.vc = dalloc<uint16_t>((size_t) Vi.kv_cap * KD);
@@ -4442,8 +4481,9 @@ int run(int argc, char** argv) {
     if (g_stage) cudaFree(g_stage), g_stage = nullptr, g_stage_bytes = 0;
     {
         size_t kv_bytes = 0;
-        for (const auto& Vi : M.V) kv_bytes += (size_t) Vi.kv_cap * KD * (g_kv_fp8 ? 1 : 2) * 2;
-        std::printf("kv cache: %s (%.2f GiB across %d layer%s)\n", g_kv_fp8 ? "FP8 E4M3" : "FP16",
+        for (const auto& Vi : M.V) kv_bytes += (size_t) Vi.kv_cap * kv_tok_b(KD) * 2;
+        std::printf("kv cache: %s (%.2f GiB across %d layer%s)\n",
+                    g_kv_i8 ? "int8, an FP16 scale per 64" : g_kv_fp8 ? "FP8 E4M3" : "FP16",
                     kv_bytes / 1073741824.0, c.n_visit, c.n_pass > 1 ? " visits" : "s");
         std::fflush(stdout);
     }
@@ -4750,7 +4790,7 @@ int run(int argc, char** argv) {
         W.relb_ext = std::max(c.extent, c.extent_swa);
         W.relb = dalloc<float>((size_t) Work::kRelbRows * c.H * W.relb_ext);
     }
-    if (g_kv_fp8) {
+    if (kv_b8()) {
         W.kv_tmp_cap = std::min(ctx, 32768);
         W.kv_k16 = dalloc<uint16_t>((size_t) W.kv_tmp_cap * KD);
         W.kv_v16 = dalloc<uint16_t>((size_t) W.kv_tmp_cap * KD);
@@ -4862,7 +4902,7 @@ int run(int argc, char** argv) {
         size_t full_v = 0;
         for (const auto& Vi : M.V) full_v += !M.L[Vi.l].sliding;
         const auto& P0 = EC.pools[0];
-        const size_t per_tok = 2 * full_v * (size_t) c.KV * c.D * (g_kv_fp8 ? 1 : 2);
+        const size_t per_tok = 2 * full_v * kv_tok_b((size_t) c.KV * c.D);
         const long most = per_tok ? (long) ((size_t) std::max(0, P0.n_slots - 2 * c.E - 80) * P0.slot_bytes / per_tok) : 0;
         if (full_v && most < ctx)
             std::printf("kv-grow: this card holds the full layers' K / V for about %ld tokens, under --ctx %d\n", most, ctx);
@@ -5044,7 +5084,7 @@ int run(int argc, char** argv) {
             std::vector<float*> h;   // [layer * 4 + conv]
             std::vector<std::vector<uint8_t>> kv_k, kv_v;
         };
-        const size_t kv_elem_b = g_kv_fp8 ? 1 : 2;
+        const size_t kv_row_b = kv_tok_b(KD);
         std::vector<Snap> snaps(8);
         for (auto& sn : snaps) {
             sn.kv_k.resize(M.V.size());
@@ -5055,7 +5095,7 @@ int run(int argc, char** argv) {
                 const size_t cc[4] = {KD, KD, C, C};
                 for (int i = 0; i < 4; ++i) sn.h.push_back(dalloc<float>(3 * cc[i]));
                 if (Ly.sliding && Ly.kv_cap < ctx) {
-                    const size_t bytes = (size_t) c.window * KD * kv_elem_b;
+                    const size_t bytes = (size_t) c.window * kv_row_b;
                     sn.kv_k[l].resize(bytes);
                     sn.kv_v[l].resize(bytes);
                 }
@@ -5065,7 +5105,7 @@ int run(int argc, char** argv) {
         auto snap_copy = [&](Snap& sn, bool save) {
             const size_t cc[4] = {KD, KD, C, C};
             const cudaMemcpyKind kv_dir = save ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice;
-            const size_t row_b = (size_t) KD * kv_elem_b;
+            const size_t row_b = kv_row_b;
             for (size_t l = 0; l < M.V.size(); ++l) {   // (l: a visit)
                 Layer& Ly = bind_visit(M, (int) l);
                 use_dev(Ly.dev);
@@ -5080,8 +5120,8 @@ int run(int argc, char** argv) {
                     const int s0 = k_start % Ly.kv_cap;
                     const int n1 = std::min(w, Ly.kv_cap - s0);
                     const int n2 = w - n1;
-                    uint8_t* dk = g_kv_fp8 ? Ly.kc8 : (uint8_t*) Ly.kc;
-                    uint8_t* dv = g_kv_fp8 ? Ly.vc8 : (uint8_t*) Ly.vc;
+                    uint8_t* dk = kv_b8() ? Ly.kc8 : (uint8_t*) Ly.kc;
+                    uint8_t* dv = kv_b8() ? Ly.vc8 : (uint8_t*) Ly.vc;
                     uint8_t* hk = sn.kv_k[l].data();
                     uint8_t* hv = sn.kv_v[l].data();
                     CU(cudaMemcpyAsync(save ? hk : dk + (size_t) s0 * row_b, save ? dk + (size_t) s0 * row_b : hk,
@@ -5132,7 +5172,7 @@ int run(int argc, char** argv) {
             eos_ids.push_back(199999);   // (Inkling 2's <|endoftext|>)
         }
         if (serve_strata) {
-            std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d\n", g_kv_fp8 ? "fp8" : "f16", ctx, n_gpu);
+            std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d\n", g_kv_i8 ? "i8" : g_kv_fp8 ? "fp8" : "f16", ctx, n_gpu);
             std::printf("READY %d stop\n", ctx);
         } else {
             std::printf("@READY ctx %d\n", ctx);

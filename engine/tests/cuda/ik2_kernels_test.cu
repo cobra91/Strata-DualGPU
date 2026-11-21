@@ -1524,6 +1524,138 @@ void test_attn_decode_mma() {
         }
 }
 
+// int8 K / V: the int8 kernels on a cache of codes and scales against the FP16 kernels on the FP16 of the same values
+// (code * scale rounded once, as the int8 kernels make them) - the same results but for summation order; and
+// prep_qkv_r_i8's rows against prep_qkv_r_f16's values (one int8 step of a group's max)
+void test_kv_i8() {
+    const int H = 12, KV = 2, D = 128, KD = KV * D, d_rel = 16;
+    const int RS = (int) k::kv_row_bytes_i8(KD);
+    struct Case { int n_pos, kv_cap, window, extent; const char* name; };
+    const Case cases[] = {{1, 0, 1 << 30, 64, "1 key"}, {2500, 0, 1 << 30, 1024, "2500 keys"},
+                          {3000, 400, 256, 256, "ring 400, window 256"}};
+    for (const Case& c : cases) {
+        const int rows = c.kv_cap > 0 ? c.kv_cap : c.n_pos;
+        std::vector<int8_t> k8((size_t) rows * RS, 0), v8((size_t) rows * RS, 0);
+        std::vector<uint16_t> k16((size_t) rows * KD), v16((size_t) rows * KD);
+        for (int r = 0; r < rows; ++r)
+            for (int which = 0; which < 2; ++which) {
+                int8_t* rw = (which ? v8 : k8).data() + (size_t) r * RS;
+                uint16_t* sc = (uint16_t*) (rw + KD);
+                uint16_t* o16 = (which ? v16 : k16).data() + (size_t) r * KD;
+                for (int gq = 0; gq < KD / 64; ++gq) {
+                    sc[gq] = f2h_host(std::fabs(frand(0.05f)) + 1e-3f);
+                    for (int i = 0; i < 64; ++i) {
+                        const int8_t q = (int8_t) ((int) (rng() % 255) - 127);
+                        rw[gq * 64 + i] = q;
+                        o16[gq * 64 + i] = f2h_host((float) q * h2f_host(sc[gq]));
+                    }
+                }
+            }
+        int8_t *dk8 = dev(k8), *dv8 = dev(v8);
+        uint16_t *dk16 = dev(k16), *dv16 = dev(v16);
+        const int qpos = c.n_pos - 1;
+        auto qf = fvec((size_t) 8 * H * D, 4.0f);
+        std::vector<uint16_t> q16(qf.size());
+        for (size_t i = 0; i < qf.size(); ++i) q16[i] = f2h_host(qf[i]), qf[i] = h2f_host(q16[i]);
+        auto r = fvec((size_t) 8 * H * d_rel, 2.0f), proj = fvec((size_t) c.extent * d_rel), sink = fvec((size_t) 8 * H, 3.0f);
+        const float scale = 1.0f / std::sqrt((float) D);
+        float *dq = dev(qf), *dr = dev(r), *dp = dev(proj), *ds = dev(sink);
+        uint16_t* dq16 = dev(q16);
+        float *o_a = dev_n<float>((size_t) 8 * H * D), *o_b = dev_n<float>((size_t) 8 * H * D);
+        float* scr = dev_n<float>((size_t) 1 << 22);
+        auto cmp = [&](const char* what, size_t n) {
+            const auto a = host(o_a, n);
+            const auto b = host(o_b, n);
+            std::vector<double> want(a.begin(), a.end());
+            char label[96];
+            std::snprintf(label, sizeof label, "i8 %s %s", what, c.name);
+            expect(label, b, want, 2e-3, 2e-4);
+        };
+        // the decode's tensor-core attention
+        k::attn_decode_mma_f16(dq16, dr, ds, dk16, dv16, c.kv_cap, H, KV, nullptr, qpos, 2, scale, dp, d_rel, c.extent,
+                               c.window, scr, o_a, nullptr, nullptr, 0);
+        k::attn_decode_mma_i8(dq16, dr, ds, dk8, dv8, c.kv_cap, H, KV, nullptr, qpos, 2, scale, dp, d_rel, c.extent,
+                              c.window, scr, o_b, nullptr, nullptr, 0);
+        cmp("decode mma", (size_t) H * D);
+        // the scalar decode, and the multi-query one (4 queries)
+        const int k0 = c.window < (1 << 30) ? std::max(0, qpos - c.window + 1) : 0;
+        k::attn_decode_f16(dq, dr, ds, dk16, dv16, c.kv_cap, H, KV, D, k0, qpos + 1 - k0, qpos, scale, dp, d_rel,
+                           c.extent, c.window, scr, o_a, 0);
+        k::attn_decode_i8(dq, dr, ds, dk8, dv8, c.kv_cap, H, KV, D, k0, qpos + 1 - k0, qpos, scale, dp, d_rel, c.extent,
+                          c.window, scr, o_b, 0);
+        cmp("decode", (size_t) H * D);
+        if (c.n_pos >= 4) {
+            const int p0 = qpos - 3, k0m = c.window < (1 << 30) ? std::max(0, p0 - c.window + 1) : 0;
+            k::attn_multi_f16(dq, dr, ds, dk16, dv16, c.kv_cap, 4, H, KV, k0m, qpos + 1 - k0m, p0, scale, dp, d_rel,
+                              c.extent, c.window, scr, o_a, 0);
+            k::attn_multi_i8(dq, dr, ds, dk8, dv8, c.kv_cap, 4, H, KV, k0m, qpos + 1 - k0m, p0, scale, dp, d_rel, c.extent,
+                             c.window, scr, o_b, 0);
+            cmp("multi 4", (size_t) 4 * H * D);
+            // the prefill's flash attention (8 queries ending at qpos; the bias as a table)
+            const int Tq = 4, q_ld = H * D;
+            auto bias = fvec((size_t) Tq * H * c.extent, 2.0f);
+            float* db = dev(bias);
+            const size_t sf = (size_t) 1 << 22;
+            k::attn_flash_f16(dq16, q_ld, dk16, dv16, c.kv_cap, H, KV, D, Tq, p0, scale, db, c.extent, c.window, ds, o_a,
+                              q_ld, scr, sf, 3, 0);
+            k::attn_flash_i8(dq16, q_ld, dk8, dv8, c.kv_cap, H, KV, D, Tq, p0, scale, db, c.extent, c.window, ds, o_b,
+                             q_ld, scr, sf, 3, 0);
+            cmp("flash 4", (size_t) Tq * H * D);
+            cudaFree(db);
+        }
+        // the unpack (the prefill's GEMM path)
+        {
+            const int nk = std::min(rows, 300);
+            uint16_t *uk = dev_n<uint16_t>((size_t) nk * KD), *uv = dev_n<uint16_t>((size_t) nk * KD);
+            k::unpack_kv_i8_to_f16(dk8, dv8, c.kv_cap, 0, nk, KD, uk, uv, 0);
+            const auto hk = host(uk, (size_t) nk * KD), hv = host(uv, (size_t) nk * KD);
+            bool same = true;
+            for (size_t i = 0; i < hk.size(); ++i) same &= hk[i] == k16[i] && hv[i] == v16[i];
+            expect_true(c.kv_cap ? "i8 unpack (ring)" : "i8 unpack", same);
+            cudaFree(uk), cudaFree(uv);
+        }
+        cudaFree(dk8), cudaFree(dv8), cudaFree(dk16), cudaFree(dv16), cudaFree(dq16);
+        for (float* p : {dq, dr, dp, ds, o_a, o_b, scr}) cudaFree(p);
+    }
+    // prep_qkv_r_i8 against prep_qkv_r_f16: 5 tokens at 7, a cache of 16 rows
+    {
+        const int T = 5, pos0 = 7, cap = 16;
+        auto q = fvec((size_t) T * H * D), kin = fvec((size_t) T * KD, 3.0f), vin = fvec((size_t) T * KD, 2.0f);
+        auto r = fvec((size_t) T * H * d_rel);
+        float *dqa = dev(q), *dqb = dev(q), *dk = dev(kin), *dv = dev(vin), *dra = dev(r), *drb = dev(r);
+        uint16_t *k16 = dev_n<uint16_t>((size_t) cap * KD), *v16 = dev_n<uint16_t>((size_t) cap * KD);
+        int8_t *k8 = dev_n<int8_t>((size_t) cap * RS), *v8 = dev_n<int8_t>((size_t) cap * RS);
+        k::prep_qkv_r_f16(dqa, nullptr, dk, k16, dv, v16, dra, nullptr, T, H, KV, D, d_rel, 22.6f, 8.0f, 1e-6f, nullptr,
+                          0.0f, 1.0f, pos0, cap, 0);
+        k::prep_qkv_r_i8(dqb, nullptr, dk, k8, dv, v8, drb, nullptr, T, H, KV, D, d_rel, 22.6f, 8.0f, 1e-6f, nullptr,
+                         0.0f, 1.0f, pos0, cap, 0);
+        uint16_t *uk = dev_n<uint16_t>((size_t) cap * KD), *uv = dev_n<uint16_t>((size_t) cap * KD);
+        k::unpack_kv_i8_to_f16(k8, v8, 0, 0, cap, KD, uk, uv, 0);
+        const auto a = host(k16, (size_t) cap * KD), b = host(uk, (size_t) cap * KD);
+        const auto av = host(v16, (size_t) cap * KD), bv = host(uv, (size_t) cap * KD);
+        double worst = 0;
+        for (int t = 0; t < T; ++t) {
+            const int row = (pos0 + t) % cap;
+            for (int which = 0; which < 2; ++which)
+                for (int gq = 0; gq < KD / 64; ++gq) {
+                    const auto& x = which ? av : a;
+                    const auto& y = which ? bv : b;
+                    double m = 0, e = 0;
+                    for (int i = 0; i < 64; ++i) {
+                        const size_t j = (size_t) row * KD + gq * 64 + i;
+                        m = std::max(m, (double) std::fabs(h2f_host(x[j])));
+                        e = std::max(e, (double) std::fabs(h2f_host(x[j]) - h2f_host(y[j])));
+                    }
+                    worst = std::max(worst, e / (m / 127.0));
+                }
+        }
+        std::printf("     prep_qkv_r_i8: worst error %.3f of a step (a step: the group's max / 127)\n", worst);
+        expect_true("prep_qkv_r_i8: within 0.55 steps of prep_qkv_r_f16", worst <= 0.55);
+        for (float* p : {dqa, dqb, dk, dv, dra, drb}) cudaFree(p);
+        cudaFree(k16), cudaFree(v16), cudaFree(k8), cudaFree(v8), cudaFree(uk), cudaFree(uv);
+    }
+}
+
 // attn_flash_f16 (the fused prefill attention) against a double reference: linear and ring caches, a window, the
 // relative bias table, the sink, a chunk from 0 and one at an offset, 1 to 7 key splits (some of them empty).
 void test_attn_flash() {
@@ -2621,6 +2753,7 @@ int main() {
     test_cand_topk();
     test_token_path();
     test_experts_mma();
+    test_kv_i8();   // (after the others: its random data leaves theirs as it was)
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

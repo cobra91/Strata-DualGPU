@@ -425,4 +425,36 @@ void decode_f32(int type, const uint8_t* blocks, size_t n, float* out, cudaStrea
 /// ... on the host (the reference of the tests, and the embedding's rows).
 void decode_host(int type, const uint8_t* blocks, size_t n, float* out);
 
+/// int8 K / V (IK2_KV=i8): a token's row is kv_row_bytes_i8(KD) bytes - its KD int8 codes, then one FP16 scale per
+/// 64 values (padded to 16 bytes); K L2-clipped and V RMS-normalized as for FP16, value = code * scale.  The same
+/// calls as the FP16 cache's (no K / V scale factors: the rows carry theirs).
+size_t kv_row_bytes_i8(int KD);
+void prep_qkv_r_i8(float* q, const float* q_clip, const float* k_in, int8_t* kc, const float* v_in, int8_t* vc,
+                   float* r, const float* r_clip, int T, int H, int KV, int D, int d_rel, float qk_clip,
+                   float rel_clip, float eps, const int* pos, float alpha, float n_floor, int pos0, int kv_cap,
+                   cudaStream_t s);
+void prep_qkv_r_i8_at(float* q, const float* q_clip, const float* k_in, int8_t* kc, const float* v_in, int8_t* vc,
+                      float* r, const float* r_clip, int H, int KV, int D, int d_rel, float qk_clip, float rel_clip,
+                      float eps, const int* pos, bool log_scale, float alpha, float n_floor, int kv_cap,
+                      uint16_t* q16, cudaStream_t s, const uint16_t* sink_w = nullptr, const float* sink_x = nullptr,
+                      int sink_k = 0, float* sink_y = nullptr);
+void attn_multi_i8(const float* q, const float* r, const float* sink, const int8_t* kc, const int8_t* vc, int kv_cap,
+                   int nq, int H, int Hkv, int k0, int nk, int qpos0, float qk_scale, const float* proj, int d_rel,
+                   int extent, int window, float* scratch, float* out, cudaStream_t s);
+void attn_decode_i8(const float* q, const float* r, const float* sink, const int8_t* kc, const int8_t* vc, int kv_cap,
+                    int H, int Hkv, int D, int k0, int nk, int qpos, float qk_scale, const float* proj, int d_rel,
+                    int extent, int window, float* scratch, float* out, cudaStream_t s);
+void attn_decode_i8_at(const float* q, const float* r, const float* sink, const int8_t* kc, const int8_t* vc,
+                       int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, const float* proj,
+                       int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s);
+void attn_decode_mma_i8(const uint16_t* q16, const float* r, const float* sink, const int8_t* kc, const int8_t* vc,
+                        int kv_cap, int H, int Hkv, const int* pos, int qpos, int n_split, float qk_scale,
+                        const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
+                        const float* gate, uint16_t* out16, cudaStream_t s);
+void attn_flash_i8(const uint16_t* q16, int q_ld, const int8_t* kc, const int8_t* vc, int kv_cap, int H, int KV, int D,
+                   int Tq, int qpos0, float qk_scale, const float* bias, int extent, int window, const float* sink,
+                   float* out, int o_ld, float* scratch, size_t scratch_floats, int n_split, cudaStream_t s);
+void unpack_kv_i8_to_f16(const int8_t* kc, const int8_t* vc, int kv_cap, int k0, int nk, int KD, uint16_t* k_out16,
+                         uint16_t* v_out16, cudaStream_t s);
+
 }  // namespace ik2::k
