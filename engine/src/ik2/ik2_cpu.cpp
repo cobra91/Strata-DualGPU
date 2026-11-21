@@ -71,9 +71,20 @@ void Pool::post(std::function<void()> f) {
 }
 void Pool::wait() {
     std::unique_lock<std::mutex> lk(m_, std::defer_lock);
-    for (int spin = 0; spin < 200000; ++spin) {   // (the caller spins too: the work is short)
+    for (int spin = 0; spin < 200000; ++spin) {   // (the caller works the queue too, then spins: the work is short)
         lk.lock();
         if (pending_ == 0) return;
+        if (!q_.empty()) {
+            std::function<void()> f = std::move(q_.front());
+            q_.pop_front();
+            lk.unlock();
+            f();
+            lk.lock();
+            if (--pending_ == 0) done_.notify_all();
+            lk.unlock();
+            spin = 0;
+            continue;
+        }
         lk.unlock();
         _mm_pause();
     }
