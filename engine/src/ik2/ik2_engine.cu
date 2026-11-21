@@ -310,6 +310,7 @@ cublasHandle_t g_blas;
 cudaStream_t g_s;
 cudaStream_t g_cs;          // the experts' copies of the token path, beside the compute stream
 cudaEvent_t g_ev;
+bool g_tg_capturing = false;   // IK2_TOKGRAPH: a decode token's graph being captured
 bool g_overlap = true;      // IK2_OVERLAP=0: the copies on the compute stream, before the experts
 // The CPU lane (IK2_CPU=1: on): a missing NVFP4 expert computed in host memory by the pool while the others' blocks
 // are copied; its own blocks follow on the copy stream without being waited for ("lazy"), so it is in VRAM next time.
@@ -2007,6 +2008,7 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
                     if (n == 1) k::argmax_sum(W.logits, nullptr, nullptr, c.n_vocab, W.argmax_d + i, g_s);
                     else k::argmax_rows(W.logits, c.n_rows, n, c.n_vocab, W.argmax_d + i, g_s);
                 }
+                if (g_tg_capturing) return;   // (a token graph: the argmax read after its launch)
                 CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, (size_t) nt * 4, cudaMemcpyDeviceToHost, g_s));
                 CU(cudaStreamSynchronize(g_s));
                 for (int i = 0; i < nt; ++i) (*argmax_out)[i] = W.argmax_h[i];
@@ -2412,7 +2414,14 @@ struct DevPlan {
     Copy q[kQ];
     const uint8_t** tsrc = nullptr;   // pinned [kQ][2]: a table entry to copy (the slot, null)
     std::atomic<int> quiesce{0};
+    // IK2_TOKGRAPH (default on with the plan): a decode token as one CUDA graph, captured while the token before runs
+    // (its inputs: the embedding row from emb, the position set by a kernel; the argmax read after it)
+    bool graph = true;
+    float* emb = nullptr;
+    cudaGraphExec_t exec[2] = {nullptr, nullptr};
+    int exec_pos[2] = {-1, -1};
 } g_dp;
+__global__ void k_set_int(int* p, int v) { *p = v; }
 __device__ __forceinline__ int dp_ld_sys(const volatile int* p) {
     int v;
     asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
@@ -2630,6 +2639,7 @@ void dp_alloc(const Config& c) {
     g_dp.blob = dalloc<const uint8_t*>(16);
     g_dp.tok = dalloc<int>(16), g_dp.inv = dalloc<int>(16), g_dp.mflag = dalloc<int>(16);
     g_dp.sg = dalloc<float>(16), g_dp.su = dalloc<float>(16), g_dp.wt = dalloc<float>(16);
+    g_dp.emb = dalloc<float>(c.C);
 }
 // the cache's residency into g_dp.tab (the GPU idle: the copies landed)
 void dp_sync_tab(const Model& M, ExpertCache& ECr) {
@@ -2715,7 +2725,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
     kv_ensure(M, pos0 + T);
     const Config& c = M.c;
     const bool dp_tok = g_dp.ok && T == 1 && dump.empty() && !g_prof && !g_rec && !g_taps && !g_trace;
-    if (dp_tok && g_dp_time) g_dp_t0 = now();
+    if (dp_tok && g_dp_time && !g_tg_capturing) g_dp_t0 = now();
     if (dp_tok && g_dp.dirty) {
         CU(cudaDeviceSynchronize());
         g_seq_done = g_seq_next - 1;
@@ -2743,16 +2753,22 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
 #define W (*Wp)
 #define EC (*ECp)
     // the embedding rows, normed (pinned host staging, no stream sync needed)
-    {
-        const size_t rb = (size_t) C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
-        for (int t = 0; t < T; ++t)
-            k::decode_host(M.embd_type, M.embd + (size_t) tok[t] * rb, C, W.emb_h + (size_t) t * C);
-        for (int t = 0; t < T; ++t) W.pos_h[t] = pos0 + t;
+    if (g_tg_capturing) {   // (a token graph: the row from g_dp.emb, the position a constant of the graph)
+        CU(cudaMemcpyAsync(W.tmp, g_dp.emb, (size_t) C * 4, cudaMemcpyDeviceToDevice, g_s));
+        k::rms(W.tmp, M.embd_norm, T, C, c.eps, W.h, g_s);
+        k_set_int<<<1, 1, 0, g_s>>>(W.pos, pos0);
+    } else {
+        {
+            const size_t rb = (size_t) C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
+            for (int t = 0; t < T; ++t)
+                k::decode_host(M.embd_type, M.embd + (size_t) tok[t] * rb, C, W.emb_h + (size_t) t * C);
+            for (int t = 0; t < T; ++t) W.pos_h[t] = pos0 + t;
+        }
+        CU(cudaMemcpyAsync(W.tmp, W.emb_h, (size_t) T * C * 4, cudaMemcpyHostToDevice, g_s));
+        k::rms(W.tmp, M.embd_norm, T, C, c.eps, W.h, g_s);
+        place_pictures(W.h, T, pos0, C, g_s);
+        CU(cudaMemcpyAsync(W.pos, W.pos_h, (size_t) T * 4, cudaMemcpyHostToDevice, g_s));
     }
-    CU(cudaMemcpyAsync(W.tmp, W.emb_h, (size_t) T * C * 4, cudaMemcpyHostToDevice, g_s));
-    k::rms(W.tmp, M.embd_norm, T, C, c.eps, W.h, g_s);
-    place_pictures(W.h, T, pos0, C, g_s);
-    CU(cudaMemcpyAsync(W.pos, W.pos_h, (size_t) T * 4, cudaMemcpyHostToDevice, g_s));
     int nb = 0;
     const size_t TC = (size_t) T * C;
     auto blk = [&](int i) { return W.blocks + (size_t) i * W.blk_ld * C; };
@@ -3419,7 +3435,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
     }
     const double t_enq = dp_tok && g_dp_time ? now() : 0;
     run_head(M, T, all_logits, out_mode, nb, W.h, W, logits_out, argmax_out);
-    if (dp_tok && g_dp_time) {   // IK2_DP_TIME=1: the host's enqueue time of a token against the token's
+    if (dp_tok && g_dp_time && !g_tg_capturing) {   // IK2_DP_TIME=1: the host's enqueue time of a token against the token's
         g_dp_t_enq += t_enq - g_dp_t0, g_dp_t_tok += now() - g_dp_t0, ++g_dp_n;
         if (g_dp_n % 64 == 0)
             std::fprintf(stderr, "devplan time a token: %.2f ms enqueued, %.2f ms in all\n", g_dp_t_enq / g_dp_n * 1e3,
@@ -3559,6 +3575,34 @@ void big_end(Work& W, ExpertCache& EC, BigScratch& bs) {
 }
 
 // Sweeps each layer once across up to W.T_sup tokens (sub-chunked attention for KV/attention scratch, then one combined MoE pass).
+// a decode token's graph for position pos into exec slot (captured, not run)
+void tg_capture(Model& M, int pos, int slot) {
+    kv_ensure(M, pos + 1);   // (a growth synchronizes: not inside a capture)
+    g_tg_capturing = true;
+    CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeThreadLocal));
+    const int tok = 0;
+    std::vector<float> lg;
+    std::vector<int> ag;
+    double te = 0;
+    forward(M, &tok, 1, pos, false, OutMode::kArgmax, std::string(), lg, &ag, te);
+    cudaGraph_t g;
+    CU(cudaStreamEndCapture(g_s, &g));
+    g_tg_capturing = false;
+    cudaGraphExec_t& ex = g_dp.exec[slot];
+    bool updated = false;
+    if (ex) {
+        cudaGraphExecUpdateResultInfo info;
+        updated = cudaGraphExecUpdate(ex, g, &info) == cudaSuccess;
+        if (!updated) {
+            cudaGetLastError();
+            CU(cudaGraphExecDestroy(ex));
+            ex = nullptr;
+        }
+    }
+    if (!updated) CU(cudaGraphInstantiate(&ex, g, 0));
+    CU(cudaGraphDestroy(g));
+    g_dp.exec_pos[slot] = pos;
+}
 void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chunk, OutMode out_mode,
                          std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp) {
     const Config& c = M.c;
@@ -3992,6 +4036,7 @@ int run(int argc, char** argv) {
     if (getenv("IK2_UP_MS")) g_t_up = std::atof(getenv("IK2_UP_MS")) * 1e-3;
     g_cpu_lazy = !getenv("IK2_CPU_LAZY") || std::atoi(getenv("IK2_CPU_LAZY"));
     if (getenv("IK2_LAZY_MAX")) g_lazy_max = std::max(0, std::atoi(getenv("IK2_LAZY_MAX")));
+    if (getenv("IK2_TOKGRAPH")) g_dp.graph = std::atoi(getenv("IK2_TOKGRAPH")) != 0;
     if (n_gpu > 2 && getenv("IK2_DENSE")) die("IK2_DENSE with --gpus > 2");
 
     // Do the experts all fit in VRAM beside the dense weights and the K / V cache (Inkling-2-Mini's 14.7 GiB on a 24 GB
@@ -5329,7 +5374,22 @@ int run(int argc, char** argv) {
         if (i + 1 == gen) break;
         std::vector<int> ag;
         if (lo) logits.clear();
-        forward(M, &tok, 1, (int) prompt.size() + i, false, lo ? OutMode::kLogits : OutMode::kArgmax, std::string(),
+        const int pos = (int) prompt.size() + i;
+        if (g_dp.ok && g_dp.graph && !lo && i > 0 && !g_dp.dirty) {   // IK2_TOKGRAPH
+            const int sl = i & 1;
+            if (g_dp.exec_pos[sl] != pos) tg_capture(M, pos, sl);
+            const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
+            Work& W0 = dev_work(0);
+            k::decode_host(M.embd_type, M.embd + (size_t) tok * rb, c.C, W0.emb_h);
+            CU(cudaMemcpyAsync(g_dp.emb, W0.emb_h, (size_t) c.C * 4, cudaMemcpyHostToDevice, g_s));
+            CU(cudaGraphLaunch(g_dp.exec[sl], g_s));
+            if (i + 2 < gen) tg_capture(M, pos + 1, sl ^ 1);   // (the next token's, while this one runs)
+            CU(cudaMemcpyAsync(W0.argmax_h, W0.argmax_d, 4, cudaMemcpyDeviceToHost, g_s));
+            CU(cudaStreamSynchronize(g_s));
+            best = W0.argmax_h[0];
+            continue;
+        }
+        forward(M, &tok, 1, pos, false, lo ? OutMode::kLogits : OutMode::kArgmax, std::string(),
                 logits, &ag, t_exp);
         if (lo) {
             std::fwrite(logits.data(), sizeof(float), (size_t) c.n_vocab, lo);
