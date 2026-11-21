@@ -370,19 +370,20 @@ void spin_start(int workers) {
 }
 void experts_batch(const BatchJob* J, int n, int C, int F, float gcap, float ucap) {
     if (n <= 0) return;
-    static std::vector<float> gu;
-    if (gu.size() < (size_t) n * 2 * F) gu.resize((size_t) n * 2 * F);
+    thread_local std::vector<float> gu_tl;   // (the caller's: the workers below see its pointer, not their own copy)
+    if (gu_tl.size() < (size_t) n * 2 * F) gu_tl.resize((size_t) n * 2 * F);
+    float* const gu = gu_tl.data();
     constexpr int RP = 64;
     const int pa = 2 * F / RP, pc = C / RP, pb = (F + 127) / 128;
     spin_for(n * pa, [&](int i) {   // gate's rows [0, F), up's [F, 2F)
         const int j = i / pa, r0 = (i % pa) * RP;
-        float* g = gu.data() + (size_t) j * 2 * F;
+        float* g = gu + (size_t) j * 2 * F;
         if (r0 < F) rows(J[j].tg, J[j].gate, C, r0, r0 + RP, J[j].x, g + r0);
         else rows(J[j].tu, J[j].up, C, r0 - F, r0 - F + RP, J[j].x, g + r0);
     });
     spin_for(n * pb, [&](int i) {   // the activation in place of gate's rows
         const int j = i / pb, f0 = (i % pb) * 128, f1 = std::min(F, f0 + 128);
-        float* g = gu.data() + (size_t) j * 2 * F;
+        float* g = gu + (size_t) j * 2 * F;
         for (int f = f0; f < f1; ++f) {
             const float a = g[f] * J[j].sg, u = g[F + f] * J[j].su;
             g[f] = gcap * std::tanh(a / gcap) * (1.0f / (1.0f + std::exp(-a))) * ucap * std::tanh(u / ucap);
@@ -390,7 +391,7 @@ void experts_batch(const BatchJob* J, int n, int C, int F, float gcap, float uca
     });
     spin_for(n * pc, [&](int i) {   // down's rows
         const int j = i / pc, r0 = (i % pc) * RP;
-        rows(J[j].td, J[j].down, F, r0, r0 + RP, gu.data() + (size_t) j * 2 * F, J[j].y + r0);
+        rows(J[j].td, J[j].down, F, r0, r0 + RP, gu + (size_t) j * 2 * F, J[j].y + r0);
     });
 }
 

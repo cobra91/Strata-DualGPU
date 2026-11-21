@@ -2692,7 +2692,7 @@ void kv_ensure(Model& M, int need) {
     const int k_new = (int) ((total + P.slot_bytes - 1) / P.slot_bytes);
     if (P.n_slots - k_new < 2 * c.E + 80)
         die("--kv-grow: the K / V for " + std::to_string(ncap) + " tokens leaves too few expert slots (this card holds the "
-            "full layers' K / V for about " + std::to_string((int) ((size_t) (P.n_slots - 2 * c.E - 80) * P.slot_bytes /
+            "full layers' K / V for about " + std::to_string((int) ((size_t) std::max(0, P.n_slots - 2 * c.E - 80) * P.slot_bytes /
                                                                    (2 * full.size() * KD * eb))) + " tokens; a smaller --ctx)");
     if (P.n_active < P.n_slots - P.kv_res) die("--kv-grow: a growth while slots are lent (internal)");
     CU(cudaDeviceSynchronize());
@@ -3920,6 +3920,7 @@ int run(int argc, char** argv) {
         const std::string kv = getenv_str("IK2_KV");
         if (kv == "f16" || kv == "fp16") g_kv_fp8 = false;
         else if (kv == "fp8" || kv == "e4m3") g_kv_fp8 = true;
+        else die("unknown IK2_KV=" + kv + " (expected fp8 or f16)");
         if (g_kv_fp8) {   // (the prompt attention's FP8 tiles need more shared memory than a block gets before sm_80)
             int mj = 0;
             CU(cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, 0));
@@ -3928,7 +3929,6 @@ int run(int argc, char** argv) {
                 g_kv_fp8 = false;
             }
         }
-        else die("unknown IK2_KV=" + kv + " (expected fp8 or f16)");
     }
     if (getenv("IK2_TRACE") && *getenv("IK2_TRACE")) {
         g_trace = std::fopen(getenv("IK2_TRACE"), "wb");
@@ -4465,6 +4465,18 @@ int run(int argc, char** argv) {
     // (the resident path keeps every expert in VRAM, so no pinned host copy is needed: the experts go from where the
     //  files are mapped straight to their slots, and stay in the page cache for the next load - IK2_HOST=pinned: as
     //  for the other models)
+    if (g_pool) {   // (no layer's experts the CPU can multiply - say NVFP4 on an AVX2-only CPU: no idle lane threads)
+        bool any = false;
+        for (int l = 0; !any && l < c.n_layer; ++l)
+            any = ik2::cpu::available_for(M.L[l].ty[0]) && ik2::cpu::available_for(M.L[l].ty[1]) &&
+                  ik2::cpu::available_for(M.L[l].ty[2]);
+        if (!any) {
+            std::printf("CPU lane: no layer's expert types on this CPU; off\n");
+            delete g_pool;
+            g_pool = nullptr;
+            if (!getenv("IK2_LAZY_MAX")) g_lazy_max = 1 << 30;
+        }
+    }
 #ifdef _WIN32
     // Windows restricts physical memory pinning (cudaHostAlloc fails with OOM for multi-gigabyte models).
     // Default to direct mmap reading unless IK2_HOST=pinned is explicitly requested.
@@ -4727,8 +4739,8 @@ int run(int argc, char** argv) {
     W.dyn = dalloc<float>(2 * Tm * c.KV * 4);   // (a full layer's dynamic taps: k's, and on the resident path v's beside)
     // (at least 256 MiB, which the prompt attention's non-flash path batches its queries into; with the flash path's
     //  prompts a small card keeps only what a decode token's attention needs, plus 16 MiB - IK2_LG_MIN_MB)
-    const size_t lg_floor = (size_t) (getenv("IK2_LG_MIN_MB") ? std::atoi(getenv("IK2_LG_MIN_MB"))
-                                                              : (small_card && g_flash && !g_kv_fp8 ? 16 : 256)) << 18;
+    const size_t lg_floor = (size_t) std::max(1, getenv("IK2_LG_MIN_MB") ? std::atoi(getenv("IK2_LG_MIN_MB"))
+                                                                        : (small_card && g_flash && !g_kv_fp8 ? 16 : 256)) << 18;
     W.lg_cap = std::max((size_t) 8 * c.H * (size_t) ctx + (size_t) 8 * c.H * 128 * 130, lg_floor);
     W.lg = dalloc<float>(W.lg_cap);
     W.blocks = dalloc<float>((size_t) (c.n_layer / c.block + 1) * T_buf * C);
