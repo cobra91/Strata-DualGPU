@@ -24,7 +24,7 @@ inline ModelFamily model_family_from_arch(const std::string& arch) {
     if (arch == "qwen4exp") return ModelFamily::Qwen4Exp;
     if (arch == "qwen35moe") return ModelFamily::Qwen35Moe;
     if (arch == "hy_v4_flash") return ModelFamily::Hy4Flash;
-    if (arch == "inkling2") return ModelFamily::Inkling2;
+    if (arch == "inkling2" || arch == "inkling2_loop") return ModelFamily::Inkling2;   // (llama.cpp's merged Mini layout)
     return ModelFamily::Unknown;
 }
 

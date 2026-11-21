@@ -2481,7 +2481,7 @@ __global__ void k_dp_merge(float* __restrict__ y, const float* ey, const int* __
     if (!mflag[k] || i >= C) return;
     y[(size_t) k * C + i] = __ldcv(ey + ((size_t) (seqd[1] % R) * 16 + k) * C + i);
 }
-bool g_dp_time = getenv("IK2_DP_TIME") != nullptr;
+bool g_dp_time = getenv("IK2_DP_TIME") && std::atoi(getenv("IK2_DP_TIME"));
 double g_dp_t0 = 0, g_dp_t_enq = 0, g_dp_t_tok = 0;
 long g_dp_n = 0;
 bool dp_ready(cudaEvent_t e) {
@@ -2690,7 +2690,11 @@ void kv_ensure(Model& M, int need) {
     const size_t ob = (size_t) g_kv_cap_full * KD * eb, nb = (size_t) ncap * KD * eb;
     const size_t total = 2 * full.size() * nb;
     const int k_new = (int) ((total + P.slot_bytes - 1) / P.slot_bytes);
-    if (P.n_slots - k_new < 2 * c.E + 80) die("--kv-grow: the K / V for " + std::to_string(ncap) + " tokens leaves too few expert slots");
+    if (P.n_slots - k_new < 2 * c.E + 80)
+        die("--kv-grow: the K / V for " + std::to_string(ncap) + " tokens leaves too few expert slots (this card holds the "
+            "full layers' K / V for about " + std::to_string((int) ((size_t) (P.n_slots - 2 * c.E - 80) * P.slot_bytes /
+                                                                   (2 * full.size() * KD * eb))) + " tokens; a smaller --ctx)");
+    if (P.n_active < P.n_slots - P.kv_res) die("--kv-grow: a growth while slots are lent (internal)");
     CU(cudaDeviceSynchronize());
     if (g_dp.M && !g_dp.dirty) {   // (the device plan's table and mirror name slots this growth takes: drained, rebuilt)
         g_dp.quiesce.store(1, std::memory_order_release);
@@ -2710,7 +2714,7 @@ void kv_ensure(Model& M, int need) {
             CU(cudaMemcpy(old.data() + (2 * i + 1) * ob, vp, ob, cudaMemcpyDeviceToHost));
         }
     }
-    EC.lend(p, P.n_active - (P.n_slots - k_new));   // the experts in the new slots dropped
+    if (P.n_active > P.n_slots - k_new) EC.lend(p, P.n_active - (P.n_slots - k_new));   // the experts in them dropped
     P.kv_res = k_new;
     uint8_t* base = P.data + (size_t) (P.n_slots - k_new) * P.slot_bytes;
     for (size_t i = 0; i < full.size(); ++i) {
@@ -3846,6 +3850,7 @@ int run(int argc, char** argv) {
     std::vector<int> eos_ids;                 // --eos a,b: the tokens a request ends at (the engine protocol)
     double cache_gb = 60;
     double vram_reserve_mib = 0;
+    bool vram_reserve_given = false;   // (an explicit 0 leaves 0: see the expert cache's room)
     int image_token = 200054;   // --image-token: Inkling 2's <|unused_200054|>, the template's placeholder of a picture
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -3868,7 +3873,7 @@ int run(int argc, char** argv) {
             if (v == "auto") chunk = 2048;
             else chunk = std::max(1, std::atoi(v.c_str()));
         }
-        else if (a == "--vram-reserve-mib") vram_reserve_mib = std::atof(next().c_str());
+        else if (a == "--vram-reserve-mib") vram_reserve_mib = std::atof(next().c_str()), vram_reserve_given = true;
         else if (a == "--kv-grow") kv_grow_arg = std::atoi(next().c_str());
         else if (a == "--ctx" || a == "--max-context") ctx = std::atoi(next().c_str());   // (--max-context: serve/server.py's name)
         else if (a == "--cache-gb" || a == "--expert-vram") cache_gb = std::atof(next().c_str());
@@ -3914,6 +3919,14 @@ int run(int argc, char** argv) {
         const std::string kv = getenv_str("IK2_KV");
         if (kv == "f16" || kv == "fp16") g_kv_fp8 = false;
         else if (kv == "fp8" || kv == "e4m3") g_kv_fp8 = true;
+        if (g_kv_fp8) {   // (the prompt attention's FP8 tiles need more shared memory than a block gets before sm_80)
+            int mj = 0;
+            CU(cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, 0));
+            if (mj < 8) {
+                std::printf("IK2_KV=fp8: not on a compute capability %d GPU (the prefill attention needs sm_80); FP16 K / V\n", mj);
+                g_kv_fp8 = false;
+            }
+        }
         else die("unknown IK2_KV=" + kv + " (expected fp8 or f16)");
     }
     if (getenv("IK2_TRACE") && *getenv("IK2_TRACE")) {
@@ -3975,9 +3988,11 @@ int run(int argc, char** argv) {
     if (c.n_pass > 1) {
         if (loop_arch) {
             c.core0 = (int) key("loop.start"), c.core1 = (int) key("loop.end"), c.rank = (int) key("loop.gate_rank");
-            c.n_visit += (c.n_pass - 1) * (c.core1 - c.core0);   // (its block_count: the layers)
-        } else
-        c.core0 = (int) key("loop.core_start"), c.core1 = (int) key("loop.core_end"), c.rank = (int) key("loop.gate_rank");
+            if (c.core1 > c.n_visit) die("loop.end past block_count");   // (block_count: the layers here)
+            c.n_visit += (c.n_pass - 1) * (c.core1 - c.core0);
+        } else {
+            c.core0 = (int) key("loop.core_start"), c.core1 = (int) key("loop.core_end"), c.rank = (int) key("loop.gate_rank");
+        }
         if (c.core0 <= 0 || c.core1 <= c.core0 || c.core0 % c.block || (c.core1 - c.core0) % c.block || c.rank <= 0)
             die("the looped core must start after the first block and span whole blocks");
     }
@@ -4108,18 +4123,29 @@ int run(int argc, char** argv) {
     // CPU-computed expert's copy queues ahead of the next layers' urgent ones on the one host-to-device engine
     // (RTX 2060 SUPER, PCIe 3.0 x8, Ryzen 9 3900X, Inkling-2-Mini IQ3_S: TG 18.9 -> 28.8 tok/s)
     bool small_card = false;
+    size_t vram_total = 0;
     {
-        size_t fr2 = 0, tot2 = 0;
-        CU(cudaMemGetInfo(&fr2, &tot2));
-        small_card = n_gpu == 1 && tot2 < (16ull << 30);
+        size_t fr2 = 0;
+        CU(cudaMemGetInfo(&fr2, &vram_total));
+        small_card = n_gpu == 1 && vram_total < (16ull << 30);
     }
-    const bool cpu_want = getenv("IK2_CPU") ? std::atoi(getenv("IK2_CPU")) != 0 : small_card;
-    if (small_card && cpu_want && !threads_given)
-        threads = std::max(threads, (int) std::thread::hardware_concurrency() / 2);
+    // (the host copy mapped from the files cannot feed the lane: then the lane is not turned on by default)
+#ifdef _WIN32
+    const bool host_mmap_planned = getenv_str("IK2_HOST").empty() || getenv_str("IK2_HOST") != "pinned";
+#else
+    const bool host_mmap_planned = getenv_str("IK2_HOST") == "mmap";
+#endif
+    const bool cpu_want = getenv("IK2_CPU") ? std::atoi(getenv("IK2_CPU")) != 0 : small_card && !host_mmap_planned;
+    if (small_card && cpu_want && !threads_given)   // (half the hardware threads, at least 2)
+        threads = std::max(2, (int) std::thread::hardware_concurrency() / 2);
     if (cpu_want && ik2::cpu::available_any() && threads > 1 && n_gpu == 1)
         g_pool = new ik2::cpu::Pool(threads - 1);
     if (small_card && g_pool) g_lazy_max = 0;
     g_kv_grow = kv_grow_arg >= 0 ? kv_grow_arg != 0 : small_card;
+    if (g_kv_grow && (n_gpu != 1 || dual())) {   // (the K / V live in GPU 0's pool: one GPU only)
+        if (kv_grow_arg > 0) std::printf("--kv-grow: one GPU only; off\n");
+        g_kv_grow = false;
+    }
     g_kv_ctx = ctx;   // (and the link's expert time measured once the cache is up)
     if (getenv("IK2_UP_MS")) g_t_up = std::atof(getenv("IK2_UP_MS")) * 1e-3;
     g_cpu_lazy = !getenv("IK2_CPU_LAZY") || std::atoi(getenv("IK2_CPU_LAZY"));
@@ -4135,12 +4161,11 @@ int run(int argc, char** argv) {
     g_graph = !(getenv("IK2_GRAPH") && !std::atoi(getenv("IK2_GRAPH")));
     g_attn_mma = c.D == 128 && c.H / c.KV <= 8 ? (getenv("IK2_ATTN_MMA") ? std::atoi(getenv("IK2_ATTN_MMA")) : 1) : 0;
     g_mma_split = k::attn_decode_mma_blocks(c.KV);
-    {   // a small card streaming its experts: the dense weights as blocks too (an FP16 output head alone is ~0.9 GiB
-        // of a cache that holds ~3 GiB: RTX 2060 SUPER 8 GB, Inkling-2-Mini IQ3_S, 654 -> 908 slots, TG 14.0 -> 20.7)
-        size_t fr1 = 0, tot1 = 0;
-        CU(cudaMemGetInfo(&fr1, &tot1));
-        if (!getenv("IK2_DENSE") && tot1 < (16ull << 30)) g_dense_q8 = true;
-    }
+    // a small card streaming its experts: the dense weights as blocks too (an FP16 output head alone is ~0.9 GiB of a
+    // cache that holds ~3 GiB: RTX 2060 SUPER 8 GB, Inkling-2-Mini IQ3_S, 654 -> 908 slots, TG 14.0 -> 20.7) - one GPU
+    // (IK2_DENSE=q8 is refused past one: its FP16 scratch is one device's), and not with --draft (it reads the output
+    // head in FP16)
+    if (!getenv("IK2_DENSE") && small_card && draft_path.empty()) g_dense_q8 = true;
     const bool can_resident = (n_gpu == 1 || (dual() && g_ep)) && !g_pool;
     if (can_resident) {
         size_t exp_b = 0, dense_b = 0, kv_b = 0;
@@ -4358,13 +4383,15 @@ int run(int argc, char** argv) {
             }
             // loop_res_query: rows 2 i (q's) and 2 i + 1 (the MoE's) of core layer i; loop_kv_res_query: k's and v's
             const size_t i = (size_t) (l - c.core0);
-            std::vector<float> q(4 * C);
-            if (loop_arch) q = host_f32(S, b + "loop_msg_query.weight", 4 * C);   // rows q, k, v, the MoE's
-            else {
-            std::memcpy(q.data(), lp_q.data() + 2 * i * C, C * 4);
-            std::memcpy(q.data() + C, lp_kv.data() + 2 * i * C, C * 4);
-            std::memcpy(q.data() + 2 * C, lp_kv.data() + (2 * i + 1) * C, C * 4);
-            std::memcpy(q.data() + 3 * C, lp_q.data() + (2 * i + 1) * C, C * 4);
+            std::vector<float> q;
+            if (loop_arch) {
+                q = host_f32(S, b + "loop_msg_query.weight", 4 * C);   // rows q, k, v, the MoE's
+            } else {
+                q.resize(4 * C);
+                std::memcpy(q.data(), lp_q.data() + 2 * i * C, C * 4);
+                std::memcpy(q.data() + C, lp_kv.data() + 2 * i * C, C * 4);
+                std::memcpy(q.data() + 2 * C, lp_kv.data() + (2 * i + 1) * C, C * 4);
+                std::memcpy(q.data() + 3 * C, lp_q.data() + (2 * i + 1) * C, C * 4);
             }
             Ly.lp_query = dev_f32(q);
             lp_all.insert(lp_all.end(), q.begin(), q.end());
@@ -4796,8 +4823,9 @@ int run(int argc, char** argv) {
     // (what is left free: 2 GiB beside a cache that streams experts in and out; a quarter of one when every expert
     //  stays in VRAM - nothing more is allocated but a token's graph)
     //  --vram-reserve-mib given: that much instead (a small card: 2 GiB of 8 is a third of the cache)
-    const size_t room = vram_reserve_mib > 0 ? (size_t) (vram_reserve_mib * 1048576.0)
-                                              : (g_fast_want ? (size_t) 256 << 20 : (size_t) 2 << 30);
+    const size_t room = vram_reserve_given ? std::max((size_t) (std::max(0.0, vram_reserve_mib) * 1048576.0),
+                                                      g_fast_want ? (size_t) 256 << 20 : (size_t) 0)
+                                           : (g_fast_want ? (size_t) 256 << 20 : (size_t) 2 << 30);
     const size_t budget = std::min((size_t) (cache_gb * 1073741824.0), fr > room ? fr - room : (size_t) 0);
     EC.tp = g_tp ? d : -1;
     EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget);
@@ -4807,6 +4835,15 @@ int run(int argc, char** argv) {
         std::printf("  pool %zu: %d slots of %.1f MiB (%.1f GiB, %d layers)\n", p, EC.pools[p].n_slots,
                     EC.pools[p].slot_bytes / 1048576.0,
                     (double) EC.pools[p].n_slots * EC.pools[p].slot_bytes / 1073741824.0, EC.pools[p].n_layers);
+    if (g_kv_grow && !EC.pools.empty()) {   // (what --kv-grow can hold here, said at load rather than mid-generation)
+        size_t full_v = 0;
+        for (const auto& Vi : M.V) full_v += !M.L[Vi.l].sliding;
+        const auto& P0 = EC.pools[0];
+        const size_t per_tok = 2 * full_v * (size_t) c.KV * c.D * (g_kv_fp8 ? 1 : 2);
+        const long most = per_tok ? (long) ((size_t) std::max(0, P0.n_slots - 2 * c.E - 80) * P0.slot_bytes / per_tok) : 0;
+        if (full_v && most < ctx)
+            std::printf("kv-grow: this card holds the full layers' K / V for about %ld tokens, under --ctx %d\n", most, ctx);
+    }
     // the link's time an expert for the CPU lane's choice: one slot copied in from pinned host memory, timed (the
     // estimate 0.36 ms is PCIe 5's; an RTX 2060 SUPER on PCIe 3.0 x8 takes ~0.55 ms a 3.6 MiB expert)
     if (small_card && g_pool && !getenv("IK2_UP_MS") && !EC.pools.empty() && EC.pools[0].n_slots > 0 && M.L[0].host[0]) {

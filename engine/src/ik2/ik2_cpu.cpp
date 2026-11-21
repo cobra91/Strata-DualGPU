@@ -9,6 +9,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "ik2_iq_tables.h"
@@ -296,6 +299,10 @@ void rows(int type, const uint8_t* W, int K, int r0, int r1, const float* x, flo
         return;
     }
 #endif
+    if (type != 40) {   // (unreachable through available_for(): a type this build has no CPU dot for)
+        std::fprintf(stderr, "ik2 CPU lane: no CPU dot for GGUF type %d in this build\n", type);
+        std::abort();
+    }
     nvfp4_rows(W, K, r0, r1, x, out);
 }
 
@@ -327,6 +334,7 @@ void spin_claim(uint32_t g) {
     }
 }
 void spin_run(int n, void (*fn)(int, void*), void* ctx) {
+    if (n <= 0) return;
     const uint32_t g = ++g_spin.gen;
     g_spin.run[g & 3] = SpinRun{fn, ctx, n};
     g_spin.done.store(0, std::memory_order_relaxed);
@@ -348,7 +356,12 @@ void spin_start(int workers) {
             uint32_t seen = (uint32_t) (g_spin.state.load() >> 32);
             for (;;) {
                 uint32_t g;
-                while ((g = (uint32_t) (g_spin.state.load(std::memory_order_acquire) >> 32)) == seen) _mm_pause();
+                // spin while runs come often (a decode token's layers, ~0.1 ms apart), then back off to short sleeps
+                // (a prompt, or no request: no core burnt at 100%)
+                for (unsigned idle = 0; (g = (uint32_t) (g_spin.state.load(std::memory_order_acquire) >> 32)) == seen; ++idle) {
+                    if (idle < (1u << 18)) _mm_pause();
+                    else std::this_thread::sleep_for(std::chrono::microseconds(50));
+                }
                 seen = g;
                 spin_claim(g);
             }

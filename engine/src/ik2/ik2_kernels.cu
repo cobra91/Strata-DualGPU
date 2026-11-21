@@ -4440,11 +4440,15 @@ void attn_flash_launch(const uint16_t* q16, int q_ld, const KVT* kc, const KVT* 
                        int Tq, int qpos0, float qk_scale, const float* bias, int extent, int window, int n_split,
                        float* o_part, float2* ml_part, cudaStream_t s) {
     static bool attr[16] = {};   // (per device: the attribute is a device's, and the layer split runs on several)
-    static int major[16] = {};
+    static int one[16] = {};     // 1: this kernel's code is the single-buffer one (built for < sm_80), 2: not, 0: unasked
     int dev = 0;
     cudaGetDevice(&dev);
-    if (dev < 16 && !major[dev]) cudaDeviceGetAttribute(&major[dev], cudaDevAttrComputeCapabilityMajor, dev);
-    const int smem = (dev < 16 && major[dev] < 8 && sizeof(KVT) != 1 && !WG) ? kFaSmem1 : kFaSmem;
+    if (dev < 16 && !one[dev]) {   // (by the code the device runs, not its compute capability: kFaOne is compile-time)
+        cudaFuncAttributes fa{};
+        if (cudaFuncGetAttributes(&fa, attn_flash_f16_kernel<NW, WG, KVT>) != cudaSuccess) check("attn_flash (attributes)");
+        one[dev] = (fa.binaryVersion < 80 && sizeof(KVT) != 1 && !WG) ? 1 : 2;
+    }
+    const int smem = (dev < 16 && one[dev] == 1) ? kFaSmem1 : kFaSmem;
     if (dev < 16 && !attr[dev]) {
         cudaFuncSetAttribute(attn_flash_f16_kernel<NW, WG, KVT>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         check("attn_flash (shared memory)");
