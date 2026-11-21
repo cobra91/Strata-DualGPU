@@ -3845,6 +3845,7 @@ int run(int argc, char** argv) {
     std::string model, toks, dump, draft_path;
     int gen = 16, chunk = 2048, ctx = 262144, threads = 8, n_gpu = 1;
     bool threads_given = false;
+    bool chunk_given = false;   // (--chunk N; auto, or none: the default, smaller on a small card)
     int kv_grow_arg = -1;   // --kv-grow 0 / 1 (default: on a card under 16 GB)
     bool serve = false, serve_strata = true;   // (--serve: the engine protocol; --serve-ik2: the @-line one)
     std::vector<int> eos_ids;                 // --eos a,b: the tokens a request ends at (the engine protocol)
@@ -3871,7 +3872,7 @@ int run(int argc, char** argv) {
         else if (a == "--chunk" || a == "--prefill") {
             const std::string v = next();
             if (v == "auto") chunk = 2048;
-            else chunk = std::max(1, std::atoi(v.c_str()));
+            else chunk = std::max(1, std::atoi(v.c_str())), chunk_given = true;
         }
         else if (a == "--vram-reserve-mib") vram_reserve_mib = std::atof(next().c_str()), vram_reserve_given = true;
         else if (a == "--kv-grow") kv_grow_arg = std::atoi(next().c_str());
@@ -4141,6 +4142,12 @@ int run(int argc, char** argv) {
     if (cpu_want && ik2::cpu::available_any() && threads > 1 && n_gpu == 1)
         g_pool = new ik2::cpu::Pool(threads - 1);
     if (small_card && g_pool) g_lazy_max = 0;
+    // a small card with a looped model: a long prompt takes lent layer-major passes (forward_prefill_sup), so forward()'s
+    // chunk only sizes the short prompts' and the decode's buffers and the sliding layers' rings - 512 instead of 2048
+    // gives the expert cache their VRAM (RTX 2060 SUPER, Inkling-2-Mini IQ3_S: 1192 -> 1365 slots, TG 36.2 -> 38.4)
+    if (small_card && !chunk_given && c.n_pass > 1 && draft_path.empty() &&
+        !(getenv("IK2_LOOP_SUP") && !std::atoi(getenv("IK2_LOOP_SUP"))))
+        chunk = 512;
     g_kv_grow = kv_grow_arg >= 0 ? kv_grow_arg != 0 : small_card;
     if (g_kv_grow && (n_gpu != 1 || dual())) {   // (the K / V live in GPU 0's pool: one GPU only)
         if (kv_grow_arg > 0) std::printf("--kv-grow: one GPU only; off\n");
