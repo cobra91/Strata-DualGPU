@@ -816,6 +816,7 @@ OWN_PATH_FAMILIES = {
                 "sha256": {"Inkling-2-Mini-UD-Q4_K_XL.gguf": (17629759456, "e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15"),
                            "Inkling-2-Mini-2-mini.gguf": (17629759456, "e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15")},
                 "kv_bytes_per_token": 11 * 2 * 256 * 2 * 4,
+                "mtp": 0,
                 "vision": False, "state_gb": 0.0}
 }
 PREVIEW_FAMILIES = OWN_PATH_FAMILIES             # the earlier name (tools and tests that import it)
@@ -9587,8 +9588,8 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         download(fam["hf"] + gguf.name, gguf)
     verify_sha256(gguf, *fam["sha256"][published], own=bool(a.gguf_dir))
     ok(f"model file: {gguf}")
-    mmproj = folder / fam["mmproj"]
     if vision != "none":                               # the image encoder: Unsloth's mmproj, pinned, size + SHA-256 checked
+        mmproj = folder / fam["mmproj"]
         if not a.gguf_dir and not have(mmproj) and not mmproj.with_name(mmproj.name + ".part").exists():
             # another size of this model has it already (the same file, kept beside each size): linked here, not fetched again
             if share_sibling_file(mmproj, Path(a.models_dir), mmproj.name, fam["sha256"][mmproj.name][0]):

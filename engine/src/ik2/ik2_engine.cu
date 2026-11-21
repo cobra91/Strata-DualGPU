@@ -3118,6 +3118,7 @@ int run(int argc, char** argv) {
     bool serve = false, serve_strata = true;   // (--serve: the engine protocol; --serve-ik2: the @-line one)
     std::vector<int> eos_ids;                 // --eos a,b: the tokens a request ends at (the engine protocol)
     double cache_gb = 60;
+    double vram_reserve_mib = 0;
     int image_token = 200054;   // --image-token: Inkling 2's <|unused_200054|>, the template's placeholder of a picture
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -3135,7 +3136,12 @@ int run(int argc, char** argv) {
             }
         }
         else if (a == "--gen" || a == "--max-new") gen = std::atoi(next().c_str());
-        else if (a == "--chunk" || a == "--prefill") chunk = std::atoi(next().c_str());
+        else if (a == "--chunk" || a == "--prefill") {
+            const std::string v = next();
+            if (v == "auto") chunk = 2048;
+            else chunk = std::max(1, std::atoi(v.c_str()));
+        }
+        else if (a == "--vram-reserve-mib") vram_reserve_mib = std::atof(next().c_str());
         else if (a == "--ctx" || a == "--max-context") ctx = std::atoi(next().c_str());   // (--max-context: serve/server.py's name)
         else if (a == "--cache-gb" || a == "--expert-vram") cache_gb = std::atof(next().c_str());
         else if (a == "--threads" || a == "--cpu-threads" || a == "--pool-workers") threads = std::atoi(next().c_str());
@@ -3964,7 +3970,8 @@ int run(int argc, char** argv) {
     CU(cudaMemGetInfo(&fr, &tot));
     // (what is left free: 2 GiB beside a cache that streams experts in and out; a quarter of one when every expert
     //  stays in VRAM - nothing more is allocated but a token's graph)
-    const size_t room = g_fast_want ? (size_t) 256 << 20 : (size_t) 2 << 30;
+    const size_t room = (g_fast_want ? (size_t) 256 << 20 : (size_t) 2 << 30) +
+                        (vram_reserve_mib > 0 ? (size_t) (vram_reserve_mib * 1048576.0) : 0);
     const size_t budget = std::min((size_t) (cache_gb * 1073741824.0), fr > room ? fr - room : (size_t) 0);
     EC.tp = g_tp ? d : -1;
     EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget);
