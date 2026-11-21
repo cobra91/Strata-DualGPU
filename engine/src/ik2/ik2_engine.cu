@@ -2483,8 +2483,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
         k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
-        const bool cpu_lane = g_pool && g_overlap && !g_prof && T <= 8 && Ly.ty[0] == k::kNVFP4 &&
-                              Ly.ty[1] == k::kNVFP4 && Ly.ty[2] == k::kNVFP4;
+        const bool cpu_lane = g_pool && g_overlap && !g_prof && T <= 8 && ik2::cpu::available_for(Ly.ty[0]) &&
+                              ik2::cpu::available_for(Ly.ty[1]) && ik2::cpu::available_for(Ly.ty[2]);
         const bool fast_ep_token = g_ep_fast && g_ep && T <= 8 && g_overlap && !g_prof &&
                                    dump.empty() && !g_trace && g_pop.empty();
         const int* top = nullptr;
@@ -2930,6 +2930,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                     J.up = Ly.host[1] + (size_t) e * Ly.stride[1];
                     J.down = Ly.host[2] + (size_t) e * Ly.stride[2];
                     J.x = W.x_h + (size_t) (i / c.K) * C;
+                    J.tg = Ly.ty[0], J.tu = Ly.ty[1], J.td = Ly.ty[2];
                     J.sg = sg[p], J.su = su[p];
                     J.y = yh + (size_t) (p - nh - nw) * C;
                     ik2::cpu::post_expert(*g_pool, &J, C, c.F, c.gate_cap, c.up_cap);
@@ -3575,7 +3576,7 @@ int run(int argc, char** argv) {
     for (auto& e : g_ring) CU(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     // (off by default: on an RTX PRO 6000 node's Xeon 6737P an NVFP4 expert takes 0.73 ms on 7 threads against 0.33 ms
     //  over PCIe, and the lane measured 16.4 against 16.8 tok/s - IK2_CPU=1 to try it)
-    if (getenv("IK2_CPU") && std::atoi(getenv("IK2_CPU")) && ik2::cpu::available() && threads > 1 && n_gpu == 1)
+    if (getenv("IK2_CPU") && std::atoi(getenv("IK2_CPU")) && ik2::cpu::available_any() && threads > 1 && n_gpu == 1)
         g_pool = new ik2::cpu::Pool(threads - 1);
     if (getenv("IK2_UP_MS")) g_t_up = std::atof(getenv("IK2_UP_MS")) * 1e-3;
     g_cpu_lazy = !getenv("IK2_CPU_LAZY") || std::atoi(getenv("IK2_CPU_LAZY"));

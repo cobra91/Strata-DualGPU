@@ -22,6 +22,11 @@ namespace ik2::cpu {
 
 /// Whether this CPU (and OS) runs the AVX-512 kernels.
 bool available();
+// the lane for an expert of GGUF type `type`: NVFP4 on AVX-512 (available()); IQ3_S, IQ4_NL and Q8_0 on AVX2 + FMA
+bool available_for(int type);
+bool available_any();
+// rows [r0, r1) of W (rows of K values in `type`'s blocks) . x -> out[0 .. r1 - r0)
+void rows(int type, const uint8_t* W, int K, int r0, int r1, const float* x, float* out);
 
 /// Worker threads taking tasks in order; wait(): until every task posted so far (and the ones they posted) is done.
 class Pool {
@@ -50,6 +55,7 @@ void nvfp4_rows(const uint8_t* W, int K, int r0, int r1, const float* x, float* 
 struct ExpertJob {
     const uint8_t *gate = nullptr, *up = nullptr, *down = nullptr;
     const float* x = nullptr;
+    int tg = 40, tu = 40, td = 40;   // the matrices' GGUF types (NVFP4 = 40)
     float sg = 1.0f, su = 1.0f;
     float* y = nullptr;
     std::vector<float> gu, h;
