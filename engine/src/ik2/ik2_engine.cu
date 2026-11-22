@@ -2642,7 +2642,7 @@ __global__ void k_dp_wait(const int* __restrict__ mflag, int K, const int* __res
         while (dp_ld_sys(ctl + 2) < seq) strata_spin_pause();
         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
         ctl[3] = (int) min(2147483647ull, (unsigned long long) ctl[3] + (t1 - t0) / 1000);   // the GPU's wait, us (saturating)
-        ctl[4] += 1;
+        ctl[4] = (int) min(2147483647ull, (unsigned long long) ctl[4] + 1);
     }
     __threadfence_system();
     ctl[1] = seq;
@@ -2656,6 +2656,7 @@ __global__ void k_dp_merge(float* __restrict__ y, const float* ey, const int* __
 // IK2_DP_MULTI=1: a verify window (2 .. kDpT tokens) through the plan too - no host sync a visit; measured no faster
 // than the host-planned path on 8 GB (the window's CPU misses bound it) and drafting slower beside its threads
 bool g_dp_multi = getenv("IK2_DP_MULTI") && std::atoi(getenv("IK2_DP_MULTI"));
+bool g_dp_multi_types = false;   // (every layer's experts batch_multi_ok: set at load)
 bool g_dp_time = getenv("IK2_DP_TIME") && std::atoi(getenv("IK2_DP_TIME"));
 double g_dp_t0 = 0, g_dp_t_enq = 0, g_dp_t_tok = 0;
 long g_dp_n = 0;
@@ -2965,7 +2966,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
     const Config& c = M.c;
     // (a decode token; or a verify window of <= kDpT tokens - its taps and its convs' records as forward() keeps them)
     const bool dp_tok = g_dp.ok && dump.empty() && !g_prof && !g_trace && g_pop.empty() &&
-                        ((T == 1 && !g_rec && !g_taps) || (T > 1 && T <= kDpT && T * c.K <= kDpS && g_dp_multi));
+                        ((T == 1 && !g_rec && !g_taps) ||
+                         (T > 1 && T <= kDpT && T * c.K <= kDpS && g_dp_multi && g_dp_multi_types));
     if (dp_tok && g_dp_time && !g_tg_capturing) g_dp_t0 = now();
     if (dp_tok && g_dp.planned > g_dp_reset_at && !g_tg_capturing) {   // (the plans' counters back to 0, every record served, before a wrap)
         CU(cudaDeviceSynchronize());
@@ -3515,7 +3517,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             const uint32_t stp = W.stamp;
             lazy_poll();
             // (a few tokens - a verify window: every miss on the CPU, grouped by expert, and copied in afterwards)
-            const bool multi = cpu_lane && T > 1 && g_verify_cpu;
+            const bool multi = cpu_lane && T > 1 && g_verify_cpu &&
+                               ik2::cpu::batch_multi_ok(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
             const bool lazy_ok = (g_cpu_lazy && g_seq_next - 1 - g_seq_done < (uint64_t) g_lazy_max) ||
                                  (multi && g_seq_next - 1 - g_seq_done < (uint64_t) kRing - 1);
             double acc_up = 0, acc_cpu = 0;
@@ -5021,6 +5024,9 @@ int run(int argc, char** argv) {
             const Layer& Ly = M.L[l];
             for (int r = 0; r < 3; ++r) ok = ok && ik2::cpu::available_for(Ly.ty[r]) && Ly.scale[r].empty();
         }
+        g_dp_multi_types = ok;   // (a verify window's misses as jobs of several tokens: the int8 dots' types only)
+        for (int l = 0; g_dp_multi_types && l < c.n_layer; ++l)
+            g_dp_multi_types = ik2::cpu::batch_multi_ok(M.L[l].ty[0], M.L[l].ty[1], M.L[l].ty[2], c.C, c.F);
         if (ok) {
             use_dev(0);
             dp_alloc(c);
@@ -5851,7 +5857,8 @@ int run(int argc, char** argv) {
         std::vector<int> ag;
         if (lo) logits.clear();
         const int pos = (int) prompt.size() + i;
-        if (g_dp.ok && g_dp.graph && !lo && i > 0 && !g_dp.dirty && g_dp.planned <= g_dp_reset_at) {   // IK2_TOKGRAPH
+        if (g_dp.ok && g_dp.graph && !lo && i > 0 && !g_dp.dirty && g_dp.planned <= g_dp_reset_at && !g_prof &&
+            !g_trace && g_pop.empty()) {   // IK2_TOKGRAPH (its token the device plan's: see dp_tok)
             const int sl = i & 1;
             if (g_dp.exec_ep != k::scratch_epoch()) g_dp.exec_pos[0] = g_dp.exec_pos[1] = -1, g_dp.exec_ep = k::scratch_epoch();
             if (g_dp.exec_pos[sl] != pos) tg_capture(M, pos, sl);

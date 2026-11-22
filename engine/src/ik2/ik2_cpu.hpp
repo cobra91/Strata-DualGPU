@@ -79,5 +79,7 @@ struct BatchJob {
 };
 void spin_start(int workers);
 void experts_batch(const BatchJob* J, int n, int C, int F, float gcap, float ucap);
+/// may experts_batch take jobs of several tokens (nt > 1) for these types and shapes
+bool batch_multi_ok(int tg, int tu, int td, int C, int F);
 
 }  // namespace ik2::cpu

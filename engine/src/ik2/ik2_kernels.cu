@@ -5494,7 +5494,8 @@ __global__ void __launch_bounds__(WARPS * 32) experts_down_iq4nl_dp4a_g_kernel(
 void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, int G, int ty_down, size_t off_down,
                     const uint16_t* h, int C, int F, float* y, cudaStream_t s, int n_h) {
     if (G <= 0) return;
-    if (g_dp4a && ty_down == kIQ4_NL && F % 32 == 0 && n_h > 0) {   // (n_h: h's rows, made int8 once)
+    if (g_dp4a && ty_down == kIQ4_NL && F % 32 == 0 && n_h > 0 &&
+        (size_t) kGroupMax * F + (size_t) kGroupMax * (F / 32) * 4 <= 48 * 1024) {   // (n_h: h's rows, made int8 once)
         static Q8Scratch scr;
         int8_t* xq = nullptr;
         float* xs = nullptr;
@@ -5570,7 +5571,8 @@ void experts_gate_up_swiglu_g(const uint8_t* const* blob, const int* n, const in
                               int ty_gate, int ty_up, size_t eb0, const float* x, int C, int F, const float* sg,
                               const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s, int n_x) {
     if (G <= 0) return;
-    if (g_dp4a && ty_gate == kIQ3_S && ty_up == kIQ3_S && C % 256 == 0 && n_x > 0) {   // (n_x: x's rows)
+    if (g_dp4a && ty_gate == kIQ3_S && ty_up == kIQ3_S && C % 256 == 0 && n_x > 0 &&
+        (size_t) kGroupMax * C + (size_t) kGroupMax * (C / 32) * 4 + 2048 <= 48 * 1024) {   // (n_x: x's rows; smem)
         static Q8Scratch scr;
         int8_t* xq = nullptr;
         float* xs = nullptr;

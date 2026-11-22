@@ -428,8 +428,7 @@ bool available_for(int type) {
 void rows(int type, const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
     if (type == 21 || type == 20 || type == 8) {
-        static const bool ok = available_for(type);   // (AVX2 + FMA + F16C: the dots are built for them)
-        if (!ok) {
+        if (!available_for(type)) {   // (AVX2 + FMA + F16C: the dots are built for them)
             std::fprintf(stderr, "ik2 CPU lane: this CPU has no AVX2 / FMA / F16C for GGUF type %d\n", type);
             std::abort();
         }
@@ -505,6 +504,9 @@ void rows_q8_n(int type, const uint8_t* W, int K, int r0, int r1, int nt, const 
 #endif
 }
 bool g_cpu_q8 = !getenv("IK2_CPU_Q8") || std::atoi(getenv("IK2_CPU_Q8"));
+bool batch_multi_ok(int tg, int tu, int td, int C, int F) {   // (jobs of several tokens: the int8 dots' path only)
+    return g_cpu_q8 && tg == 21 && tu == 21 && td == 20 && C % 256 == 0 && F % 128 == 0 && available_for(21);
+}
 
 namespace {
 // The spin pool's state is one 64-bit word, generation << 32 | next task: a task is claimed by compare-and-swap only
