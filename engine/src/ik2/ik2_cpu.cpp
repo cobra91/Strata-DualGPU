@@ -493,7 +493,7 @@ void experts_batch(const BatchJob* J, int n, int C, int F, float gcap, float uca
         std::abort();
     }
     const int pa = 2 * F / RP, pc = C / RP, pb = (F + 127) / 128;
-    bool q8 = g_cpu_q8 && C % 256 == 0 && F % 128 == 0;
+    bool q8 = g_cpu_q8 && C % 256 == 0 && F % 128 == 0;   // (F % 128: whole 32-row tasks for any RG of 32, 64, 128)
     for (int j = 0; q8 && j < n; ++j) q8 = J[j].tg == 21 && J[j].tu == 21 && J[j].td == 20;
     if (q8) {   // the int8 dots: the inputs made int8 (x here, the activations by the tasks that make them)
         thread_local std::vector<int8_t> q_tl;
@@ -503,22 +503,20 @@ void experts_batch(const BatchJob* J, int n, int C, int F, float gcap, float uca
         int8_t* const qb = q_tl.data();
         float* const sb = s_tl.data();
         for (int j = 0; j < n; ++j) quant_q8(J[j].x, C, qb + j * per, sb + j * per / 32);
-        spin_for(n * pa, [&](int i) {
-            const int j = i / pa, r0 = (i % pa) * RP;
+        constexpr int RG = 32;   // (gate_up rows a task: a 32-block of the activations; 64 measured the same)
+        const int pg = F / RG;
+        spin_for(n * pg, [&](int i) {   // a task: RG rows of gate and the same of up, their activation, made int8
+            const int j = i / pg, f0 = (i % pg) * RG;
             float* g = gu + (size_t) j * 2 * F;
             const int8_t* xq = qb + j * per;
             const float* xs = sb + j * per / 32;
-            if (r0 < F) rows_q8(21, J[j].gate, C, r0, r0 + RP, xq, xs, g + r0);
-            else rows_q8(21, J[j].up, C, r0 - F, r0 - F + RP, xq, xs, g + r0);
-        });
-        spin_for(n * pb, [&](int i) {   // the activation, then its four 32-blocks made int8
-            const int j = i / pb, f0 = (i % pb) * 128, f1 = std::min(F, f0 + 128);
-            float* g = gu + (size_t) j * 2 * F;
-            for (int f = f0; f < f1; ++f) {
+            rows_q8(21, J[j].gate, C, f0, f0 + RG, xq, xs, g + f0);
+            rows_q8(21, J[j].up, C, f0, f0 + RG, xq, xs, g + F + f0);
+            for (int f = f0; f < f0 + RG; ++f) {
                 const float a = g[f] * J[j].sg, u = g[F + f] * J[j].su;
                 g[f] = gcap * std::tanh(a / gcap) * (1.0f / (1.0f + std::exp(-a))) * ucap * std::tanh(u / ucap);
             }
-            quant_q8(g + f0, f1 - f0, qb + j * per + C + f0, sb + (j * per + C + f0) / 32);
+            quant_q8(g + f0, RG, qb + j * per + C + f0, sb + (j * per + C + f0) / 32);
         });
         spin_for(n * pc, [&](int i) {
             const int j = i / pc, r0 = (i % pc) * RP;

@@ -2695,7 +2695,7 @@ void dp_service() {
                     next = 1;
                 }
             }
-            dp_advance(false);
+            if ((spin & 63) == 0) dp_advance(false);   // (the copies' stages: driver calls, not on every spin)
             if (++spin < 200000) __builtin_ia32_pause();
             else std::this_thread::yield();
         }
@@ -2723,14 +2723,15 @@ void dp_service() {
             J.x = xr, J.sg = 1.0f, J.su = 1.0f;
             J.y = ey + (size_t) k * g_dp.C;
         }
-        for (int k = 0; k < g_dp.K; ++k)   // the misses' copies (for the next tokens)
-            if (hd[18 + k]) dp_request(hd[1], hd[2 + k]);
-        dp_advance(false);
+        // the misses on the CPU and published first (the GPU waits for them), then their copies for the next tokens
         ik2::cpu::experts_batch(jobs, n, g_dp.C, g_dp.F, g_dp.gcap, g_dp.ucap);
         g_dp.cpu_experts += n;
         std::atomic_thread_fence(std::memory_order_seq_cst);
         g_dp.ctl[2] = next;
         ++next;
+        for (int k = 0; k < g_dp.K; ++k)
+            if (hd[18 + k]) dp_request(hd[1], hd[2 + k]);
+        if (n) dp_advance(false);
     }
 }
 void dp_init(const Model& M) {
