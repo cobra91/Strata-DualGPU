@@ -2921,6 +2921,36 @@ void bench_experts() {
             cudaFree(dq), cudaFree(ddq), cudaFree(dxx), cudaFree(dyy);
         }
     }
+    {   // a decode token's attention over nk keys (Inkling-2-Mini: 24 heads on 8 K / V heads, D 128)
+        const int H = 24, KV = 8, D = 128, KD = KV * D, d_rel = 16;
+        const int RS = (int) k::kv_row_bytes_i8(KD);
+        for (int nk : {5000, 20000}) {
+            std::vector<int8_t> kc((size_t) nk * RS), vc((size_t) nk * RS);
+            for (auto& v : kc) v = (int8_t) (rng() % 200 - 100);
+            for (auto& v : vc) v = (int8_t) (rng() % 200 - 100);
+            for (int r = 0; r < nk; ++r)
+                for (int g = 0; g < KD / 64; ++g) {
+                    const uint16_t sc = f2h_host(0.01f);
+                    std::memcpy(kc.data() + (size_t) r * RS + KD + 2 * g, &sc, 2), std::memcpy(vc.data() + (size_t) r * RS + KD + 2 * g, &sc, 2);
+                }
+            int8_t *dk = dev(kc), *dv = dev(vc);
+            auto qf = fvec((size_t) H * D);
+            std::vector<uint16_t> q16(qf.size());
+            for (size_t i = 0; i < qf.size(); ++i) q16[i] = f2h_host(qf[i]);
+            uint16_t* dq = dev(q16);
+            auto r = fvec((size_t) H * d_rel), proj = fvec((size_t) 1024 * d_rel), sink = fvec(H);
+            float *dr = dev(r), *dp = dev(proj), *ds = dev(sink), *out = dev_n<float>((size_t) H * D);
+            const int ns = k::attn_decode_mma_blocks(KV);
+            float* scr = dev_n<float>(k::attn_decode_mma_scratch(H, ns));
+            char nm[64];
+            std::snprintf(nm, sizeof nm, "attn mma i8 %d keys (ns %d)", nk, ns);
+            timeit(nm, 2.0 * nk * RS, [&](int) {
+                k::attn_decode_mma_i8(dq, dr, ds, dk, dv, 0, H, KV, nullptr, nk - 1, ns, 0.088f, dp, d_rel, 1024, 1 << 30, scr,
+                                      out, nullptr, nullptr, 0);
+            });
+            cudaFree(dk), cudaFree(dv), cudaFree(dq), cudaFree(dr), cudaFree(dp), cudaFree(ds), cudaFree(out), cudaFree(scr);
+        }
+    }
     CU(cudaDeviceSynchronize());
     CU(cudaEventDestroy(e0));
     CU(cudaEventDestroy(e1));
