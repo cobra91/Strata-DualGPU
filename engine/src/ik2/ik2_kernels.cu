@@ -5031,32 +5031,47 @@ __device__ __forceinline__ uint32_t sign_bytes4(uint32_t nib) {   // bit k of ni
 }
 // a warp: 2 output rows - its 4 matrix rows (gate r, r + 1, up r, r + 1) as one run of 4 x C / 32 sub-blocks, lane
 // i taking i, i + 32, ...: consecutive lanes read consecutive sub-blocks (coalesced), and 4 x 72 = 9 x 32 (balanced)
-template <int WARPS, int PAIRS>
+// x made int8 once a call (k::experts_gate_up_swiglu with n_x rows): [rows][C] codes, then [rows][C / 32] scales
+template <int WARPS>
+__global__ void quant_rows_i8_kernel(const float* x, int C, int8_t* xq, float* xs) {
+    const int r = blockIdx.x;
+    quant_x_i8<WARPS>(x + (size_t) r * C, C, xq + (size_t) r * C, xs + (size_t) r * (C / 32));
+}
+template <int WARPS, int PAIRS, bool PREQ = false, bool SGNA = false, int NSB = 0>   // (NSB: C / 32 at compile time, 0: C's)
 __global__ void __launch_bounds__(WARPS * 32) experts_gu_iq3s_dp4a_kernel(
     const uint8_t* const* blob, const int* tok, size_t eb0, const float* x, int C, int F, const float* sg,
-    const float* su, float gcap, float ucap, uint16_t* h, const int* orow, int h_ld) {
+    const float* su, float gcap, float ucap, uint16_t* h, const int* orow, int h_ld, const int8_t* xq_g = nullptr,
+    const float* xs_g = nullptr) {
     const int s = blockIdx.y;
     const uint8_t* bl = blob[s];
     if (!bl) return;
     __shared__ uint32_t grid_s[512];
-    __shared__ uint2 sgn_s[256];
+    __shared__ uint2 sgn_s[SGNA ? 1 : 256];
     extern __shared__ __align__(16) int8_t gu_xq[];   // [C] int8, then [C / 32] scales
     float* xsc = (float*) (gu_xq + C);
     for (int i = threadIdx.x; i < 512; i += WARPS * 32) grid_s[i] = d_iq3s_grid[i];
-    for (int i = threadIdx.x; i < 256; i += WARPS * 32) sgn_s[i] = make_uint2(sign_bytes4(i & 15u), sign_bytes4(i >> 4));
-    quant_x_i8<WARPS>(x + (size_t) tok[s] * C, C, gu_xq, xsc);
+    if constexpr (!SGNA)
+        for (int i = threadIdx.x; i < 256; i += WARPS * 32) sgn_s[i] = make_uint2(sign_bytes4(i & 15u), sign_bytes4(i >> 4));
+    if constexpr (PREQ) {   // (the codes and scales made once a call: copied in)
+        const int4* src = (const int4*) (xq_g + (size_t) tok[s] * C);
+        for (int i = threadIdx.x; i < C / 16; i += WARPS * 32) ((int4*) gu_xq)[i] = __ldg(src + i);
+        const float* ss = xs_g + (size_t) tok[s] * (C / 32);
+        for (int i = threadIdx.x; i < C / 32; i += WARPS * 32) xsc[i] = __ldg(ss + i);
+    } else {
+        quant_x_i8<WARPS>(x + (size_t) tok[s] * C, C, gu_xq, xsc);
+    }
     __syncthreads();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     for (int pr = 0; pr < PAIRS; ++pr) {   // (a block's rows: its setup above shared by PAIRS row pairs a warp)
     const int r0 = ((blockIdx.x * PAIRS + pr) * WARPS + warp) * 2;
     if (r0 >= F) return;
-    const int nsb = C / 32;
-    const size_t rb = (size_t) (C / 256) * 110;
+    const int nsb = NSB ? NSB : C / 32;
+    const size_t rb = (size_t) (nsb / 8) * 110;
     const uint8_t* rows[4] = {bl + (size_t) r0 * rb, bl + (size_t) min(r0 + 1, F - 1) * rb, bl + eb0 + (size_t) r0 * rb,
                               bl + eb0 + (size_t) min(r0 + 1, F - 1) * rb};
     const int4* xq4 = (const int4*) gu_xq;
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll 3
+#pragma unroll (NSB ? 4 * NSB / 32 : 3)
     for (int p = lane; p < 4 * nsb; p += 32) {
         const int m = p / nsb, sb = p - m * nsb;
         const uint8_t* b = rows[m] + (size_t) (sb >> 3) * 110;
@@ -5075,7 +5090,8 @@ __global__ void __launch_bounds__(WARPS * 32) experts_gu_iq3s_dp4a_kernel(
             const uint32_t q = __ldg(qs + l);
             const uint32_t g1 = grid_s[(q & 0xFFu) | ((qh << (8 - 2 * l)) & 256u)];
             const uint32_t g2 = grid_s[(q >> 8) | ((qh << (7 - 2 * l)) & 256u)];
-            const uint2 mk = sgn_s[(sgw >> (8 * l)) & 255u];
+            const uint2 mk = SGNA ? make_uint2(sign_bytes4((sgw >> (8 * l)) & 15u), sign_bytes4((sgw >> (8 * l + 4)) & 15u))
+                                  : sgn_s[(sgw >> (8 * l)) & 255u];
             sumi = __dp4a((int) ((g1 ^ mk.x) + (mk.x & 0x01010101u)), xw[2 * l], sumi);
             sumi = __dp4a((int) ((g2 ^ mk.y) + (mk.y & 0x01010101u)), xw[2 * l + 1], sumi);
         }
@@ -5093,14 +5109,28 @@ __global__ void __launch_bounds__(WARPS * 32) experts_gu_iq3s_dp4a_kernel(
 }
 // down: a warp 8 rows of C as one run of 8 x F / 32 blocks (8 x 36 = 9 x 32), lane i taking i, i + 32, ...
 template <int WARPS>
+__global__ void quant_h_rows_i8_kernel(const uint16_t* const* blob, const uint16_t* h, int F, int8_t* xq, float* xs) {
+    const int r = blockIdx.x;
+    if (!blob[r]) return;
+    quant_h_i8<WARPS>(h + (size_t) r * F, F, xq + (size_t) r * F, xs + (size_t) r * (F / 32));
+}
+template <int WARPS, bool PREQ = false>
 __global__ void __launch_bounds__(WARPS * 32) experts_down_iq4nl_dp4a_kernel(const uint8_t* const* blob, size_t off_down,
-                                                                             const uint16_t* h, int C, int F, float* y) {
+                                                                             const uint16_t* h, int C, int F, float* y,
+                                                                             const int8_t* xq_g = nullptr,
+                                                                             const float* xs_g = nullptr) {
     const int s = blockIdx.y;
     const uint8_t* bl = blob[s];
     if (!bl) return;
     extern __shared__ __align__(16) int8_t dn_xq[];   // [F] int8, then [F / 32] scales
     float* xsc = (float*) (dn_xq + F);
-    quant_h_i8<WARPS>(h + (size_t) s * F, F, dn_xq, xsc);
+    if constexpr (PREQ) {
+        const int4* src = (const int4*) (xq_g + (size_t) s * F);
+        for (int i = threadIdx.x; i < F / 16; i += WARPS * 32) ((int4*) dn_xq)[i] = __ldg(src + i);
+        for (int i = threadIdx.x; i < F / 32; i += WARPS * 32) xsc[i] = __ldg(xs_g + (size_t) s * (F / 32) + i);
+    } else {
+        quant_h_i8<WARPS>(h + (size_t) s * F, F, dn_xq, xsc);
+    }
     __syncthreads();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int r0 = (blockIdx.x * WARPS + warp) * 8;
@@ -5142,8 +5172,28 @@ void experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_dow
     if (S <= 0) return;
     if (g_dp4a && ty_down == kIQ4_NL && F % 32 == 0) {
         constexpr int W = 4;
-        experts_down_iq4nl_dp4a_kernel<W><<<dim3((unsigned) ((C + 8 * W - 1) / (8 * W)), (unsigned) S), W * 32,
-                                            (size_t) F + (size_t) F / 32 * 4, s>>>(blob, off_down, h, C, F, y);
+        static const bool pre = !getenv("IK2_DN_PRE") || std::atoi(getenv("IK2_DN_PRE"));
+        static int8_t* xq = nullptr;   // (the activations made int8 once a call; allocated outside any graph capture)
+        static float* xs = nullptr;
+        static size_t cap = 0;
+        const size_t need = (size_t) S * F;
+        if (pre && need > cap) {
+            cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+            cudaStreamIsCapturing(s, &cs);
+            if (cs == cudaStreamCaptureStatusNone) {
+                if (xq) cudaFree(xq), cudaFree(xs);
+                cap = std::max<size_t>(need, (size_t) 64 * F);
+                if (cudaMalloc(&xq, cap) != cudaSuccess || cudaMalloc(&xs, cap / 32 * 4) != cudaSuccess) check("down scratch");
+            }
+        }
+        const dim3 g((unsigned) ((C + 8 * W - 1) / (8 * W)), (unsigned) S);
+        const size_t sm = (size_t) F + (size_t) F / 32 * 4;
+        if (pre && need <= cap) {
+            quant_h_rows_i8_kernel<8><<<(unsigned) S, 256, 0, s>>>((const uint16_t* const*) blob, h, F, xq, xs);
+            experts_down_iq4nl_dp4a_kernel<W, true><<<g, W * 32, sm, s>>>(blob, off_down, h, C, F, y, xq, xs);
+        } else {
+            experts_down_iq4nl_dp4a_kernel<W><<<g, W * 32, sm, s>>>(blob, off_down, h, C, F, y);
+        }
         check("experts_down (dp4a)");
         return;
     }
@@ -5172,13 +5222,37 @@ template <int WARPS, int ROWS>
 void launch_experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up,
                                    size_t eb0, const float* x, int C, int F, const float* sg, const float* su,
                                    float gcap, float ucap, uint16_t* h, cudaStream_t s, const int* orow = nullptr,
-                                   int h_ld = 0) {
+                                   int h_ld = 0, int n_x = 0) {
     if (g_dp4a && ty_gate == kIQ3_S && ty_up == kIQ3_S && C % 256 == 0) {
         constexpr int Wn = 8, Pn = 1;   // (RTX 2060 SUPER: 8 warps and a row pair each, 145 us for 8 experts; 4 x 2: 153)
-        auto kfn = experts_gu_iq3s_dp4a_kernel<Wn, Pn>;
-        kfn<<<dim3((unsigned) ((F + 2 * Wn * Pn - 1) / (2 * Wn * Pn)), (unsigned) S), Wn * 32,
-                                         (size_t) C + (size_t) C / 32 * 4, s>>>(blob, tok, eb0, x, C, F, sg, su, gcap,
-                                                                                 ucap, h, orow, h_ld > 0 ? h_ld : F);
+        static const int V = getenv("IK2_GU_VAR") ? std::atoi(getenv("IK2_GU_VAR")) : 7;   // 1: x once a call, 2: signs by arithmetic
+        // (the codes made once a call - n_x rows of x - into a scratch that exists before any graph capture)
+        static int8_t* xq = nullptr;
+        static float* xs = nullptr;
+        static size_t cap = 0;
+        const size_t need = (size_t) std::max(0, n_x) * C;
+        if ((V & 1) && n_x > 0 && need > cap) {
+            cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+            cudaStreamIsCapturing(s, &cs);
+            if (cs == cudaStreamCaptureStatusNone) {
+                if (xq) cudaFree(xq), cudaFree(xs);
+                cap = std::max<size_t>(need, (size_t) 8 * C);
+                if (cudaMalloc(&xq, cap) != cudaSuccess || cudaMalloc(&xs, cap / 32 * 4) != cudaSuccess) check("gate_up scratch");
+            }
+        }
+        const dim3 g((unsigned) ((F + 2 * Wn * Pn - 1) / (2 * Wn * Pn)), (unsigned) S);
+        const size_t sm = (size_t) C + (size_t) C / 32 * 4;
+        const int hl = h_ld > 0 ? h_ld : F;
+        if ((V & 1) && n_x > 0 && need <= cap) {
+            quant_rows_i8_kernel<8><<<(unsigned) n_x, 256, 0, s>>>(x, C, xq, xs);
+            if ((V & 4) && C == 2304) experts_gu_iq3s_dp4a_kernel<Wn, Pn, true, true, 72><<<g, Wn * 32, sm, s>>>(blob, tok, eb0, x, C, F, sg, su, gcap, ucap, h, orow, hl, xq, xs);
+            else if (V & 2) experts_gu_iq3s_dp4a_kernel<Wn, Pn, true, true><<<g, Wn * 32, sm, s>>>(blob, tok, eb0, x, C, F, sg, su, gcap, ucap, h, orow, hl, xq, xs);
+            else experts_gu_iq3s_dp4a_kernel<Wn, Pn, true, false><<<g, Wn * 32, sm, s>>>(blob, tok, eb0, x, C, F, sg, su, gcap, ucap, h, orow, hl, xq, xs);
+        } else if (V & 2) {
+            experts_gu_iq3s_dp4a_kernel<Wn, Pn, false, true><<<g, Wn * 32, sm, s>>>(blob, tok, eb0, x, C, F, sg, su, gcap, ucap, h, orow, hl);
+        } else {
+            experts_gu_iq3s_dp4a_kernel<Wn, Pn><<<g, Wn * 32, sm, s>>>(blob, tok, eb0, x, C, F, sg, su, gcap, ucap, h, orow, hl);
+        }
         return;
     }
     const dim3 g((unsigned) ((F + WARPS * ROWS - 1) / (WARPS * ROWS)), (unsigned) S);
@@ -5197,9 +5271,9 @@ void experts_gate_up_swiglu_rows(const uint8_t* const* blob, const int* tok, int
 }
 void experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, size_t eb0,
                             const float* x, int C, int F, const float* sg, const float* su, float gcap, float ucap,
-                            uint16_t* h, cudaStream_t s) {
+                            uint16_t* h, cudaStream_t s, int n_x) {
     if (S <= 0) return;
-    if (S <= 8) launch_experts_gate_up_swiglu<4, 2>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, sg, su, gcap, ucap, h, s);
+    if (S <= 8) launch_experts_gate_up_swiglu<4, 2>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, sg, su, gcap, ucap, h, s, nullptr, 0, n_x);
     else launch_experts_gate_up_swiglu<4, 4>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, sg, su, gcap, ucap, h, s);
     check("experts_gate_up_swiglu");
 }

@@ -209,7 +209,7 @@ void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, in
 /// indexed by row[g*8+t]).  sg, su may be null (scale 1).
 void experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, size_t eb0,
                             const float* x, int C, int F, const float* sg, const float* su, float gcap, float ucap,
-                            uint16_t* h, cudaStream_t s);
+                            uint16_t* h, cudaStream_t s, int n_x = 0);   // (n_x > 0: x's rows, made int8 once a call)
 /// experts_gate_up_swiglu with slot s's F outputs written at h + orow[s] * h_ld (orow null: s; h_ld 0: F) - a tensor-
 /// parallel GPU's half of every row of a wider h
 void experts_gate_up_swiglu_rows(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up,

@@ -2996,7 +2996,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                                           g_dp.R, l, g_dp.seqd, g_dp.ctl_d, g_dp.blob, g_dp.tok, g_dp.inv, g_dp.sg,
                                           g_dp.su, g_dp.wt, g_dp.mflag);
             k::experts_gate_up_swiglu(g_dp.blob, g_dp.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, c.F, g_dp.sg,
-                                      g_dp.su, c.gate_cap, c.up_cap, W.h16, g_s);
+                                      g_dp.su, c.gate_cap, c.up_cap, W.h16, g_s, 1);
             k::experts_down(g_dp.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
             k_dp_wait<<<1, 32, 0, g_s>>>(g_dp.mflag, c.K, g_dp.seqd, g_dp.ctl_d);
             k_dp_merge<<<dim3((unsigned) ((C + 255) / 256), (unsigned) c.K), 256, 0, g_s>>>(W.y32, g_dp.ey_d, g_dp.mflag,

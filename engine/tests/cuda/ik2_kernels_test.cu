@@ -2757,7 +2757,7 @@ void test_experts_dp4a() {
     k::experts_gate_up_swiglu(dtab, dtok, S, k::kIQ3_S, k::kIQ3_S, eb0, dx, C, F, dsg, nullptr, 10.0f, 10.0f, h_a, 0);
     k::experts_down(dtab, S, k::kIQ4_NL, 2 * eb0, h_a, C, F, y_a, 0);
     k::g_dp4a = true;
-    k::experts_gate_up_swiglu(dtab, dtok, S, k::kIQ3_S, k::kIQ3_S, eb0, dx, C, F, dsg, nullptr, 10.0f, 10.0f, h_b, 0);
+    k::experts_gate_up_swiglu(dtab, dtok, S, k::kIQ3_S, k::kIQ3_S, eb0, dx, C, F, dsg, nullptr, 10.0f, 10.0f, h_b, 0, 2);
     k::experts_down(dtab, S, k::kIQ4_NL, 2 * eb0, h_a, C, F, y_b, 0);   // (the same input as the fp32 one)
     k::g_dp4a = was;
     const auto ha = host(h_a, (size_t) S * F), hb2 = host(h_b, (size_t) S * F);
@@ -2822,7 +2822,7 @@ void bench_experts() {
     };
     timeit("gate_up IQ3_S x8", (double) S * 2 * eb0, [&](int i) {
         k::experts_gate_up_swiglu(dtab + (size_t) (i % 16) * S, dtok, S, k::kIQ3_S, k::kIQ3_S, eb0, dx, C, F, nullptr,
-                                  nullptr, 10.0f, 10.0f, dh, 0);
+                                  nullptr, 10.0f, 10.0f, dh, 0, 1);
     });
     timeit("down IQ4_NL x8", (double) S * C * rb_dn, [&](int i) {
         k::experts_down(dtab + (size_t) (i % 16) * S, S, k::kIQ4_NL, 2 * eb0, dh, C, F, dy, 0);
