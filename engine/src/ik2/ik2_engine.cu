@@ -2497,6 +2497,12 @@ struct DevPlan {
     std::vector<int> owner, loc;
     std::vector<uint64_t> last;
     std::vector<char> busy;
+    // (IK2_DP_LFU, default on: a key's picks counted with a decay of 0.95 a token - lscore its log, shifted by its tick
+    //  so that keys compare without the decay applied; the copy of a miss takes the slot of the least counted key, and
+    //  only when the miss counts more.  A trace of 255 decode tokens: misses 21.9 -> 19.0 a token against LRU)
+    std::vector<double> lscore;
+    bool lfu = !getenv("IK2_DP_LFU") || std::atoi(getenv("IK2_DP_LFU"));
+    double lnd = 0.0;   // ln of the decay a visit
     std::vector<int> changed;
     uint64_t tick = 0;
     struct Copy { bool on = false; int s = -1, key = -1, l = 0, e = 0, stage = 0, need = 0; cudaEvent_t ev = nullptr; };
@@ -2687,7 +2693,15 @@ void dp_advance(bool idle) {
         }
     }
 }
-void dp_request(int l, int e) {   // a miss: its copy into the least recently used slot not in use
+// a pick of key at the current tick counted (see DevPlan::lscore)
+void dp_count(int key) {
+    if (!g_dp.lfu) return;
+    double& L = g_dp.lscore[key];
+    const double tl = (double) g_dp.tick * g_dp.lnd;
+    const double eff = std::isfinite(L) ? std::exp(L + tl) : 0.0;
+    L = std::log(eff + 1.0) - tl;
+}
+void dp_request(int l, int e) {   // a miss: its copy into the least recently used (least counted: lfu) slot not in use
     const int key = l * g_dp.E + e;
     if (g_dp.loc[key] >= 0 || g_dp.busy[key]) return;
     int qi = 0;
@@ -2697,9 +2711,11 @@ void dp_request(int l, int e) {   // a miss: its copy into the least recently us
     for (int s2 = 0; s2 < g_dp.n_active; ++s2) {
         if (g_dp.owner[s2] == -2 || g_dp.last[s2] == g_dp.tick) continue;
         if (g_dp.owner[s2] < 0) { v = s2; break; }
-        if (v < 0 || g_dp.last[s2] < g_dp.last[v]) v = s2;
+        if (v < 0) { v = s2; continue; }
+        if (g_dp.lfu ? g_dp.lscore[g_dp.owner[s2]] < g_dp.lscore[g_dp.owner[v]] : g_dp.last[s2] < g_dp.last[v]) v = s2;
     }
     if (v < 0) return;
+    if (g_dp.lfu && g_dp.owner[v] >= 0 && !(g_dp.lscore[key] > g_dp.lscore[g_dp.owner[v]])) return;   // (not worth it)
     auto& q = g_dp.q[qi];
     const cudaEvent_t ev = q.ev;
     q = DevPlan::Copy{true, v, key, l, e, 1, 0, ev};
@@ -2772,11 +2788,13 @@ void dp_service() {
         const int T = std::max(1, std::min(kDpT, hd[2])), S = T * g_dp.K;
         float* ey = g_dp.ey_h + (size_t) (next % g_dp.R) * kDpS * g_dp.C;
         const uint64_t t = ++g_dp.tick;
-        for (int k = 0; k < S; ++k)   // the hits' recency
+        for (int k = 0; k < S; ++k) {   // the hits' recency, every pick's count
+            dp_count(lay * g_dp.E + hd[8 + k]);
             if (!hd[72 + k]) {
-                const int s2 = g_dp.loc[hd[1] * g_dp.E + hd[8 + k]];
+                const int s2 = g_dp.loc[lay * g_dp.E + hd[8 + k]];
                 if (s2 >= 0) g_dp.last[s2] = t;
             }
+        }
         int n = 0;   // the misses, an expert's tokens a job (its weights read once for them)
         int ej[kDpS];
         for (int k = 0; k < S; ++k) {
@@ -2815,6 +2833,8 @@ void dp_service() {
 void dp_init(const Model& M) {
     const Config& c = M.c;
     g_dp.M = &M, g_dp.K = c.K, g_dp.C = c.C, g_dp.F = c.F, g_dp.gcap = c.gate_cap, g_dp.ucap = c.up_cap;
+    g_dp.lscore.assign((size_t) c.n_layer * c.E, -INFINITY);   // (kept across the plan's rebuilds)
+    g_dp.lnd = std::log(0.95) / std::max(1, c.n_visit);
     g_dp.rec_bytes = kDpHdr + (size_t) kDpT * c.C * 4;
     CU(cudaHostAlloc((void**) &g_dp.rec_h, g_dp.rec_bytes * g_dp.R, cudaHostAllocMapped));
     std::memset(g_dp.rec_h, 0, g_dp.rec_bytes * g_dp.R);
