@@ -1584,6 +1584,17 @@ void test_kv_i8() {
         k::attn_decode_i8(dq, dr, ds, dk8, dv8, c.kv_cap, H, KV, D, k0, qpos + 1 - k0, qpos, scale, dp, d_rel, c.extent,
                           c.window, scr, o_b, 0);
         cmp("decode", (size_t) H * D);
+        {   // the _at variants (the position read on the device) against the host-position ones
+            std::vector<int> ph = {qpos};
+            int* dp_pos = dev(ph);
+            const int P = std::min(128, std::max(1, (qpos + 1 - k0 + 63) / 64));
+            k::attn_decode_f16_at(dq, dr, ds, dk16, dv16, c.kv_cap, H, KV, dp_pos, P, scale, dp, d_rel, c.extent,
+                                  c.window, scr, o_a, 0);
+            k::attn_decode_i8_at(dq, dr, ds, dk8, dv8, c.kv_cap, H, KV, dp_pos, P, scale, dp, d_rel, c.extent, c.window,
+                                 scr, o_b, 0);
+            cmp("decode _at", (size_t) H * D);
+            cudaFree(dp_pos);
+        }
         if (c.n_pos >= 4) {
             const int p0 = qpos - 3, k0m = c.window < (1 << 30) ? std::max(0, p0 - c.window + 1) : 0;
             k::attn_multi_f16(dq, dr, ds, dk16, dv16, c.kv_cap, 4, H, KV, k0m, qpos + 1 - k0m, p0, scale, dp, d_rel,
@@ -2832,7 +2843,7 @@ void bench_experts() {
 }
 
 int main() {
-    if (getenv("IK2_BENCH")) {
+    if (getenv("IK2_BENCH") && std::atoi(getenv("IK2_BENCH"))) {
         bench_experts();
         return 0;
     }

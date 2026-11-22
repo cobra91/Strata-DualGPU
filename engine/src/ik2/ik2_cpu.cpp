@@ -361,6 +361,11 @@ bool available_for(int type) {
 void rows(int type, const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
     if (type == 21 || type == 20 || type == 8) {
+        static const bool ok = available_for(type);   // (AVX2 + FMA + F16C: the dots are built for them)
+        if (!ok) {
+            std::fprintf(stderr, "ik2 CPU lane: this CPU has no AVX2 / FMA / F16C for GGUF type %d\n", type);
+            std::abort();
+        }
         if (K % (type == 21 ? 256 : 32)) {   // (a row of whole blocks, as GGUF lays them out)
             std::fprintf(stderr, "ik2 CPU lane: a row of %d values is not whole blocks of type %d\n", K, type);
             std::abort();
@@ -383,6 +388,10 @@ void rows(int type, const uint8_t* W, int K, int r0, int r1, const float* x, flo
 // rows by the int8 dots (IQ3_S / IQ4_NL only; xq / xs from quant_q8)
 void rows_q8(int type, const uint8_t* W, int K, int r0, int r1, const int8_t* xq, const float* xs, float* out) {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    if ((type != 21 && type != 20) || !available_for(type)) {
+        std::fprintf(stderr, "ik2 CPU lane: no int8 CPU dot for GGUF type %d here\n", type);
+        std::abort();
+    }
     if (K % (type == 21 ? 256 : 32)) {
         std::fprintf(stderr, "ik2 CPU lane: a row of %d values is not whole blocks of type %d\n", K, type);
         std::abort();
@@ -392,11 +401,17 @@ void rows_q8(int type, const uint8_t* W, int K, int r0, int r1, const int8_t* xq
         const uint8_t* w = W + (size_t) r * rb;
         out[r - r0] = type == 21 ? dot_iq3s_q8(w, xq, xs, K) : dot_iq4nl_q8(w, xq, xs, K);
     }
+#else
+    std::fprintf(stderr, "ik2 CPU lane: no int8 CPU dots in this build\n");
+    std::abort();
 #endif
 }
 void quant_q8(const float* x, int K, int8_t* q, float* sc) {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
     quant_q8_32(x, K, q, sc);
+#else
+    std::fprintf(stderr, "ik2 CPU lane: no int8 CPU dots in this build\n");
+    std::abort();
 #endif
 }
 bool g_cpu_q8 = !getenv("IK2_CPU_Q8") || std::atoi(getenv("IK2_CPU_Q8"));
@@ -473,6 +488,10 @@ void experts_batch(const BatchJob* J, int n, int C, int F, float gcap, float uca
     if (gu_tl.size() < (size_t) n * 2 * F) gu_tl.resize((size_t) n * 2 * F);
     float* const gu = gu_tl.data();
     constexpr int RP = 64;
+    if (C % RP || F % RP) {   // (the tasks are whole 64-row chunks)
+        std::fprintf(stderr, "ik2 CPU lane: C %d / F %d not multiples of %d\n", C, F, RP);
+        std::abort();
+    }
     const int pa = 2 * F / RP, pc = C / RP, pb = (F + 127) / 128;
     bool q8 = g_cpu_q8 && C % 256 == 0 && F % 128 == 0;
     for (int j = 0; q8 && j < n; ++j) q8 = J[j].tg == 21 && J[j].tu == 21 && J[j].td == 20;

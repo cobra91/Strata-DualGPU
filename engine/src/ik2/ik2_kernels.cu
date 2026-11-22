@@ -5,6 +5,7 @@
 // src/ik2/ik2_kernels.cu - strata-ik2's kernels (the interface and the conventions: ik2_kernels.cuh).
 #include "ik2_kernels.cuh"
 #include "ik2_iq_tables.h"
+#include "strata/kernels/dp4a.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -5092,8 +5093,8 @@ __global__ void __launch_bounds__(WARPS * 32) experts_gu_iq3s_dp4a_kernel(
             const uint32_t g2 = grid_s[(q >> 8) | ((qh << (7 - 2 * l)) & 256u)];
             const uint2 mk = SGNA ? make_uint2(sign_bytes4((sgw >> (8 * l)) & 15u), sign_bytes4((sgw >> (8 * l + 4)) & 15u))
                                   : sgn_s[(sgw >> (8 * l)) & 255u];
-            sumi = __dp4a((int) ((g1 ^ mk.x) + (mk.x & 0x01010101u)), xw[2 * l], sumi);
-            sumi = __dp4a((int) ((g2 ^ mk.y) + (mk.y & 0x01010101u)), xw[2 * l + 1], sumi);
+            sumi = STRATA_DP4A((int) ((g1 ^ mk.x) + (mk.x & 0x01010101u)), xw[2 * l], sumi);
+            sumi = STRATA_DP4A((int) ((g2 ^ mk.y) + (mk.y & 0x01010101u)), xw[2 * l + 1], sumi);
         }
         const float v = d * (float) (1 + 2 * nib) * xsc[sb] * (float) sumi;
         acc[0] += m == 0 ? v : 0.0f, acc[1] += m == 1 ? v : 0.0f, acc[2] += m == 2 ? v : 0.0f, acc[3] += m == 3 ? v : 0.0f;
@@ -5149,8 +5150,8 @@ __global__ void __launch_bounds__(WARPS * 32) experts_down_iq4nl_dp4a_kernel(con
 #pragma unroll
         for (int k = 0; k < 4; ++k) {
             const uint32_t w = (uint32_t) __ldg(b + 1 + 2 * k) | ((uint32_t) __ldg(b + 2 + 2 * k) << 16);
-            sumi = __dp4a((int) iq4nl_lut4(w, false), xw[k], sumi);
-            sumi = __dp4a((int) iq4nl_lut4(w, true), xw[4 + k], sumi);
+            sumi = STRATA_DP4A((int) iq4nl_lut4(w, false), xw[k], sumi);
+            sumi = STRATA_DP4A((int) iq4nl_lut4(w, true), xw[4 + k], sumi);
         }
         const float v = d * xsc[bk] * (float) sumi;
 #pragma unroll
@@ -5253,6 +5254,7 @@ void launch_experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, i
         } else {
             experts_gu_iq3s_dp4a_kernel<Wn, Pn><<<g, Wn * 32, sm, s>>>(blob, tok, eb0, x, C, F, sg, su, gcap, ucap, h, orow, hl);
         }
+        check("experts_gate_up_swiglu (dp4a)");
         return;
     }
     const dim3 g((unsigned) ((F + WARPS * ROWS - 1) / (WARPS * ROWS)), (unsigned) S);
@@ -5687,6 +5689,10 @@ void prep_qkv_r_i8_at(float* q, const float* q_clip, const float* k_in, int8_t* 
                       float eps, const int* pos, bool log_scale, float alpha, float n_floor, int kv_cap,
                       uint16_t* q16, cudaStream_t s, const uint16_t* sink_w, const float* sink_x, int sink_k,
                       float* sink_y) {
+    if (D % 64) {
+        std::fprintf(stderr, "ik2::k::prep_qkv_r_i8_at: D = %d, not a multiple of 64\n", D);
+        std::abort();
+    }
     prep_qkv_r_impl_kernel<int8_t><<<(unsigned) (2 * H + 2 * KV + (sink_w ? H : 0)), 32, 0, s>>>(
         q, q_clip, k_in, kc, v_in, vc, r, r_clip, 1, H, KV, D, d_rel, qk_clip, rel_clip, eps, log_scale ? pos : nullptr,
         alpha, n_floor, 0, kv_cap, 1.0f, 1.0f, pos, q16, sink_w, sink_x, sink_k, sink_y);

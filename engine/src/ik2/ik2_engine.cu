@@ -29,6 +29,7 @@
 #include "ik2_draft.hpp"
 #include "ik2_kernels.cuh"
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/kernels/dp4a.hpp"
 #include "strata/ik2/engine.hpp"
 
 #include <cublas_v2.h>
@@ -310,7 +311,9 @@ cublasHandle_t g_blas;
 cudaStream_t g_s;
 cudaStream_t g_cs;          // the experts' copies of the token path, beside the compute stream
 cudaEvent_t g_ev;
-bool g_tg_capturing = false;   // IK2_TOKGRAPH: a decode token's graph being captured
+bool g_tg_capturing = false;
+// the device plan's counters set back once this many visits were planned (a token past it runs without a graph)
+const long long g_dp_reset_at = getenv("IK2_DP_RESET_AT") ? std::atoll(getenv("IK2_DP_RESET_AT")) : (1LL << 30);   // IK2_TOKGRAPH: a decode token's graph being captured
 bool g_overlap = true;      // IK2_OVERLAP=0: the copies on the compute stream, before the experts
 // The CPU lane (IK2_CPU=1: on): a missing NVFP4 expert computed in host memory by the pool while the others' blocks
 // are copied; its own blocks follow on the copy stream without being waited for ("lazy"), so it is in VRAM next time.
@@ -2441,7 +2444,11 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
 // computes the misses on the CPU lane into mapped rows and raises a counter; k_dp_wait waits for it only when the CPU
 // owes rows, k_dp_merge puts them in, the combine follows.  The cache does not change during such tokens.
 struct DevPlan {
-    bool want = true, ok = false, dirty = true;
+    bool ok = false, dirty = true;
+    // the plans' 32-bit counters set back to 0 (a quiesce with reset asked) before they could wrap: planned counts the
+    // visits enqueued since
+    std::atomic<bool> reset{false};
+    long long planned = 0;
     std::thread th;
     std::atomic<bool> run{false};
     int R = 64, K = 0, C = 0, F = 0;
@@ -2530,7 +2537,7 @@ __global__ void k_dp_plan(const float* __restrict__ logits, const float* __restr
         seqd[0] = q, seqd[1] = q, s_seq = q;
         // (the ring's record q % R free: the host done with plan q - R - a plan without misses does not wait for the
         // host, so a run of them could otherwise lap a record still being read)
-        while (dp_ld_sys(ctl + 2) < q - R) __nanosleep(256);
+        while (dp_ld_sys(ctl + 2) < q - R) strata_spin_pause();
     }
     __syncthreads();
     const int seq = s_seq;
@@ -2563,7 +2570,7 @@ __global__ void k_dp_wait(const int* __restrict__ mflag, int K, const int* __res
     if (any && dp_ld_sys(ctl + 2) < seq) {
         unsigned long long t0, t1;
         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
-        while (dp_ld_sys(ctl + 2) < seq) __nanosleep(256);
+        while (dp_ld_sys(ctl + 2) < seq) strata_spin_pause();
         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
         ctl[3] = (int) min(2147483647ull, (unsigned long long) ctl[3] + (t1 - t0) / 1000);   // the GPU's wait, us (saturating)
         ctl[4] += 1;
@@ -2590,6 +2597,7 @@ bool dp_ready(cudaEvent_t e) {
 // that may have read it (its done counter at the planned one + 1, or the GPU idle), 3 the blocks and the new entry
 // queued, done once landed
 void dp_advance(bool idle) {
+    if (g_dp.pool < 0) return;   // (the service runs before the first dp_sync_tab names the pool)
     const Model& M = *g_dp.M;
     ExpertCache& ECr = dev_cache(0);
     auto& P = ECr.pools[g_dp.pool];
@@ -2680,7 +2688,12 @@ void dp_service() {
             if (!g_dp.run.load(std::memory_order_relaxed)) return;
             if (g_dp.quiesce.load(std::memory_order_acquire) == 1) {   // (the GPU idle, every record served)
                 dp_drain();
+                const bool rs = g_dp.reset.load(std::memory_order_acquire);
                 g_dp.quiesce.store(2, std::memory_order_release);
+                if (rs) {   // (the counters set back by the host: its quiesce 0 says they are)
+                    while (g_dp.quiesce.load(std::memory_order_acquire) != 0) std::this_thread::yield();
+                    next = 1;
+                }
             }
             dp_advance(false);
             if (++spin < 200000) __builtin_ia32_pause();
@@ -2847,8 +2860,22 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
              std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp) {
     kv_ensure(M, pos0 + T);
     const Config& c = M.c;
-    const bool dp_tok = g_dp.ok && T == 1 && dump.empty() && !g_prof && !g_rec && !g_taps && !g_trace;
+    const bool dp_tok = g_dp.ok && T == 1 && dump.empty() && !g_prof && !g_rec && !g_taps && !g_trace && g_pop.empty();
     if (dp_tok && g_dp_time && !g_tg_capturing) g_dp_t0 = now();
+    if (dp_tok && g_dp.planned > g_dp_reset_at && !g_tg_capturing) {   // (the plans' counters back to 0, every record served, before a wrap)
+        CU(cudaDeviceSynchronize());
+        g_dp.reset.store(true, std::memory_order_release);
+        g_dp.quiesce.store(1, std::memory_order_release);
+        while (g_dp.quiesce.load(std::memory_order_acquire) != 2) std::this_thread::yield();
+        for (int i = 0; i < 3; ++i) g_dp.ctl[i] = 0;
+        CU(cudaMemset(g_dp.seqd, 0, 2 * sizeof(int)));
+        CU(cudaDeviceSynchronize());
+        g_dp.reset.store(false, std::memory_order_release);
+        g_dp.quiesce.store(0, std::memory_order_release);
+        g_dp.planned = 0;
+        g_dp.dirty = true;
+    }
+    if (dp_tok) g_dp.planned += c.n_visit;
     if (dp_tok && g_dp.dirty) {
         CU(cudaDeviceSynchronize());
         g_seq_done = g_seq_next - 1;
@@ -4113,6 +4140,7 @@ int run(int argc, char** argv) {
             c.n_visit += (c.n_pass - 1) * (c.core1 - c.core0);
         } else {
             c.core0 = (int) key("loop.core_start"), c.core1 = (int) key("loop.core_end"), c.rank = (int) key("loop.gate_rank");
+            if (c.core1 > c.n_visit) die("loop.core_end past block_count");
         }
         if (c.core0 <= 0 || c.core1 <= c.core0 || c.core0 % c.block || (c.core1 - c.core0) % c.block || c.rank <= 0)
             die("the looped core must start after the first block and span whole blocks");
@@ -4997,7 +5025,10 @@ int run(int argc, char** argv) {
     if (g_kv_grow && !EC.pools.empty()) {   // (what --kv-grow can hold here, said at load rather than mid-generation)
         size_t full_v = 0;
         for (const auto& Vi : M.V) full_v += !M.L[Vi.l].sliding;
-        const auto& P0 = EC.pools[0];
+        int pf = 0;   // (the pool kv_ensure takes them from: the first full layer's)
+        for (const auto& Vi : M.V)
+            if (!M.L[Vi.l].sliding) { pf = std::max(0, EC.layer_pool[Vi.l]); break; }
+        const auto& P0 = EC.pools[pf];
         const size_t per_tok = 2 * full_v * kv_tok_b((size_t) c.KV * c.D);
         const long most = per_tok ? (long) ((size_t) std::max(0, P0.n_slots - 2 * c.E - 80) * P0.slot_bytes / per_tok) : 0;
         if (full_v && most < ctx)
@@ -5664,7 +5695,7 @@ int run(int argc, char** argv) {
         std::vector<int> ag;
         if (lo) logits.clear();
         const int pos = (int) prompt.size() + i;
-        if (g_dp.ok && g_dp.graph && !lo && i > 0 && !g_dp.dirty) {   // IK2_TOKGRAPH
+        if (g_dp.ok && g_dp.graph && !lo && i > 0 && !g_dp.dirty && g_dp.planned <= g_dp_reset_at) {   // IK2_TOKGRAPH
             const int sl = i & 1;
             if (g_dp.exec_pos[sl] != pos) tg_capture(M, pos, sl);
             if (g_dp.exec_pos[sl] != pos) goto plain;   // (not captured: see tg_capture)
