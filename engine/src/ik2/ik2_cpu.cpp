@@ -261,7 +261,7 @@ IK2_AVX2 void quant_q8_32(const float* x, int K, int8_t* q, float* sc) {
         a = _mm_max_ss(a, _mm_movehdup_ps(a));
         const float mx = _mm_cvtss_f32(a);
         sc[b] = mx * (1.0f / 127.0f);
-        const __m256 f = _mm256_set1_ps(mx > 0.0f ? 127.0f / mx : 0.0f);
+        const __m256 f = _mm256_set1_ps(mx > 1e-30f ? 127.0f / mx : 0.0f);   // (a subnormal max: zero codes)
         __m256i v[4];
         for (int j = 0; j < 4; ++j) v[j] = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xb + 8 * j), f));   // (nearest)
         const __m256i p01 = _mm256_packs_epi32(v[0], v[1]), p23 = _mm256_packs_epi32(v[2], v[3]);
@@ -372,7 +372,7 @@ IK2_AVX2 void dot_iq4nl_q8_n(const uint8_t* row, const int8_t* const* xq, const 
 template <int NT>
 IK2_AVX2 void rows_q8_n_t(int type, const uint8_t* W, int K, int r0, int r1, const int8_t* const* xq,
                           const float* const* xs, float* const* out) {
-    const size_t rb = type == 21 ? (size_t) K / 256 * 110 : (size_t) K / 32 * 18;
+    const size_t rb = type == 21 ? (size_t) K / 256 * 110 : (size_t) K / 32 * 18;   // (21 or 20: rows_q8_n checks)
     float v[NT];
     for (int r = r0; r < r1; ++r) {
         if (type == 21) dot_iq3s_q8_n<NT>(W + (size_t) r * rb, xq, xs, K, v);
@@ -590,7 +590,13 @@ void experts_batch(const BatchJob* J, int n, int C, int F, float gcap, float uca
     if (q8) {   // the int8 dots: the inputs made int8 (x here, the activations by the tasks that make them)
         // (a job's nt tokens - 1 for the device plan's, up to 8 for a verify window's - share each weight's decode)
         int ntm = 1;
-        for (int j = 0; j < n; ++j) ntm = std::max(ntm, J[j].nt);
+        for (int j = 0; j < n; ++j) {
+            if (J[j].nt > 8) {   // (BatchJob holds 8 tokens)
+                std::fprintf(stderr, "ik2 CPU lane: a job of %d tokens (8 at most)\n", J[j].nt);
+                std::abort();
+            }
+            ntm = std::max(ntm, J[j].nt);
+        }
         thread_local std::vector<int8_t> q_tl;
         thread_local std::vector<float> s_tl, g_tl;
         const size_t per = (size_t) C + F;   // (a token's x codes, then its activations')

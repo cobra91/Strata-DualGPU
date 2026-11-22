@@ -1397,6 +1397,7 @@ void loop_gates_chunk(Work& W, const k::LoopGate* gt, int n, int T, int C, int R
     static size_t w32_ns[16] = {};
     int dev = 0;
     CU(cudaGetDevice(&dev));
+    if (dev < 0 || dev >= 16) die("loop_gates_chunk: more than 16 GPUs");
     const size_t wn = (size_t) R * 2 * C + (size_t) 2 * R * C;
     if (wn > w32_ns[dev]) {
         if (w32s[dev]) cudaFree(w32s[dev]);
@@ -3735,9 +3736,10 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                                 W.y32 + (size_t) p0 * C, g_s);
             }
             if (n_jobs > 0) {
+                const double tb0 = multi ? now() : tc0;   // (the batch's own time: the enqueues before it are not the CPU's)
                 if (multi) ik2::cpu::experts_batch(bj, n_bj, C, F, c.gate_cap, c.up_cap);   // (the GPU's groups run)
                 else g_pool->wait();
-                g_t_cpu = 0.9 * g_t_cpu + 0.1 * (now() - tc0) / n_jobs;
+                g_t_cpu = 0.9 * g_t_cpu + 0.1 * (now() - tb0) / n_jobs;
                 CU(cudaMemcpyAsync(W.y32 + (size_t) (nh + nw) * C, yh, (size_t) n_jobs * C * 4, cudaMemcpyHostToDevice,
                                    g_s));
             }
@@ -4319,6 +4321,7 @@ int run(int argc, char** argv) {
     }
     const int n_core = c.core1 - c.core0;
     c.n_layer = c.n_visit - (c.n_pass - 1) * n_core;
+    if (c.n_layer <= 0 || c.core1 > c.n_layer) die("the looped core runs past the model's layers");
     {   // the pattern is a visit's; a layer's is its first visit's (the same in every pass)
         const auto* sp = S.get(a + "attention.sliding_window_pattern");
         const bool per_layer = loop_arch && sp && (int) sp->items.size() == c.n_layer && c.n_layer != c.n_visit;
