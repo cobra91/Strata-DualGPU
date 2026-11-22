@@ -1489,8 +1489,25 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const int HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel;
     float *q_p = W.q, *k_p = W.kk, *v_p = W.vv, *r_p = W.rr, *gate_p = W.gate, *sink_p = W.sink;
     float *kd_p = W.dyn, *vd_p = W.dyn;
+    // (a token over the planar Q8 rows: k's and v's short convs ride the product's launch, as on the resident path)
+    const bool qkv_conv = Ly.sliding && T == 1 && !g_rec && g_dense_q8 && Ly.wqkvrg.N > 0 && Ly.wqkvrg.q8;
     if (Ly.sliding) {
-        if (Ly.wqkvrg.N > 0) {
+        if (qkv_conv) {
+            const Mat& m = Ly.wqkvrg;
+            const k::MvConv ck{HD, KD, Ly.h_k, Ly.sc_k, nullptr, 0, nullptr, W.kconv};
+            const k::MvConv cv{HD + KD, KD, Ly.h_v, Ly.sc_v, nullptr, 0, nullptr, W.vconv};
+            if (msg)   // (k's and v's rows each with its input)
+                k::mv_q8p_conv(m.q8, m.q8d, m.N, m.K, in_q, W.qkv, ck, cv, g_s, k::MvAlt{in_k, HD, KD},
+                               k::MvAlt{in_v, HD + KD, KD});
+            else
+                mv1c(m, in_q, W.qkv, ck, cv);
+            q_p = W.qkv;
+            k_p = q_p + HD;
+            v_p = k_p + KD;
+            r_p = v_p + KD;
+            gate_p = r_p + HR;
+            gemm16(Ly.sink16, c.H, C, W.x16, T, sink_p, c.H);
+        } else if (Ly.wqkvrg.N > 0) {
             if (msg) {   // the fused rows by the input they take: q | k | v | r, gate (and the sink)
                 const int N = Ly.wqkvrg.N;
                 matmul_rows(Ly.wqkvrg, 0, HD, in_q, W.x16, T, W.qkv, N);
@@ -1524,10 +1541,12 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             matmul(Ly.wgate, in_q, W.x16, T, gate_p, HD);
             gemm16(Ly.sink16, c.H, C, W.x16, T, sink_p, c.H);
         }
-        conv_rec(Ly, 0, k_p, Ly.h_k, T, KD);
-        conv_rec(Ly, 1, v_p, Ly.h_v, T, KD);
-        k::conv4(k_p, Ly.h_k, Ly.sc_k, nullptr, 0, T, KD, W.kconv, g_s);
-        k::conv4(v_p, Ly.h_v, Ly.sc_v, nullptr, 0, T, KD, W.vconv, g_s);
+        if (!qkv_conv) {
+            conv_rec(Ly, 0, k_p, Ly.h_k, T, KD);
+            conv_rec(Ly, 1, v_p, Ly.h_v, T, KD);
+            k::conv4(k_p, Ly.h_k, Ly.sc_k, nullptr, 0, T, KD, W.kconv, g_s);
+            k::conv4(v_p, Ly.h_v, Ly.sc_v, nullptr, 0, T, KD, W.vconv, g_s);
+        }
     } else {
         if (Ly.wqrg.N > 0) {
             matmul(Ly.wqrg, in_q, W.x16, T, W.qkv, Ly.wqrg.N);
@@ -1778,6 +1797,12 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         }
     }
     if (!mma1) k::gate_mul_f16(W.o, gate_p, (size_t) T * HD, W.x16, g_dense_q8 && (T == 1 || (T <= 8 && g_q8_t)), g_s);
+    if (T == 1 && !g_rec && g_dense_q8 && Ly.wo.q8) {   // (the output product with its short conv: one launch)
+        const bool first = l % c.block == 0;
+        if (first) CU(cudaMemcpyAsync(blk(nb), h_in, TC * 4, cudaMemcpyDeviceToDevice, g_s));
+        mv1c(Ly.wo, W.o, W.tmp, k::MvConv{0, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, first ? nullptr : h_in, r_out});
+        return;
+    }
     matmul(Ly.wo, W.o, W.x16, T, W.tmp, C);
     conv_rec(Ly, 2, W.tmp, Ly.h_attn, T, C);
     if (l % c.block == 0) {
