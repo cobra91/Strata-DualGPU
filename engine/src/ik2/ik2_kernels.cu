@@ -3933,6 +3933,24 @@ __global__ void __launch_bounds__(256) mv_q8p_t4_kernel(const int8_t* __restrict
             }
         }
 }
+// ... 8 values a thread: an 8-byte load, a 16-byte store (the same products: the same bits)
+__global__ void decode_q8p_f16_8_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, size_t n8,
+                                        uint16_t* __restrict__ out) {
+    const size_t t = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n8) return;
+    const uint2 w = __ldg((const uint2*) q + t);
+    const float dv = h2f(__ldg(d + (t >> 2)));
+    const uint32_t ww[2] = {w.x, w.y};
+    uint32_t o[4];
+#pragma unroll
+    for (int k = 0; k < 2; ++k)
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const uint32_t v = ww[k] >> (16 * j);
+            o[2 * k + j] = (uint32_t) f2h(dv * (float) (int8_t) (v & 0xFFu)) | ((uint32_t) f2h(dv * (float) (int8_t) ((v >> 8) & 0xFFu)) << 16);
+        }
+    ((uint4*) out)[t] = make_uint4(o[0], o[1], o[2], o[3]);
+}
 __global__ void decode_q8p_f16_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, size_t n,
                                       uint16_t* __restrict__ out) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -5795,6 +5813,11 @@ void mv_q8p(const int8_t* q, const uint16_t* d, int N, int K, const float* x, fl
 }
 void decode_q8p_f16(const int8_t* q, const uint16_t* d, size_t n, uint16_t* out, cudaStream_t s) {
     if (!n) return;
+    if (n % 8 == 0 && ((uintptr_t) q & 7) == 0 && ((uintptr_t) out & 15) == 0) {
+        decode_q8p_f16_8_kernel<<<grid(n / 8), kBlk, 0, s>>>(q, d, n / 8, out);
+        check("decode_q8p_f16");
+        return;
+    }
     decode_q8p_f16_kernel<<<grid(n), kBlk, 0, s>>>(q, d, n, out);
     check("decode_q8p_f16");
 }
