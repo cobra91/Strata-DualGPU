@@ -1691,6 +1691,37 @@ void test_kv_i8() {
         for (float v : va) mx = std::max(mx, (double) std::fabs(v));
         std::vector<double> want(va.begin(), va.end());
         expect("k8v8 decode vs FP16 K / V", vb, want, 0.0, 0.03 * mx);
+        {   // ... the decode's tensor-core kernel and the prefill's flash combine (both rotate their output back)
+            std::vector<uint16_t> q16h((size_t) T * H * D);
+            const auto qa_h = host(dqa, (size_t) T * H * D), qc_h = host(dqc, (size_t) T * H * D);
+            std::vector<uint16_t> q16c(q16h.size());
+            for (size_t i = 0; i < q16h.size(); ++i) q16h[i] = f2h_host(qa_h[i]), q16c[i] = f2h_host(qc_h[i]);
+            uint16_t *dq16a = dev(q16h), *dq16c = dev(q16c);
+            float *ma = dev_n<float>((size_t) T * H * D), *mb = dev_n<float>((size_t) T * H * D);
+            const uint16_t* qa_last = dq16a + (size_t) (T - 1) * H * D;
+            const uint16_t* qc_last = dq16c + (size_t) (T - 1) * H * D;
+            k::attn_decode_mma_f16(qa_last, dra + (size_t) (T - 1) * H * d_rel, ds, k16, v16, cap, H, KV, nullptr, qpos, 2,
+                                   1.0f / std::sqrt((float) D), dp, d_rel, 64, 1 << 30, scr, ma, nullptr, nullptr, 0);
+            k::attn_decode_mma_i8(qc_last, drc + (size_t) (T - 1) * H * d_rel, ds, k8r, v8r, cap, H, KV, nullptr, qpos, 2,
+                                  1.0f / std::sqrt((float) D), dp, d_rel, 64, 1 << 30, scr, mb, nullptr, nullptr, 0);
+            const auto a2 = host(ma, (size_t) H * D), b2 = host(mb, (size_t) H * D);
+            double m2 = 0;
+            for (float v : a2) m2 = std::max(m2, (double) std::fabs(v));
+            expect("k8v8 decode mma vs FP16 K / V", b2, std::vector<double>(a2.begin(), a2.end()), 0.0, 0.03 * m2);
+            auto bias = fvec((size_t) T * H * 64, 1.0f);
+            std::vector<float> sk((size_t) T * H, 1.0f);
+            float *db = dev(bias), *dsk = dev(sk);
+            const size_t sf = (size_t) 1 << 20;
+            k::attn_flash_f16(dq16a, H * D, k16, v16, cap, H, KV, D, T, pos0, 1.0f / std::sqrt((float) D), db, 64, 1 << 30,
+                              dsk, ma, H * D, scr, sf, 2, 0);
+            k::attn_flash_i8(dq16c, H * D, k8r, v8r, cap, H, KV, D, T, pos0, 1.0f / std::sqrt((float) D), db, 64, 1 << 30,
+                             dsk, mb, H * D, scr, sf, 2, 0);
+            const auto a3 = host(ma, (size_t) T * H * D), b3 = host(mb, (size_t) T * H * D);
+            double m3 = 0;
+            for (float v : a3) m3 = std::max(m3, (double) std::fabs(v));
+            expect("k8v8 flash vs FP16 K / V", b3, std::vector<double>(a3.begin(), a3.end()), 0.0, 0.03 * m3);
+            cudaFree(dq16a), cudaFree(dq16c), cudaFree(ma), cudaFree(mb), cudaFree(db), cudaFree(dsk);
+        }
         for (float* pp : {dqc, drc, dp, ds, oa, ob, scr}) cudaFree(pp);
         cudaFree(k8r), cudaFree(v8r);
         k::g_v_rot = rot_was;

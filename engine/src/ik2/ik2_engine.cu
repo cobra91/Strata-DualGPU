@@ -1393,13 +1393,16 @@ void loop_gates_chunk(Work& W, const k::LoopGate* gt, int n, int T, int C, int R
     float *a1 = W.lp_a, *a2 = a1 + (size_t) T * R, *g = a2 + (size_t) T * R;
     float *f = W.lp_f, *gn = f + (size_t) T * C;
     // (the gates' FP16 weights as F32 for cuBLAS's SGEMMs: D [R][2 C], F, G [R][C], a gate at a time)
-    static float* w32 = nullptr;
-    static size_t w32_n = 0;
+    static float* w32s[16] = {};   // (a device's: the layer split runs gates on both)
+    static size_t w32_ns[16] = {};
+    int dev = 0;
+    CU(cudaGetDevice(&dev));
     const size_t wn = (size_t) R * 2 * C + (size_t) 2 * R * C;
-    if (wn > w32_n) {
-        if (w32) cudaFree(w32);
-        w32 = dalloc<float>(w32_n = wn);
+    if (wn > w32_ns[dev]) {
+        if (w32s[dev]) cudaFree(w32s[dev]);
+        w32s[dev] = dalloc<float>(w32_ns[dev] = wn);
     }
+    float* w32 = w32s[dev];
     float *Dw = w32, *Fw = Dw + (size_t) R * 2 * C, *Gw = Fw + (size_t) R * C;
     for (int j = 0; j < n; ++j) {
         k::f16_to_f32(gt[j].D, (size_t) R * 2 * C, Dw, g_s);
@@ -4488,9 +4491,9 @@ int run(int argc, char** argv) {
     g_mma_split = k::attn_decode_mma_blocks(c.KV);
     // a small card streaming its experts: the dense weights as blocks too (an FP16 output head alone is ~0.9 GiB of a
     // cache that holds ~3 GiB: RTX 2060 SUPER 8 GB, Inkling-2-Mini IQ3_S, 654 -> 908 slots, TG 14.0 -> 20.7) - one GPU
-    // (IK2_DENSE=q8 is refused past one: its FP16 scratch is one device's), and not with --draft (it reads the output
-    // head in FP16)
-    if (!getenv("IK2_DENSE") && small_card) g_dense_q8 = true;   // (with --draft too: its verify's products by mv_q8p_t)
+    // (IK2_DENSE=q8 is refused past one: its FP16 scratch is one device's); with --draft too (its verify's products
+    // by mv_q8p_t, the drafter's base rows over the Q8 head)
+    if (!getenv("IK2_DENSE") && small_card) g_dense_q8 = true;
     const bool can_resident = (n_gpu == 1 || (dual() && g_ep)) && !g_pool;
     if (can_resident) {
         size_t exp_b = 0, dense_b = 0, kv_b = 0;
