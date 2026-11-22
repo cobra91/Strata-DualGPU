@@ -2465,11 +2465,46 @@ __device__ __forceinline__ int dp_ld_sys(const volatile int* p) {
     asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
     return v;
 }
-__global__ void k_dp_plan(const int* __restrict__ top, const float* __restrict__ w, const uint8_t* const* __restrict__ tab_l,
-                          int K, int C, const float* __restrict__ x, uint8_t* ring, size_t rec_bytes, int R, int l,
-                          int* seqd, volatile int* ctl, const uint8_t** blob, int* tok, int* inv, float* sg, float* su,
-                          float* wt, int* mflag) {
+// (the routing too, as k::route's warp kernel picks: an expert's rank the count of the larger sigmoid + bias, ties to the
+// lower expert; the picks ascending, their weights the sigmoids over their sum - the same operations in the same order,
+// the same bits - a launch less a visit)
+__global__ void k_dp_plan(const float* __restrict__ logits, const float* __restrict__ bias, int E, float scale,
+                          const uint8_t* const* __restrict__ tab_l, int K, int C, const float* __restrict__ x,
+                          uint8_t* ring, size_t rec_bytes, int R, int l, int* seqd, volatile int* ctl,
+                          const uint8_t** blob, int* tok, int* inv, float* sg, float* su, float* wt, int* mflag) {
     __shared__ int s_seq;
+    __shared__ float s_sig[256], s_val[256];
+    __shared__ int s_flag[256], top[16];
+    __shared__ float w[16];
+    {
+        const int e = threadIdx.x;
+        if (e < E) {
+            const float sgm = 1.0f / (1.0f + expf(-__ldg(logits + e)));
+            s_sig[e] = sgm, s_val[e] = sgm + __ldg(bias + e);
+        }
+        __syncthreads();
+        if (e < E) {
+            const float v = s_val[e];
+            int rank = 0;
+            for (int j = 0; j < E; ++j) {
+                const float vj = s_val[j];
+                rank += vj > v || (vj == v && j < e);
+            }
+            s_flag[e] = rank < K;
+        }
+        __syncthreads();
+        if (e < E && s_flag[e]) {
+            int pos = 0;
+            for (int j = 0; j < e; ++j) pos += s_flag[j];
+            top[pos] = e;
+        }
+        __syncthreads();
+        if (e == 0) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; ++k) sum += s_sig[top[k]];
+            for (int k = 0; k < K; ++k) w[k] = s_sig[top[k]] / (sum + 1e-20f) * scale;
+        }
+    }
     if (threadIdx.x == 0) {
         const int q = seqd[0] + 1;
         seqd[0] = q, seqd[1] = q, s_seq = q;
@@ -2935,9 +2970,9 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         const int S = T * c.K;
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
-        k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
-        if (dp_tok) {   // IK2_DEVPLAN: no wait for the routing (see k_dp_plan)
-            k_dp_plan<<<1, 256, 0, g_s>>>(rtop, rw, g_dp.tab + (size_t) l * c.E, c.K, C, W.xq, g_dp.rec_d, g_dp.rec_bytes,
+        if (dp_tok) {   // IK2_DEVPLAN: no wait for the routing (see k_dp_plan, which routes too)
+            k_dp_plan<<<1, 256, 0, g_s>>>(W.rlog, Ly.probs_b, c.E, c.route_scale, g_dp.tab + (size_t) l * c.E, c.K, C,
+                                          W.xq, g_dp.rec_d, g_dp.rec_bytes,
                                           g_dp.R, l, g_dp.seqd, g_dp.ctl_d, g_dp.blob, g_dp.tok, g_dp.inv, g_dp.sg,
                                           g_dp.su, g_dp.wt, g_dp.mflag);
             k::experts_gate_up_swiglu(g_dp.blob, g_dp.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, c.F, g_dp.sg,
@@ -2951,6 +2986,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
             continue;
         }
+        k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
         const bool cpu_lane = g_pool && g_overlap && !g_prof && T <= 8 && ik2::cpu::available_for(Ly.ty[0]) &&
                               ik2::cpu::available_for(Ly.ty[1]) && ik2::cpu::available_for(Ly.ty[2]);
         const bool fast_ep_token = g_ep_fast && g_ep && T <= 8 && g_overlap && !g_prof &&
@@ -4765,7 +4801,7 @@ int run(int argc, char** argv) {
     // IK2_DEVPLAN (see DevPlan): one GPU, the CPU lane, the experts' types on it, no per-expert scales
     {
         bool ok = !(getenv("IK2_DEVPLAN") && !std::atoi(getenv("IK2_DEVPLAN"))) && g_pool && n_gpu == 1 && !dual() &&
-                  !g_tp && !g_fast_want && c.K <= 16;
+                  !g_tp && !g_fast_want && c.K <= 16 && c.E <= 256;
         // (its mirror is one pool's: every layer's experts the same slot size, as ExpertCache::init groups them)
         for (int l = 1; ok && l < c.n_layer; ++l)
             ok = (M.L[l].eb[0] + M.L[l].eb[1] + M.L[l].eb[2] + 255) / 256 == (M.L[0].eb[0] + M.L[0].eb[1] + M.L[0].eb[2] + 255) / 256;

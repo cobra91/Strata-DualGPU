@@ -285,7 +285,7 @@ IK2_AVX2 float dot_iq3s_q8(const uint8_t* row, const int8_t* xq, const float* xs
             uint32_t s32;
             std::memcpy(&s32, b + 74 + 4 * ib, 4);
             const uint32_t* G = k_iq3s_grid;
-            const __m256i g = _mm256_setr_epi32(
+            const __m256i g = _mm256_setr_epi32(   // (8 scalar lookups: an AVX2 gather measured 1.5x slower on Zen 2)
                 (int) G[qs[0] | ((qh << 8) & 256)], (int) G[qs[1] | ((qh << 7) & 256)], (int) G[qs[2] | ((qh << 6) & 256)],
                 (int) G[qs[3] | ((qh << 5) & 256)], (int) G[qs[4] | ((qh << 4) & 256)], (int) G[qs[5] | ((qh << 3) & 256)],
                 (int) G[qs[6] | ((qh << 2) & 256)], (int) G[qs[7] | ((qh << 1) & 256)]);
