@@ -2455,8 +2455,8 @@ struct DevPlan {
     std::atomic<bool> run{false};
     int R = 64, K = 0, C = 0, F = 0;
     size_t rec_bytes = 0;
-    uint8_t *rec_h = nullptr, *rec_d = nullptr;   // mapped [R] records: int seq, l, ids [16], flags [16], pad; x [C]
-    float *ey_h = nullptr, *ey_d = nullptr;       // mapped [R][16][C]: the CPU's rows
+    uint8_t *rec_h = nullptr, *rec_d = nullptr;   // mapped [R] records (see k_dp_plan)
+    float *ey_h = nullptr, *ey_d = nullptr;       // mapped [R][kDpS][C]: the CPU's rows
     volatile int* ctl = nullptr;                  // mapped: [0] planned (GPU), [1] done (GPU), [2] served (host)
     int* ctl_d = nullptr;
     int* seqd = nullptr;                          // device: [0] the counter, [1] the current
@@ -2464,6 +2464,8 @@ struct DevPlan {
     const uint8_t** blob = nullptr;
     int *tok = nullptr, *inv = nullptr, *mflag = nullptr;
     float *sg = nullptr, *su = nullptr, *wt = nullptr;
+    const uint8_t** gblob = nullptr;   // (a verify window's hit groups: see k_dp_plan)
+    int *gn = nullptr, *gtok = nullptr, *grow = nullptr;
     float gcap = 0, ucap = 0;
     uint64_t cpu_experts = 0, copies = 0, skipped = 0;
     const Model* M = nullptr;
@@ -2497,18 +2499,24 @@ __device__ __forceinline__ int dp_ld_sys(const volatile int* p) {
 // (the routing too, as k::route's warp kernel picks: an expert's rank the count of the larger sigmoid + bias, ties to the
 // lower expert; the picks ascending, their weights the sigmoids over their sum - the same operations in the same order,
 // the same bits - a launch less a visit)
+// T tokens (1, or a verify window's <= kDpT): slot s = t K + k; record header ints [0] seq, [1] layer, [2] T, [8 + s]
+// the slot's expert, [72 + s] its miss flag, then x [T][C] at kDpHdr bytes.  T > 1: the hits grouped by expert on the
+// device (gblob / gn / gtok / grow, kGroupMax tokens a group, gn 0 past the last) for the grouped kernels
+constexpr int kDpT = 8, kDpS = 64, kDpHdr = 1024;
 __global__ void k_dp_plan(const float* __restrict__ logits, const float* __restrict__ bias, int E, float scale,
-                          const uint8_t* const* __restrict__ tab_l, int K, int C, const float* __restrict__ x,
+                          const uint8_t* const* __restrict__ tab_l, int K, int C, const float* __restrict__ x, int T,
                           uint8_t* ring, size_t rec_bytes, int R, int l, int* seqd, volatile int* ctl,
-                          const uint8_t** blob, int* tok, int* inv, float* sg, float* su, float* wt, int* mflag) {
+                          const uint8_t** blob, int* tok, int* inv, float* sg, float* su, float* wt, int* mflag,
+                          const uint8_t** gblob, int* gn, int* gtok, int* grow) {
     __shared__ int s_seq;
     __shared__ float s_sig[256], s_val[256];
-    __shared__ int s_flag[256], top[16];
-    __shared__ float w[16];
-    {
+    __shared__ int s_flag[256], top[kDpS];
+    __shared__ float w[kDpS];
+    for (int t = 0; t < T; ++t) {   // (each token's routing as k::route's warp kernel picks)
         const int e = threadIdx.x;
+        const float* lg = logits + (size_t) t * E;
         if (e < E) {
-            const float sgm = 1.0f / (1.0f + expf(-__ldg(logits + e)));
+            const float sgm = 1.0f / (1.0f + expf(-__ldg(lg + e)));
             s_sig[e] = sgm, s_val[e] = sgm + __ldg(bias + e);
         }
         __syncthreads();
@@ -2525,14 +2533,15 @@ __global__ void k_dp_plan(const float* __restrict__ logits, const float* __restr
         if (e < E && s_flag[e]) {
             int pos = 0;
             for (int j = 0; j < e; ++j) pos += s_flag[j];
-            top[pos] = e;
+            top[t * K + pos] = e;
         }
         __syncthreads();
         if (e == 0) {
             float sum = 0.0f;
-            for (int k = 0; k < K; ++k) sum += s_sig[top[k]];
-            for (int k = 0; k < K; ++k) w[k] = s_sig[top[k]] / (sum + 1e-20f) * scale;
+            for (int k = 0; k < K; ++k) sum += s_sig[top[t * K + k]];
+            for (int k = 0; k < K; ++k) w[t * K + k] = s_sig[top[t * K + k]] / (sum + 1e-20f) * scale;
         }
+        __syncthreads();
     }
     if (threadIdx.x == 0) {
         const int q = seqd[0] + 1;
@@ -2542,22 +2551,50 @@ __global__ void k_dp_plan(const float* __restrict__ logits, const float* __restr
         while (dp_ld_sys(ctl + 2) < q - R) strata_spin_pause();
     }
     __syncthreads();
-    const int seq = s_seq;
+    const int seq = s_seq, S = T * K;
     uint8_t* rec = ring + (size_t) (seq % R) * rec_bytes;
     int* hd = (int*) rec;
-    float* xr = (float*) (rec + 256);
-    for (int i = threadIdx.x; i < C; i += blockDim.x) xr[i] = x[i];
-    if (threadIdx.x < K) {
-        const int k = threadIdx.x, e = top[k];
+    float* xr = (float*) (rec + kDpHdr);
+    for (int i = threadIdx.x; i < T * C; i += blockDim.x) xr[i] = x[i];
+    if (threadIdx.x < S) {
+        const int s = threadIdx.x, e = top[s];
         const uint8_t* p = tab_l[e];
-        blob[k] = p, tok[k] = 0, inv[k] = k, sg[k] = 1.0f, su[k] = 1.0f, wt[k] = w[k];
-        mflag[k] = p == nullptr;
-        hd[2 + k] = e, hd[18 + k] = p == nullptr;
+        blob[s] = p, tok[s] = s / K, inv[s] = s, sg[s] = 1.0f, su[s] = 1.0f, wt[s] = w[s];
+        mflag[s] = p == nullptr;
+        hd[8 + s] = e, hd[72 + s] = p == nullptr;
+    }
+    if (T > 1) {   // the hits' groups: a group an expert (its first slot leads), its slots in their order
+        __shared__ int s_gi[kDpS];
+        const int sl = threadIdx.x;
+        if (sl < kDpS) gn[sl] = 0;
+        int lead = -1, pos = 0;
+        if (sl < S && tab_l[top[sl]]) {
+            const int e = top[sl];
+            lead = sl;
+            for (int j = 0; j < sl; ++j)
+                if (top[j] == e) { if (lead == sl) lead = j; ++pos; }
+            if (lead == sl) {   // (its index: the leaders before it)
+                int g = 0;
+                for (int j = 0; j < sl; ++j) {
+                    bool lj = tab_l[top[j]] != nullptr;
+                    for (int i = 0; lj && i < j; ++i) lj = top[i] != top[j];
+                    g += lj;
+                }
+                s_gi[sl] = g;
+                gblob[g] = tab_l[e];
+            }
+        }
+        __syncthreads();
+        if (lead >= 0 && pos < k::kGroupMax) {
+            const int gi = s_gi[lead];
+            gtok[gi * k::kGroupMax + pos] = sl / K, grow[gi * k::kGroupMax + pos] = sl;
+            atomicAdd(&gn[gi], 1);
+        }
     }
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) {
-        hd[1] = l;
+        hd[1] = l, hd[2] = T;
         __threadfence_system();
         *(volatile int*) &hd[0] = seq;
         __threadfence_system();
@@ -2584,8 +2621,11 @@ __global__ void k_dp_merge(float* __restrict__ y, const float* ey, const int* __
                            const int* __restrict__ seqd, int C, int R) {
     const int k = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
     if (!mflag[k] || i >= C) return;
-    y[(size_t) k * C + i] = __ldcv(ey + ((size_t) (seqd[1] % R) * 16 + k) * C + i);
+    y[(size_t) k * C + i] = __ldcv(ey + ((size_t) (seqd[1] % R) * kDpS + k) * C + i);
 }
+// IK2_DP_MULTI=1: a verify window (2 .. kDpT tokens) through the plan too - no host sync a visit; measured no faster
+// than the host-planned path on 8 GB (the window's CPU misses bound it) and drafting slower beside its threads
+bool g_dp_multi = getenv("IK2_DP_MULTI") && std::atoi(getenv("IK2_DP_MULTI"));
 bool g_dp_time = getenv("IK2_DP_TIME") && std::atoi(getenv("IK2_DP_TIME"));
 double g_dp_t0 = 0, g_dp_t_enq = 0, g_dp_t_tok = 0;
 long g_dp_n = 0;
@@ -2682,7 +2722,7 @@ void dp_quiesce() {
 // the host's side: each record in order, its misses on the CPU lane, then the counter
 void dp_service() {
     const Model& M = *g_dp.M;
-    static ik2::cpu::BatchJob jobs[16];
+    static ik2::cpu::BatchJob jobs[kDpS];
     int next = 1;
     while (g_dp.run.load(std::memory_order_relaxed)) {
         unsigned spin = 0;
@@ -2704,26 +2744,40 @@ void dp_service() {
         std::atomic_thread_fence(std::memory_order_acquire);
         const uint8_t* rec = g_dp.rec_h + (size_t) (next % g_dp.R) * g_dp.rec_bytes;
         const int* hd = (const int*) rec;
-        const float* xr = (const float*) (rec + 256);
+        const float* xr = (const float*) (rec + kDpHdr);
         const Layer& Ly = M.L[hd[1]];
-        float* ey = g_dp.ey_h + (size_t) (next % g_dp.R) * 16 * g_dp.C;
+        const int T = std::max(1, std::min(kDpT, hd[2])), S = T * g_dp.K;
+        float* ey = g_dp.ey_h + (size_t) (next % g_dp.R) * kDpS * g_dp.C;
         const uint64_t t = ++g_dp.tick;
-        for (int k = 0; k < g_dp.K; ++k)   // the hits' recency
-            if (!hd[18 + k]) {
-                const int s2 = g_dp.loc[hd[1] * g_dp.E + hd[2 + k]];
+        for (int k = 0; k < S; ++k)   // the hits' recency
+            if (!hd[72 + k]) {
+                const int s2 = g_dp.loc[hd[1] * g_dp.E + hd[8 + k]];
                 if (s2 >= 0) g_dp.last[s2] = t;
             }
-        int n = 0;
-        for (int k = 0; k < g_dp.K; ++k) {
-            if (!hd[18 + k]) continue;
-            const int e = hd[2 + k];
+        int n = 0;   // the misses, an expert's tokens a job (its weights read once for them)
+        int ej[kDpS];
+        for (int k = 0; k < S; ++k) {
+            if (!hd[72 + k]) continue;
+            const int e = hd[8 + k];
+            const float* x = xr + (size_t) (k / g_dp.K) * g_dp.C;
+            float* y = ey + (size_t) k * g_dp.C;
+            int j = 0;
+            while (j < n && !(ej[j] == e && jobs[j].nt < 8)) ++j;
+            if (j < n) {
+                auto& J = jobs[j];
+                J.xt[J.nt] = x, J.yt[J.nt] = y;
+                ++J.nt;
+                continue;
+            }
+            ej[n] = e;
             auto& J = jobs[n++];
+            J = ik2::cpu::BatchJob{};
             J.gate = Ly.host[0] + (size_t) e * Ly.stride[0];
             J.up = Ly.host[1] + (size_t) e * Ly.stride[1];
             J.down = Ly.host[2] + (size_t) e * Ly.stride[2];
             J.tg = Ly.ty[0], J.tu = Ly.ty[1], J.td = Ly.ty[2];
-            J.x = xr, J.sg = 1.0f, J.su = 1.0f;
-            J.y = ey + (size_t) k * g_dp.C;
+            J.x = x, J.sg = 1.0f, J.su = 1.0f;
+            J.y = y;
         }
         // the misses on the CPU and published first (the GPU waits for them), then their copies for the next tokens
         ik2::cpu::experts_batch(jobs, n, g_dp.C, g_dp.F, g_dp.gcap, g_dp.ucap);
@@ -2731,19 +2785,18 @@ void dp_service() {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         g_dp.ctl[2] = next;
         ++next;
-        for (int k = 0; k < g_dp.K; ++k)
-            if (hd[18 + k]) dp_request(hd[1], hd[2 + k]);
+        for (int j = 0; j < n; ++j) dp_request(hd[1], ej[j]);
         if (n) dp_advance(false);
     }
 }
 void dp_init(const Model& M) {
     const Config& c = M.c;
     g_dp.M = &M, g_dp.K = c.K, g_dp.C = c.C, g_dp.F = c.F, g_dp.gcap = c.gate_cap, g_dp.ucap = c.up_cap;
-    g_dp.rec_bytes = 256 + (size_t) c.C * 4;
+    g_dp.rec_bytes = kDpHdr + (size_t) kDpT * c.C * 4;
     CU(cudaHostAlloc((void**) &g_dp.rec_h, g_dp.rec_bytes * g_dp.R, cudaHostAllocMapped));
     std::memset(g_dp.rec_h, 0, g_dp.rec_bytes * g_dp.R);
     CU(cudaHostGetDevicePointer((void**) &g_dp.rec_d, g_dp.rec_h, 0));
-    CU(cudaHostAlloc((void**) &g_dp.ey_h, (size_t) g_dp.R * 16 * c.C * 4, cudaHostAllocMapped));
+    CU(cudaHostAlloc((void**) &g_dp.ey_h, (size_t) g_dp.R * kDpS * c.C * 4, cudaHostAllocMapped));
     CU(cudaHostGetDevicePointer((void**) &g_dp.ey_d, g_dp.ey_h, 0));
     int* ct = nullptr;
     CU(cudaHostAlloc((void**) &ct, 64, cudaHostAllocMapped));
@@ -2762,9 +2815,11 @@ void dp_alloc(const Config& c) {
     g_dp.seqd = dalloc<int>(2);
     CU(cudaMemset(g_dp.seqd, 0, 8));
     g_dp.tab = dalloc<const uint8_t*>((size_t) c.n_layer * c.E);
-    g_dp.blob = dalloc<const uint8_t*>(16);
-    g_dp.tok = dalloc<int>(16), g_dp.inv = dalloc<int>(16), g_dp.mflag = dalloc<int>(16);
-    g_dp.sg = dalloc<float>(16), g_dp.su = dalloc<float>(16), g_dp.wt = dalloc<float>(16);
+    g_dp.blob = dalloc<const uint8_t*>(kDpS);
+    g_dp.tok = dalloc<int>(kDpS), g_dp.inv = dalloc<int>(kDpS), g_dp.mflag = dalloc<int>(kDpS);
+    g_dp.sg = dalloc<float>(kDpS), g_dp.su = dalloc<float>(kDpS), g_dp.wt = dalloc<float>(kDpS);
+    g_dp.gblob = dalloc<const uint8_t*>(kDpS), g_dp.gn = dalloc<int>(kDpS);
+    g_dp.gtok = dalloc<int>((size_t) kDpS * k::kGroupMax), g_dp.grow = dalloc<int>((size_t) kDpS * k::kGroupMax);
     g_dp.emb = dalloc<float>(c.C);
 }
 // the cache's residency into g_dp.tab (the GPU idle: the copies landed)
@@ -2863,7 +2918,9 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
              std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp) {
     kv_ensure(M, pos0 + T);
     const Config& c = M.c;
-    const bool dp_tok = g_dp.ok && T == 1 && dump.empty() && !g_prof && !g_rec && !g_taps && !g_trace && g_pop.empty();
+    // (a decode token; or a verify window of <= kDpT tokens - its taps and its convs' records as forward() keeps them)
+    const bool dp_tok = g_dp.ok && dump.empty() && !g_prof && !g_trace && g_pop.empty() &&
+                        ((T == 1 && !g_rec && !g_taps) || (T > 1 && T <= kDpT && T * c.K <= kDpS && g_dp_multi));
     if (dp_tok && g_dp_time && !g_tg_capturing) g_dp_t0 = now();
     if (dp_tok && g_dp.planned > g_dp_reset_at && !g_tg_capturing) {   // (the plans' counters back to 0, every record served, before a wrap)
         CU(cudaDeviceSynchronize());
@@ -3021,16 +3078,24 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
         if (dp_tok) {   // IK2_DEVPLAN: no wait for the routing (see k_dp_plan, which routes too)
+            const int S1 = T * c.K;
             k_dp_plan<<<1, 256, 0, g_s>>>(W.rlog, Ly.probs_b, c.E, c.route_scale, g_dp.tab + (size_t) l * c.E, c.K, C,
-                                          W.xq, g_dp.rec_d, g_dp.rec_bytes,
+                                          W.xq, T, g_dp.rec_d, g_dp.rec_bytes,
                                           g_dp.R, l, g_dp.seqd, g_dp.ctl_d, g_dp.blob, g_dp.tok, g_dp.inv, g_dp.sg,
-                                          g_dp.su, g_dp.wt, g_dp.mflag);
-            k::experts_gate_up_swiglu(g_dp.blob, g_dp.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, c.F, g_dp.sg,
-                                      g_dp.su, c.gate_cap, c.up_cap, W.h16, g_s, 1);
-            k::experts_down(g_dp.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
-            k_dp_wait<<<1, 32, 0, g_s>>>(g_dp.mflag, c.K, g_dp.seqd, g_dp.ctl_d);
-            k_dp_merge<<<dim3((unsigned) ((C + 255) / 256), (unsigned) c.K), 256, 0, g_s>>>(W.y32, g_dp.ey_d, g_dp.mflag,
-                                                                                           g_dp.seqd, C, g_dp.R);
+                                          g_dp.su, g_dp.wt, g_dp.mflag, g_dp.gblob, g_dp.gn, g_dp.gtok, g_dp.grow);
+            if (T == 1) {
+                k::experts_gate_up_swiglu(g_dp.blob, g_dp.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, c.F, g_dp.sg,
+                                          g_dp.su, c.gate_cap, c.up_cap, W.h16, g_s, 1);
+                k::experts_down(g_dp.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+            } else {   // (a verify window: the hits' groups, an expert's weights read once for its tokens)
+                k::experts_gate_up_swiglu_g(g_dp.gblob, g_dp.gn, g_dp.gtok, g_dp.grow, S1, Ly.ty[0], Ly.ty[1], Ly.eb[0],
+                                            W.xq, C, c.F, g_dp.sg, g_dp.su, c.gate_cap, c.up_cap, W.h16, g_s, T);
+                k::experts_down_g(g_dp.gblob, g_dp.gn, g_dp.grow, S1, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F,
+                                  W.y32, g_s, S1);
+            }
+            k_dp_wait<<<1, 32, 0, g_s>>>(g_dp.mflag, S1, g_dp.seqd, g_dp.ctl_d);
+            k_dp_merge<<<dim3((unsigned) ((C + 255) / 256), (unsigned) S1), 256, 0, g_s>>>(W.y32, g_dp.ey_d, g_dp.mflag,
+                                                                                         g_dp.seqd, C, g_dp.R);
             k::moe_combine_f32(W.y32, g_dp.inv, g_dp.wt, T, c.K, C, W.tmp, false, g_s);
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
             k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
