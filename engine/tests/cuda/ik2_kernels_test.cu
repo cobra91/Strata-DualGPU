@@ -2838,6 +2838,26 @@ void bench_experts() {
     timeit("down IQ4_NL x8", (double) S * C * rb_dn, [&](int i) {
         k::experts_down(dtab + (size_t) (i % 16) * S, S, k::kIQ4_NL, 2 * eb0, dh, C, F, dy, 0);
     });
+    {   // the dense Q8 products: one token, and T tokens' (a verify window's)
+        for (int N : {4608, 65536}) {
+            const int Kd = 2304;
+            std::vector<int8_t> hq((size_t) N * Kd);
+            for (auto& v : hq) v = (int8_t) (rng() % 255 - 127);
+            std::vector<uint16_t> hd((size_t) N * Kd / 32, f2h_host(0.01f));
+            int8_t* dq = dev(hq);
+            uint16_t* ddq = dev(hd);
+            auto xx = fvec((size_t) 8 * Kd);
+            float *dxx = dev(xx), *dyy = dev_n<float>((size_t) 8 * N);
+            char nm[64];
+            std::snprintf(nm, sizeof nm, "mv_q8p N %d T 1", N);
+            timeit(nm, (double) N * Kd, [&](int) { k::mv_q8p(dq, ddq, N, Kd, dxx, dyy, 0); });
+            for (int T : {2, 4, 8}) {
+                std::snprintf(nm, sizeof nm, "mv_q8p_t N %d T %d", N, T);
+                timeit(nm, (double) N * Kd, [&](int) { k::mv_q8p_t(dq, ddq, N, Kd, dxx, T, dyy, N, 0); });
+            }
+            cudaFree(dq), cudaFree(ddq), cudaFree(dxx), cudaFree(dyy);
+        }
+    }
     CU(cudaDeviceSynchronize());
     cudaFree(db), cudaFree(dtab), cudaFree(dtok), cudaFree(dx), cudaFree(dh), cudaFree(dy);
 }

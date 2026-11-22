@@ -3820,6 +3820,61 @@ __global__ void mv_q8p_t_kernel(const int8_t* __restrict__ q, const uint16_t* __
         }
     }
 }
+// ... the rows 4 a warp and x staged in shared memory a 256-value chunk at a time for the block's 32 rows: an x load
+// serves 4 rows (the T tokens' x read once a block, not once a row)
+template <int TT>
+__global__ void __launch_bounds__(256) mv_q8p_t4_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d,
+                                                        int N, int K, const float* __restrict__ x, int T, float* y, int ldy) {
+    constexpr int R = 4, KC = 256;
+    __shared__ __align__(16) float xs[TT][KC];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int row0 = (blockIdx.x * 8 + warp) * R;
+    float acc[R][TT];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int t = 0; t < TT; ++t) acc[r][t] = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += KC) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < TT * (KC / 4); i += 256) {
+            const int t = i / (KC / 4), c4 = i % (KC / 4);
+            ((float4*) xs[t])[c4] = t < T ? __ldg((const float4*) (x + (size_t) t * K + k0) + c4) : make_float4(0, 0, 0, 0);
+        }
+        __syncthreads();
+        if (row0 >= N) continue;
+#pragma unroll
+        for (int it = 0; it < KC / 128; ++it) {
+            const int kk = k0 + it * 128 + lane * 4;   // (the lane's 4 values)
+            float w[R][4];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const int rr = min(row0 + r, N - 1);
+                const uint32_t wv = __ldg((const uint32_t*) (q + (size_t) rr * K + kk));
+                const float dv = h2f(__ldg(d + (size_t) rr * (K >> 5) + (kk >> 5)));
+                w[r][0] = dv * (float) (int8_t) (wv & 0xFFu), w[r][1] = dv * (float) (int8_t) ((wv >> 8) & 0xFFu);
+                w[r][2] = dv * (float) (int8_t) ((wv >> 16) & 0xFFu), w[r][3] = dv * (float) (int8_t) (wv >> 24);
+            }
+#pragma unroll
+            for (int t = 0; t < TT; ++t) {
+                if (t < T) {
+                    const float4 xv = ((const float4*) xs[t])[it * 32 + lane];
+#pragma unroll
+                    for (int r = 0; r < R; ++r) acc[r][t] += w[r][0] * xv.x + w[r][1] * xv.y + w[r][2] * xv.z + w[r][3] * xv.w;
+                }
+            }
+        }
+    }
+    if (row0 >= N) return;
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int t = 0; t < TT; ++t) {
+            if (t < T) {
+                const float a = wsum(acc[r][t]);
+                if (lane == 0 && row0 + r < N) y[(size_t) t * ldy + row0 + r] = a;
+            }
+        }
+}
 __global__ void decode_q8p_f16_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, size_t n,
                                       uint16_t* __restrict__ out) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -5624,6 +5679,15 @@ void mv_q8p_t(const int8_t* q, const uint16_t* d, int N, int K, const float* x, 
     if (K % 128 || T > 8 || ((uintptr_t) q & 3) || ((uintptr_t) x & 15)) {
         std::fprintf(stderr, "ik2::k::mv_q8p_t: K %d, T %d, or q / x not aligned\n", K, T);
         std::abort();
+    }
+    static const bool v4 = !getenv("IK2_Q8_T4") || std::atoi(getenv("IK2_Q8_T4"));
+    if (v4 && K % 256 == 0) {
+        const unsigned g4 = (unsigned) ((N + 31) / 32);
+        if (T <= 2) mv_q8p_t4_kernel<2><<<g4, 256, 0, s>>>(q, d, N, K, x, T, y, ldy);
+        else if (T <= 4) mv_q8p_t4_kernel<4><<<g4, 256, 0, s>>>(q, d, N, K, x, T, y, ldy);
+        else mv_q8p_t4_kernel<8><<<g4, 256, 0, s>>>(q, d, N, K, x, T, y, ldy);
+        check("mv_q8p_t");
+        return;
     }
     const unsigned g = (unsigned) ((N + 3) / 4);
     if (T <= 2) mv_q8p_t_kernel<4, 2><<<g, 128, 0, s>>>(q, d, N, K, x, T, y, ldy);

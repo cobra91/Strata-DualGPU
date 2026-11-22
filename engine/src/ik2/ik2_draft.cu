@@ -156,6 +156,8 @@ struct Drafter {
     cublasHandle_t blas;
     cudaStream_t s;
     size_t vram = 0;
+    bool h16 = false;   // (before sm_80: no BF16 tensor cores - the GEMMs' weights and inputs in FP16, cuBLAS's BF16 path
+                        //  is a slow fallback there: 555 us a call)
     // work
     float *x, *res, *h, *q, *kk, *vv, *o, *gu, *f_rnn, *base, *state, *latent, *proj, *scratch, *mix;
     uint16_t *hb, *hb2, *rnn_in;
@@ -196,6 +198,35 @@ __global__ void pack_f16_strided_kernel(const float* src, int m, int n_rows, int
     if (i < m) dst[(size_t) r * n_rows + r0 + i] = __half_as_ushort(__float2half_rn(src[(size_t) r * m + i]));
 }
 
+__global__ void bf16_to_f16_kernel(const uint16_t* src, size_t n, uint16_t* dst) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __half_as_ushort(__float2half_rn(__uint_as_float((uint32_t) src[i] << 16)));
+}
+__global__ void silu_mul_f16_kernel(const float* gu, int T, int F, uint16_t* out) {   // as silu_mul_bf16, FP16 out
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t) T * F) return;
+    const size_t t = i / F, f = i % F;
+    const float g = gu[t * 2 * F + f], u = gu[t * 2 * F + F + f];
+    out[i] = __half_as_ushort(__float2half_rn(g / (1.0f + expf(-g)) * u));
+}
+// an activation in the GEMMs' input type: BF16, or FP16 (h16)
+void to_in16(Drafter* d, const float* x, size_t n, uint16_t* y) {
+    if (d->h16) k::to_f16(x, n, y, d->s);
+    else k::to_bf16(x, n, y, d->s);
+}
+// a GEMM's weights (BF16 in the file): FP16 on the device for h16
+uint16_t* up16w(Drafter* d, const std::vector<uint16_t>& v) {
+    uint16_t* p = dalloc<uint16_t>(v.size());
+    if (!d->h16) {
+        cu(cudaMemcpy(p, v.data(), v.size() * 2, cudaMemcpyHostToDevice), "upload");
+    } else {
+        std::vector<uint16_t> h(v.size());
+        for (size_t i = 0; i < v.size(); ++i) h[i] = __half_as_ushort(__float2half_rn(bf(v[i])));
+        cu(cudaMemcpy(p, h.data(), h.size() * 2, cudaMemcpyHostToDevice), "upload");
+    }
+    d->vram += v.size() * 2;
+    return p;
+}
 uint16_t* up16(Drafter* d, const std::vector<uint16_t>& v) {
     uint16_t* p = dalloc<uint16_t>(v.size());
     cu(cudaMemcpy(p, v.data(), v.size() * 2, cudaMemcpyHostToDevice), "upload");
@@ -214,7 +245,8 @@ float* up32(Drafter* d, const std::vector<uint16_t>& v) {
 // Y [T][N] (ldy) = X [T][K] BF16 . W [N][K]^T BF16, F32 sums
 void gemm_bf(Drafter* d, const uint16_t* W, int N, int K, const uint16_t* X, int T, float* Y, int ldy) {
     const float one = 1.0f, zero = 0.0f;
-    cb(cublasGemmEx(d->blas, CUBLAS_OP_T, CUBLAS_OP_N, N, T, K, &one, W, CUDA_R_16BF, K, X, CUDA_R_16BF, K, &zero, Y,
+    const cudaDataType ty = d->h16 ? CUDA_R_16F : CUDA_R_16BF;
+    cb(cublasGemmEx(d->blas, CUBLAS_OP_T, CUBLAS_OP_N, N, T, K, &one, W, ty, K, X, ty, K, &zero, Y,
                     CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
        "gemm_bf");
 }
@@ -227,7 +259,7 @@ void gemm_h(Drafter* d, const uint16_t* W, int N, int K, const void* X, int T, f
 
 void layer_attn(Drafter* d, DLayer& l, int P, float* out) {
     const int T = kBlock, HD = d->H * 128, KD = d->KV * 128;
-    k::to_bf16(d->h, (size_t) T * d->C, d->hb, d->s);
+    to_in16(d, d->h, (size_t) T * d->C, d->hb);
     gemm_bf(d, l.wq, HD, d->C, d->hb, T, d->q, HD);
     gemm_bf(d, l.wk, KD, d->C, d->hb, T, d->kk, KD);
     gemm_bf(d, l.wv, KD, d->C, d->hb, T, d->vv, KD);
@@ -240,15 +272,18 @@ void layer_attn(Drafter* d, DLayer& l, int P, float* out) {
     const int k_lo = l.local ? std::max(0, P - 1023) : 0;
     k::draft_attn(d->q, l.kc, l.vc, k_lo, P, d->kk, d->vv, T, d->H, d->KV, 1.0f / std::sqrt(128.0f), d->scratch, d->o,
                   d->s);
-    k::to_bf16(d->o, (size_t) T * HD, d->hb, d->s);
+    to_in16(d, d->o, (size_t) T * HD, d->hb);
     gemm_bf(d, l.wo, d->C, HD, d->hb, T, out, d->C);
 }
 
 void layer_mlp(Drafter* d, DLayer& l, float* out) {
     const int T = kBlock;
-    k::to_bf16(d->h, (size_t) T * d->C, d->hb, d->s);
+    to_in16(d, d->h, (size_t) T * d->C, d->hb);
     gemm_bf(d, l.wgu, 2 * d->F, d->C, d->hb, T, d->gu, 2 * d->F);
-    k::silu_mul_bf16(d->gu, T, d->F, d->hb2, d->s);
+    if (d->h16)
+        silu_mul_f16_kernel<<<(unsigned) (((size_t) T * d->F + 255) / 256), 256, 0, d->s>>>(d->gu, T, d->F, d->hb2);
+    else
+        k::silu_mul_bf16(d->gu, T, d->F, d->hb2, d->s);
     gemm_bf(d, l.wd, d->C, d->F, d->hb2, T, out, d->C);
 }
 
@@ -264,6 +299,12 @@ int taps(const Drafter* d) { return d ? d->n_taps : 8; }
 Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cudaStream_t s) {
     const StFile f = st_open(path);
     auto* d = new Drafter;
+    {
+        int dev = 0, mj = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, dev);
+        d->h16 = getenv("IK2_DRAFT_F16") ? std::atoi(getenv("IK2_DRAFT_F16")) != 0 : mj < 8;
+    }
     d->C = C, d->ctx = ctx, d->blas = blas, d->s = s;
 
     auto find_tensor = [&](const std::string& n1, const std::string& n2 = "") -> std::string {
@@ -332,19 +373,19 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
         l.q_norm = up32(d, st_bf16(f, b + "self_attn.q_norm.weight", {128}));
         l.k_norm = up32(d, st_bf16(f, b + "self_attn.k_norm.weight", {128}));
         l.k_norm_ctx = up32(d, st_bf16(f, b + "self_attn.k_norm_ctx.weight", {128}));
-        l.wq = up16(d, st_bf16(f, b + "self_attn.q_proj.weight", {H * 128, C}));
-        l.wk = up16(d, st_bf16(f, b + "self_attn.k_proj.weight", {KV * 128, C}));
-        l.wv = up16(d, st_bf16(f, b + "self_attn.v_proj.weight", {KV * 128, C}));
-        l.wo = up16(d, st_bf16(f, b + "self_attn.o_proj.weight", {C, H * 128}));
-        l.wkc = up16(d, st_bf16(f, b + "self_attn.k_proj_ctx.weight", {KV * 128, C}));
-        l.wvc = up16(d, st_bf16(f, b + "self_attn.v_proj_ctx.weight", {KV * 128, C}));
+        l.wq = up16w(d, st_bf16(f, b + "self_attn.q_proj.weight", {H * 128, C}));
+        l.wk = up16w(d, st_bf16(f, b + "self_attn.k_proj.weight", {KV * 128, C}));
+        l.wv = up16w(d, st_bf16(f, b + "self_attn.v_proj.weight", {KV * 128, C}));
+        l.wo = up16w(d, st_bf16(f, b + "self_attn.o_proj.weight", {C, H * 128}));
+        l.wkc = up16w(d, st_bf16(f, b + "self_attn.k_proj_ctx.weight", {KV * 128, C}));
+        l.wvc = up16w(d, st_bf16(f, b + "self_attn.v_proj_ctx.weight", {KV * 128, C}));
         {
             auto g = st_bf16(f, b + "mlp.gate_proj.weight", {F, C});
             const auto u = st_bf16(f, b + "mlp.up_proj.weight", {F, C});
             g.insert(g.end(), u.begin(), u.end());   // gate's rows, then up's
-            l.wgu = up16(d, g);
+            l.wgu = up16w(d, g);
         }
-        l.wd = up16(d, st_bf16(f, b + "mlp.down_proj.weight", {C, F}));
+        l.wd = up16w(d, st_bf16(f, b + "mlp.down_proj.weight", {C, F}));
         l.kc = dalloc<float>((size_t) ctx * KV * 128);
         l.vc = dalloc<float>((size_t) ctx * KV * 128);
         d->vram += (size_t) ctx * KV * 128 * 8;
@@ -361,7 +402,7 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     d->mk_dflare = up32(d, st_bf16(f, mk_dflare_name, {C}));
 
     d->w1 = up16(d, st_bf16(f, w1_name, {d->V, R}));
-    d->rnn_w = up16(d, st_bf16(f, "markov_head.rnn_proj.weight", {3 * R, 2 * R + 2 * C}));
+    d->rnn_w = up16w(d, st_bf16(f, "markov_head.rnn_proj.weight", {3 * R, 2 * R + 2 * C}));
     d->rnn_b = up32(d, st_bf16(f, "markov_head.rnn_proj.bias", {3 * R}));
     d->hout_w = st_bf16(f, "markov_head.hidden_out.weight", {C, R});
     d->hout_b = st_bf16(f, "markov_head.hidden_out.bias", {C});
@@ -430,7 +471,7 @@ void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos
             const int li = (int) (&l - d->L.data());
             k::mix_rms(taps + (size_t) (r0 + a) * C, n_taps, (size_t) ld * C, n, C, d->alpha + li * n_taps, l.dflare,
                        d->eps, d->mix, d->s);
-            k::to_bf16(d->mix, (size_t) n * C, d->hb, d->s);
+            to_in16(d, d->mix, (size_t) n * C, d->hb);
             float* kd = l.kc + (size_t) (pos0 + a) * KD;
             gemm_bf(d, l.wkc, KD, C, d->hb, n, kd, KD);
             gemm_bf(d, l.wvc, KD, C, d->hb, n, l.vc + (size_t) (pos0 + a) * KD, KD);
@@ -478,6 +519,9 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
     cu(cudaMemsetAsync(d->state, 0, d->R * 4, d->s), "state");
     for (int t = 0; t < T - 1; ++t) {
         k::rnn_inputs(d->state, d->w1, d->toks + t, d->h + (size_t) (t + 1) * C, d->f_rnn, d->R, C, d->rnn_in, d->s);
+        if (d->h16)   // (rnn_inputs writes BF16; the GEMM takes FP16)
+            bf16_to_f16_kernel<<<(unsigned) ((2 * d->R + 2 * C + 255) / 256), 256, 0, d->s>>>(d->rnn_in, 2 * d->R + 2 * C,
+                                                                                             d->rnn_in);
         gemm_bf(d, d->rnn_w, 3 * d->R, 2 * d->R + 2 * C, d->rnn_in, 1, d->proj, 3 * d->R);
         k::rnn_gates(d->proj, d->rnn_b, d->R, d->state, d->latent, d->s);
         k::argmax_gemv_f16(d->fold_w, n_rows, d->latent, d->base + (size_t) t * n_rows, d->fold_b, d->R, n_vocab,

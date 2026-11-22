@@ -5777,7 +5777,8 @@ int run(int argc, char** argv) {
         auto argmax_row = [&](const float* r) { return (int) (std::max_element(r, r + c.n_vocab) - r); };
         int anchor = first_best, P = (int) prompt.size();
         out.push_back(anchor);
-        const int B = ik2::draft::kBlock;
+        // the verify window: IK2_DRAFT_B tokens (2 .. kBlock: the anchor and B - 1 of the 7 drafts)
+        const int B = std::max(2, std::min(ik2::draft::kBlock, getenv("IK2_DRAFT_B") ? std::atoi(getenv("IK2_DRAFT_B")) : ik2::draft::kBlock));
         const bool margin_check = getenv("IK2_MARGIN") != nullptr;
         while ((int) out.size() < gen && P + B <= ctx) {
             use_dev(0);
