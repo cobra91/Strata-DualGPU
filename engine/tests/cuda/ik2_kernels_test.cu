@@ -227,8 +227,9 @@ void test_conv() {
 }
 
 void test_attn_res() {
-    const int T = 9, C = 4608;
-    for (int n : {1, 2, 9})
+    for (int T : {9, 1})
+    for (int C : {4608, 2304})
+    for (int n : {1, 2, 9, 12})
         for (int nq : {1, 3}) {
             std::vector<std::vector<float>> st(n);
             k::ResStates rs{};
@@ -263,7 +264,7 @@ void test_attn_res() {
                 }
             }
             char name[64];
-            std::snprintf(name, sizeof name, "attn_res %d states, %d queries", n, nq);
+            std::snprintf(name, sizeof name, "attn_res T %d C %d, %d states, %d queries", T, C, n, nq);
             expect(name, host(dout, want.size()), want, 1e-4, 1e-6);
             for (auto* p : ds) cudaFree(p);
             cudaFree(dq), cudaFree(dout);
@@ -2422,8 +2423,10 @@ void test_fp8_kv() {
 
 void test_round6() {
     // 1. attn_res_rms_f16: C=4608 (vectorized float4/576-thread) and odd C=517 (scalar fallback), with optional w / y32
-    for (int C : {4608, 517}) {
-        const int T = 7, n = 9;
+    // (and T 1 at C 2304 / 4608: the decode's multi-block kernel, 12 states)
+    for (int C : {4608, 517, 2304, -4608}) {
+        const int T = C > 2304 || C == 517 ? 7 : 1, n = C > 0 && T == 7 ? 9 : 12;
+        C = C < 0 ? -C : C;
         for (int nq : {1, 3}) {
             std::vector<std::vector<float>> st(n);
             k::ResStates rs{};
@@ -2484,10 +2487,10 @@ void test_round6() {
                 std::vector<float> got16(want_y.size());
                 for (size_t j = 0; j < want_y.size(); ++j) got16[j] = h2f_host(h16[j]);
                 char label[96];
-                std::snprintf(label, sizeof label, "attn_res_rms_f16 C=%d nq=%d qi=%d y16", C, nq, qi);
+                std::snprintf(label, sizeof label, "attn_res_rms_f16 C=%d T=%d nq=%d qi=%d y16", C, T, nq, qi);
                 expect(label, got16, want_y, 2e-3, 1e-4);
                 if (dy32[qi]) {
-                    std::snprintf(label, sizeof label, "attn_res_rms_f16 C=%d nq=%d qi=%d y32", C, nq, qi);
+                    std::snprintf(label, sizeof label, "attn_res_rms_f16 C=%d T=%d nq=%d qi=%d y32", C, T, nq, qi);
                     expect(label, host(dy32[qi], want_y.size()), want_y, 1e-4, 5e-6);
                 }
             }
@@ -2920,6 +2923,46 @@ void bench_experts() {
             }
             cudaFree(dq), cudaFree(ddq), cudaFree(dxx), cudaFree(dyy);
         }
+    }
+    {   // a decode token's block residual (attn_res: n states of C, nq queries) and RMS
+        const int C2 = 2304;
+        std::vector<float*> sts;
+        k::ResStates rs{};
+        for (int i = 0; i < k::kResMax; ++i) {
+            auto v = fvec(C2);
+            sts.push_back(dev(v));
+            rs.st[i] = sts.back();
+        }
+        auto qv = fvec((size_t) 3 * C2);
+        float *dq = dev(qv), *out = dev_n<float>((size_t) 3 * C2);
+        for (int nst : {4, 8, 12})
+            for (int nq : {1, 3}) {
+                char nm[64];
+                std::snprintf(nm, sizeof nm, "attn_res n %d nq %d", nst, nq);
+                cudaStream_t cs;
+                CU(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking));
+                cudaGraph_t gr;
+                cudaGraphExec_t ge;
+                CU(cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal));
+                for (int r = 0; r < 100; ++r) { if (getenv("IK2_EMPTY")) k::softcap(out, 4, 30.0f, cs); else k::attn_res(rs, nst, dq, nq, 1, C2, 1e-6f, out, cs); }
+                CU(cudaStreamEndCapture(cs, &gr));
+                CU(cudaGraphInstantiate(&ge, gr, 0));
+                for (int r = 0; r < 20; ++r) CU(cudaGraphLaunch(ge, cs));
+                CU(cudaStreamSynchronize(cs));
+                cudaEvent_t a0, a1;
+                CU(cudaEventCreate(&a0));
+                CU(cudaEventCreate(&a1));
+                CU(cudaEventRecord(a0, cs));
+                for (int r = 0; r < 50; ++r) CU(cudaGraphLaunch(ge, cs));
+                CU(cudaEventRecord(a1, cs));
+                CU(cudaEventSynchronize(a1));
+                float ms = 0;
+                CU(cudaEventElapsedTime(&ms, a0, a1));
+                std::printf("bench %-28s %8.2f us (in a graph)\n", nm, ms * 1e3 / 5000);
+                cudaGraphExecDestroy(ge), cudaGraphDestroy(gr), cudaStreamDestroy(cs);
+            }
+        for (float* p : sts) cudaFree(p);
+        cudaFree(dq), cudaFree(out);
     }
     {   // a decode token's attention over nk keys (Inkling-2-Mini: 24 heads on 8 K / V heads, D 128)
         const int H = 24, KV = 8, D = 128, KD = KV * D, d_rel = 16;

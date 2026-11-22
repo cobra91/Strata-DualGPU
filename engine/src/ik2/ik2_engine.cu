@@ -3936,6 +3936,27 @@ void tg_capture(Model& M, int pos, int slot) {
     cudaGraph_t g;
     CU(cudaStreamEndCapture(g_s, &g));
     g_tg_capturing = false;
+    if (getenv("IK2_TG_NODES")) {   // (debug: the token graph's node count by kind)
+        size_t nn = 0;
+        CU(cudaGraphGetNodes(g, nullptr, &nn));
+        std::vector<cudaGraphNode_t> nd(nn);
+        CU(cudaGraphGetNodes(g, nd.data(), &nn));
+        int kinds[16] = {};
+        for (auto n : nd) {
+            cudaGraphNodeType t;
+            cudaGraphNodeGetType(n, &t);
+            ++kinds[(int) t & 15];
+            if (t == cudaGraphNodeTypeKernel && std::atoi(getenv("IK2_TG_NODES")) > 1) {
+                cudaKernelNodeParams kp{};
+                const char* nm = nullptr;
+                if (cudaGraphKernelNodeGetParams(n, &kp) == cudaSuccess && cudaFuncGetName(&nm, kp.func) == cudaSuccess && nm)
+                    std::fprintf(stderr, "node %s %u %u\n", nm, kp.gridDim.x * kp.gridDim.y * kp.gridDim.z, kp.blockDim.x);
+            }
+        }
+        std::fprintf(stderr, "token graph: %zu nodes (kernel %d, memcpy %d, memset %d, host %d, event wait %d, record %d)\n",
+                     nn, kinds[cudaGraphNodeTypeKernel], kinds[cudaGraphNodeTypeMemcpy], kinds[cudaGraphNodeTypeMemset],
+                     kinds[cudaGraphNodeTypeHost], kinds[cudaGraphNodeTypeWaitEvent], kinds[cudaGraphNodeTypeEventRecord]);
+    }
     cudaGraphExec_t& ex = g_dp.exec[slot];
     bool updated = false;
     if (ex) {

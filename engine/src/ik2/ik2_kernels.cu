@@ -4715,6 +4715,137 @@ void conv4(const float* x, float* hist, const float* w, const float* dyn, int he
     conv4_res(x, hist, w, dyn, heads, T, C, nullptr, y, s);
 }
 
+// a decode token's attn_res (T 1) across C / 256 blocks instead of one (one block's loads were the call: 5 - 13 us):
+// a thread's float4 of every state held in registers, the blocks' partial sums met at a grid barrier, every block
+// the softmax, its slice of the output (and, fused, a second barrier for the RMS).  The blocks are few (<= 32) and
+// the launch waits on nothing else, so they are all resident together.
+// (attn_res_jobs: a job a row of blocks, each its own barrier)
+constexpr int kResMbThreads = 64, kResMbMax = 32, kResMbJobs = 64;
+__device__ float d_res_part[kResMbJobs][kResMbMax][kResMax * 4];
+__device__ float d_res_part2[kResMbJobs][kResMbMax][3];
+__device__ unsigned d_res_bar_cnt[kResMbJobs], d_res_bar_gen[kResMbJobs];
+__device__ __forceinline__ void res_grid_bar(int B, int job) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned g = *(volatile unsigned*) &d_res_bar_gen[job];
+        __threadfence();
+        if (atomicAdd(&d_res_bar_cnt[job], 1u) == (unsigned) B - 1) {
+            d_res_bar_cnt[job] = 0;
+            __threadfence();
+            atomicAdd(&d_res_bar_gen[job], 1u);
+        } else {
+            while (*(volatile unsigned*) &d_res_bar_gen[job] == g) {}
+        }
+        __threadfence();
+    }
+    __syncthreads();
+}
+template <bool FUSED_RMS>
+__global__ void __launch_bounds__(kResMbThreads) attn_res_t1_kernel(ResStates st, int n, const float* q, int nq, int C,
+                                                                    float res_eps, float rms_eps, float* out, RmsOuts outs,
+                                                                    size_t job_step) {
+    const int job = blockIdx.y;
+    q += job * job_step, out += job * job_step;
+    const int B = gridDim.x, b = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int c4 = C >> 2, d4 = b * kResMbThreads + tid;
+    const bool in = d4 < c4;
+    __shared__ float red[kResMbThreads / 32][kResMax * 4];
+    __shared__ float part_s[kResMax * 4][kResMbThreads + 1];
+    __shared__ float sc[3][kResMax];
+    __shared__ float rs_rms[3];
+    const float4 zero4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 x[kResMax], qv[3];
+#pragma unroll
+    for (int i = 0; i < kResMax; ++i) x[i] = (i < n && in) ? __ldg((const float4*) st.st[i] + d4) : zero4;
+#pragma unroll
+    for (int qi = 0; qi < 3; ++qi) qv[qi] = (qi < nq && in) ? __ldg((const float4*) (q + (size_t) qi * C) + d4) : zero4;
+#pragma unroll
+    for (int i = 0; i < kResMax; ++i) {   // (each thread's 4 n products to shared memory, then a thread a sum)
+        const float4 v = x[i];
+        part_s[i * 4][tid] = v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+#pragma unroll
+        for (int qi = 0; qi < 3; ++qi)
+            part_s[i * 4 + 1 + qi][tid] = v.x * qv[qi].x + v.y * qv[qi].y + v.z * qv[qi].z + v.w * qv[qi].w;
+    }
+    __syncthreads();
+    if (tid < 4 * n) {
+        float v = 0.0f;
+#pragma unroll 16
+        for (int j = 0; j < kResMbThreads; ++j) v += part_s[tid][j];
+        d_res_part[job][b][tid] = v;
+    }
+    res_grid_bar(B, job);
+    if (warp == 0) {   // (attn_res_warp0_softmax's arithmetic on the blocks' sums)
+        float ss = 0.0f, dd[3] = {0.0f, 0.0f, 0.0f};
+        if (lane < n)
+            for (int bb = 0; bb < B; ++bb) {
+                ss += __ldcg(&d_res_part[job][bb][lane * 4]);
+#pragma unroll
+                for (int qi = 0; qi < 3; ++qi) dd[qi] += __ldcg(&d_res_part[job][bb][lane * 4 + 1 + qi]);
+            }
+        const float r = (lane < n) ? rsqrtf(ss / (float) C + res_eps) : 0.0f;
+        const float inv_sqrt_c = rsqrtf((float) C);
+#pragma unroll
+        for (int qi = 0; qi < 3; ++qi) {
+            if (qi >= nq) break;
+            const float s_i = (lane < n) ? dd[qi] * r * inv_sqrt_c : -INFINITY;
+            const float m = wmax(s_i);
+            const float e_i = (lane < n) ? expf(s_i - m) : 0.0f;
+            const float sum = wsum(e_i);
+            if (lane < n) sc[qi][lane] = (e_i / sum) * r;
+        }
+    }
+    __syncthreads();
+    float4 o[3] = {zero4, zero4, zero4};
+#pragma unroll
+    for (int i = 0; i < kResMax; ++i) {
+        if (i >= n) break;
+#pragma unroll
+        for (int qi = 0; qi < 3; ++qi) {
+            if (qi >= nq) break;
+            const float w = sc[qi][i];
+            o[qi].x += w * x[i].x, o[qi].y += w * x[i].y, o[qi].z += w * x[i].z, o[qi].w += w * x[i].w;
+        }
+    }
+    if constexpr (!FUSED_RMS) {
+#pragma unroll
+        for (int qi = 0; qi < 3; ++qi)
+            if (qi < nq && in) ((float4*) (out + (size_t) qi * C))[d4] = o[qi];
+    } else {
+#pragma unroll
+        for (int qi = 0; qi < 3; ++qi) {
+            if (qi >= nq) break;
+            float sq = in ? o[qi].x * o[qi].x + o[qi].y * o[qi].y + o[qi].z * o[qi].z + o[qi].w * o[qi].w : 0.0f;
+            sq = wsum(sq);
+            if (lane == 0) red[warp][qi] = sq;
+        }
+        __syncthreads();
+        if (tid < nq) {
+            float v = 0.0f;
+#pragma unroll
+            for (int w = 0; w < kResMbThreads / 32; ++w) v += red[w][tid];
+            d_res_part2[job][b][tid] = v;
+        }
+        res_grid_bar(B, job);
+        if (tid < nq) {
+            float tot = 0.0f;
+            for (int bb = 0; bb < B; ++bb) tot += __ldcg(&d_res_part2[job][bb][tid]);
+            rs_rms[tid] = rsqrtf(tot / (float) C + rms_eps);
+        }
+        __syncthreads();
+        if (in) {
+#pragma unroll
+            for (int qi = 0; qi < 3; ++qi) {
+                if (qi >= nq) break;
+                const float rs = rs_rms[qi];
+                const float4 ww = outs.w[qi] ? __ldg((const float4*) outs.w[qi] + d4) : make_float4(1.0f, 1.0f, 1.0f, 1.0f);
+                const float r0 = o[qi].x * rs * ww.x, r1 = o[qi].y * rs * ww.y, r2 = o[qi].z * rs * ww.z, r3 = o[qi].w * rs * ww.w;
+                if (outs.y32[qi]) ((float4*) outs.y32[qi])[d4] = make_float4(r0, r1, r2, r3);
+                if (outs.y16[qi]) ((uint2*) outs.y16[qi])[d4] = make_uint2(f2_to_u32(r0, r1), f2_to_u32(r2, r3));
+            }
+        }
+    }
+}
 template <bool FUSED_RMS>
 void launch_attn_res(const ResStates& states, int n, const float* q, int nq, int T, int C, float res_eps, float rms_eps,
                      float* out, const RmsOuts& outs, cudaStream_t s, int jobs = 1) {
@@ -4736,7 +4867,11 @@ void launch_attn_res(const ResStates& states, int n, const float* q, int nq, int
                     (!outs.y32[qi] || (((uintptr_t) outs.y32[qi] & 15) == 0));
         }
     }
-    if (vec4 && C == 4608) {
+    static const bool mb = !getenv("IK2_RES_MB") || std::atoi(getenv("IK2_RES_MB"));
+    if (mb && vec4 && T == 1 && jobs <= kResMbJobs && (C >> 2) <= kResMbThreads * kResMbMax && (!FUSED_RMS || jobs == 1)) {
+        const dim3 gm((unsigned) ((C / 4 + kResMbThreads - 1) / kResMbThreads), (unsigned) jobs);
+        attn_res_t1_kernel<FUSED_RMS><<<gm, kResMbThreads, 0, s>>>(states, n, q, nq, C, res_eps, rms_eps, out, outs, job_step);
+    } else if (vec4 && C == 4608) {
         attn_res_vec4_kernel<FUSED_RMS, 576><<<g, 576, 0, s>>>(states, n, q, nq, T, C, res_eps, rms_eps, out, outs,
                                                                job_step);
     } else if (vec4 && C <= 4096) {
