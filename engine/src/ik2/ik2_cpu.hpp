@@ -28,6 +28,10 @@ bool available_any();
 // rows [r0, r1) of W (rows of K values in `type`'s blocks) . x -> out[0 .. r1 - r0)
 void rows(int type, const uint8_t* W, int K, int r0, int r1, const float* x, float* out);
 
+// IQ3_S rows read in the GPU's re-laid layout (k::Iq3sSoa; set at load when the host copies were re-laid), and the
+// re-laying of R rows of K values in place (the layout follows the rows' addresses: matrices 8-byte aligned)
+extern bool g_iq3s_soa;
+void iq3s_rows_soa_host(uint8_t* m, size_t R, int K);
 /// Worker threads taking tasks in order; wait(): until every task posted so far (and the ones they posted) is done.
 class Pool {
 public:

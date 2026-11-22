@@ -1130,18 +1130,16 @@ struct ExpertCache {
                 CU(cudaMemcpyAsync(dst + off, Ly.host[r] + (size_t) e * Ly.stride[r] + o, b, cudaMemcpyHostToDevice, st));
                 off += b, bytes_up += b;
             }
-            return;
-        }
-        if (Ly.host_contig) {
+        } else if (Ly.host_contig) {
             CU(cudaMemcpyAsync(dst, Ly.host[0] + (size_t) e * Ly.slot_bytes, Ly.slot_bytes, cudaMemcpyHostToDevice, st));
             bytes_up += Ly.slot_bytes;
-            return;
-        }
-        size_t off = 0;
-        for (int r = 0; r < 3; ++r) {
-            CU(cudaMemcpyAsync(dst + off, Ly.host[r] + (size_t) e * Ly.stride[r], Ly.eb[r], cudaMemcpyHostToDevice, st));
-            off += Ly.eb[r];
-            bytes_up += Ly.eb[r];
+        } else {
+            size_t off = 0;
+            for (int r = 0; r < 3; ++r) {
+                CU(cudaMemcpyAsync(dst + off, Ly.host[r] + (size_t) e * Ly.stride[r], Ly.eb[r], cudaMemcpyHostToDevice, st));
+                off += Ly.eb[r];
+                bytes_up += Ly.eb[r];
+            }
         }
     }
 };
@@ -1953,10 +1951,10 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
             const uint8_t* sl = X.slot_ptrs[e];
             gather_f16_16_kernel<<<cnt_e, 256, 0, g_s>>>(xin, X.gidx + st_e, cnt_e, C, X.ex16);
             if (Ly.ty[0] == Ly.ty[1]) {
-                k::decode_f16(Ly.ty[0], sl, (size_t) 2 * F * C, X.w16, g_s);
+                k::decode_f16_slot(Ly.ty[0], sl, (size_t) 2 * F * C, C, X.w16, g_s);
             } else {
-                k::decode_f16(Ly.ty[0], sl, (size_t) F * C, X.w16, g_s);
-                k::decode_f16(Ly.ty[1], sl + Ly.eb[0], (size_t) F * C, X.w16 + (size_t) F * C, g_s);
+                k::decode_f16_slot(Ly.ty[0], sl, (size_t) F * C, C, X.w16, g_s);
+                k::decode_f16_slot(Ly.ty[1], sl + Ly.eb[0], (size_t) F * C, C, X.w16 + (size_t) F * C, g_s);
             }
             gemm16(X.w16, 2 * F, C, X.ex16, cnt_e, X.gu32, 2 * F);
             k::swiglu_cap_f32(X.gu32, cnt_e, F, X.sg + st_e, X.su + st_e, c.gate_cap, c.up_cap, X.h16, g_s);
@@ -2042,10 +2040,10 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
                 const uint8_t* sl = X.slot_ptrs[e];
                 gather_f16_16_kernel<<<cnt_e, 256, 0, g_s>>>(xin, X.gidx + st_e, cnt_e, C, X.ex16);
                 if (Ly.ty[0] == Ly.ty[1]) {
-                    k::decode_f16(Ly.ty[0], sl, (size_t) 2 * Fd * C, X.w16, g_s);
+                    k::decode_f16_slot(Ly.ty[0], sl, (size_t) 2 * Fd * C, C, X.w16, g_s);
                 } else {
-                    k::decode_f16(Ly.ty[0], sl, (size_t) Fd * C, X.w16, g_s);
-                    k::decode_f16(Ly.ty[1], sl + b0g, (size_t) Fd * C, X.w16 + (size_t) Fd * C, g_s);
+                    k::decode_f16_slot(Ly.ty[0], sl, (size_t) Fd * C, C, X.w16, g_s);
+                    k::decode_f16_slot(Ly.ty[1], sl + b0g, (size_t) Fd * C, C, X.w16 + (size_t) Fd * C, g_s);
                 }
                 gemm16(X.w16, 2 * Fd, C, X.ex16, cnt_e, X.gu32, 2 * Fd);
                 k::swiglu_cap_f32(X.gu32, cnt_e, Fd, X.sg + st_e, X.su + st_e, c.gate_cap, c.up_cap, X.h16, g_s);
@@ -4990,6 +4988,18 @@ int run(int argc, char** argv) {
 #endif
         // (pinned: the allocations and the reads overlap - a layer's reads start as soon as its buffer exists;
         // IK2_ALLOC_THREADS threads allocate, default 1)
+        {   // IQ3_S gate / up rows re-laid in the host copies as read, uploaded as they are (k::Iq3sSoa: the dp4a
+            // kernels' aligned loads; the CPU lane reads the same layout); the layout follows the rows' addresses, so
+            // every matrix must start 8-byte aligned here and in VRAM (slots, a tensor-parallel half). IK2_SOA=0: off
+            bool soa = k::iq3s_soa_ok(c.C) && (!getenv("IK2_SOA") || std::atoi(getenv("IK2_SOA"))), any = false;
+            for (const Layer& Ly : M.L)
+                if (Ly.eb[0]) {
+                    any = true;
+                    soa = soa && Ly.ty[0] == k::kIQ3_S && Ly.ty[1] == k::kIQ3_S && Ly.eb[0] % 16 == 0 &&
+                          Ly.eb[1] % 16 == 0 && (Ly.eb[0] + Ly.eb[1] + Ly.eb[2]) % 8 == 0;
+                }
+            k::g_iq3s_soa = ik2::cpu::g_iq3s_soa = soa && any;
+        }
         std::vector<std::atomic<int>> ready(c.n_layer);
         for (auto& r : ready) r.store(use_mmap_reg ? 1 : 0);
         for (int l = 0; l < c.n_layer; ++l) {
@@ -5076,6 +5086,9 @@ int run(int argc, char** argv) {
                     uint8_t* dst = (uint8_t*) pin.blocks[J.l].ptr + role_off;
                     read_into_strided(S.paths[S.file_of(J.name)], S.file_offset(J.name), c.E, exp_bytes,
                                       Ly.slot_bytes, dst);
+                    if (k::g_iq3s_soa && J.roles[0] != 2)
+                        for (int e = 0; e < c.E; ++e)
+                            ik2::cpu::iq3s_rows_soa_host(dst + (size_t) e * Ly.slot_bytes, exp_bytes / ((size_t) C / 256 * 110), (int) C);
                     if (--jobs_left[J.l] == 0) layer_read(J.l);
                 }
             });

@@ -217,6 +217,14 @@ void experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, int S, i
 bool experts_gu_x_scratch(int n_x, int C, cudaStream_t s, int8_t** xq, float** xs);
 /// experts_gate_up_swiglu with slot s's F outputs written at h + orow[s] * h_ld (orow null: s; h_ld 0: F) - a tensor-
 /// parallel GPU's half of every row of a wider h
+// IQ3_S expert rows re-laid (set by the engine when iq3s_soa_ok: every IQ3_S gate / up row of the host copies re-laid
+// at load - ik2::cpu::iq3s_rows_soa_host - and uploaded as is; read by the dp4a kernels, decode_f16_slot and the CPU
+// lane; the other readers take the file's layout).  iq3s_rows_soa: the same on the device (the tests)
+extern bool g_iq3s_soa;
+bool iq3s_soa_ok(int C);
+void iq3s_rows_soa(uint8_t* m, int R, int K, cudaStream_t s);
+// decode_f16 of an expert slot's matrix (rows of K values): the re-laid IQ3_S rows when g_iq3s_soa
+void decode_f16_slot(int type, const uint8_t* blocks, size_t n, int K, uint16_t* out, cudaStream_t s);
 void experts_gate_up_swiglu_rows(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up,
                                  size_t eb0, const float* x, int C, int F, const float* sg, const float* su, float gcap,
                                  float ucap, uint16_t* h, const int* orow, int h_ld, cudaStream_t s);

@@ -98,6 +98,7 @@ void Pool::wait() {
     done_.wait(lk, [this]() { return pending_ == 0; });
 }
 
+bool g_iq3s_soa = false;
 namespace {
 
 // ggml_ue4m3_to_fp32 of every byte
@@ -178,17 +179,49 @@ IK2_AVX2 inline float hsum8(__m256 v) {
     a = _mm_add_ss(a, _mm_movehdup_ps(a));
     return _mm_cvtss_f32(a);
 }
-// a 110-byte superblock of 256: d, qs [64], qh [8], signs [32], scales [4]
+// a 110-byte superblock of 256: d, qs [64], qh [8], signs [32], scales [4] - or, the rows re-laid (g_iq3s_soa:
+// k::Iq3sSoa's layout, set at load for the GPU's dp4a kernels), each part a run across the row's nb blocks
+struct Iq3sBlk {
+    const uint8_t *qs, *qh, *sg, *sc;
+    float d;
+};
+inline Iq3sBlk iq3s_blk(const uint8_t* row, int nb, int sb) {
+    if (!g_iq3s_soa) {
+        const uint8_t* b = row + (size_t) sb * 110;
+        return {b + 2, b + 66, b + 74, b + 106, f16_at(b)};
+    }
+    const int g = (int) ((8u - ((uint32_t) (uintptr_t) row & 7u)) & 7u);
+    const uint8_t* qs = row + g;
+    return {qs + 64 * sb, qs + 96 * nb + 8 * sb, qs + 64 * nb + 32 * sb, qs + 104 * nb + 4 * sb,
+            f16_at(row + (2 * sb < g ? 2 * sb : g + 108 * nb + 2 * sb - g))};
+}
+void iq3s_rows_soa_host_impl(uint8_t* m, size_t R, int K) {
+    const int nb = K / 256, n = 110 * nb;
+    std::vector<uint8_t> t((size_t) n);
+    for (size_t r = 0; r < R; ++r) {
+        uint8_t* row = m + r * (size_t) n;
+        std::memcpy(t.data(), row, (size_t) n);
+        const int g = (int) ((8u - ((uint32_t) (uintptr_t) row & 7u)) & 7u);
+        for (int k = 0; k < nb; ++k) {
+            const uint8_t* b = t.data() + (size_t) k * 110;
+            std::memcpy(row + (2 * k < g ? 2 * k : g + 108 * nb + 2 * k - g), b, 2);
+            std::memcpy(row + g + 64 * k, b + 2, 64);
+            std::memcpy(row + g + 96 * nb + 8 * k, b + 66, 8);
+            std::memcpy(row + g + 64 * nb + 32 * k, b + 74, 32);
+            std::memcpy(row + g + 104 * nb + 4 * k, b + 106, 4);
+        }
+    }
+}
 IK2_AVX2 float dot_iq3s(const uint8_t* row, const float* x, int K) {
     __m256 acc = _mm256_setzero_ps();
     for (int sb = 0; sb < K / 256; ++sb) {
-        const uint8_t* b = row + (size_t) sb * 110;
-        const float d = f16_at(b);
+        const Iq3sBlk B = iq3s_blk(row, K / 256, sb);
+        const float d = B.d;
         for (int ib = 0; ib < 8; ++ib) {
-            const float db = d * (float) (1 + 2 * ((b[106 + (ib >> 1)] >> (4 * (ib & 1))) & 15));
-            const uint32_t qh = b[66 + ib];
-            const uint8_t* qs = b + 2 + 8 * ib;
-            const uint8_t* sg = b + 74 + 4 * ib;
+            const float db = d * (float) (1 + 2 * ((B.sc[ib >> 1] >> (4 * (ib & 1))) & 15));
+            const uint32_t qh = B.qh[ib];
+            const uint8_t* qs = B.qs + 8 * ib;
+            const uint8_t* sg = B.sg + 4 * ib;
             const float* xx = x + sb * 256 + ib * 32;
             __m256 s = _mm256_setzero_ps();
             for (int il = 0; il < 4; ++il) {
@@ -276,14 +309,14 @@ IK2_AVX2 float dot_iq3s_q8(const uint8_t* row, const int8_t* xq, const float* xs
     const __m256i one8 = _mm256_set1_epi8(1), one16 = _mm256_set1_epi16(1);
     __m256 acc = _mm256_setzero_ps();
     for (int sb = 0; sb < K / 256; ++sb) {
-        const uint8_t* b = row + (size_t) sb * 110;
-        const float d = f16_at(b);
+        const Iq3sBlk B = iq3s_blk(row, K / 256, sb);
+        const float d = B.d;
         for (int ib = 0; ib < 8; ++ib) {
-            const float db = d * (float) (1 + 2 * ((b[106 + (ib >> 1)] >> (4 * (ib & 1))) & 15));
-            const uint32_t qh = b[66 + ib];
-            const uint8_t* qs = b + 2 + 8 * ib;
+            const float db = d * (float) (1 + 2 * ((B.sc[ib >> 1] >> (4 * (ib & 1))) & 15));
+            const uint32_t qh = B.qh[ib];
+            const uint8_t* qs = B.qs + 8 * ib;
             uint32_t s32;
-            std::memcpy(&s32, b + 74 + 4 * ib, 4);
+            std::memcpy(&s32, B.sg + 4 * ib, 4);
             const uint32_t* G = k_iq3s_grid;
             const __m256i g = _mm256_setr_epi32(   // (8 scalar lookups: an AVX2 gather measured 1.5x slower on Zen 2)
                 (int) G[qs[0] | ((qh << 8) & 256)], (int) G[qs[1] | ((qh << 7) & 256)], (int) G[qs[2] | ((qh << 6) & 256)],
@@ -324,14 +357,14 @@ IK2_AVX2 void dot_iq3s_q8_n(const uint8_t* row, const int8_t* const* xq, const f
     __m256 acc[NT];
     for (int t = 0; t < NT; ++t) acc[t] = _mm256_setzero_ps();
     for (int sb = 0; sb < K / 256; ++sb) {
-        const uint8_t* b = row + (size_t) sb * 110;
-        const float d = f16_at(b);
+        const Iq3sBlk B = iq3s_blk(row, K / 256, sb);
+        const float d = B.d;
         for (int ib = 0; ib < 8; ++ib) {
-            const float db = d * (float) (1 + 2 * ((b[106 + (ib >> 1)] >> (4 * (ib & 1))) & 15));
-            const uint32_t qh = b[66 + ib];
-            const uint8_t* qs = b + 2 + 8 * ib;
+            const float db = d * (float) (1 + 2 * ((B.sc[ib >> 1] >> (4 * (ib & 1))) & 15));
+            const uint32_t qh = B.qh[ib];
+            const uint8_t* qs = B.qs + 8 * ib;
             uint32_t s32;
-            std::memcpy(&s32, b + 74 + 4 * ib, 4);
+            std::memcpy(&s32, B.sg + 4 * ib, 4);
             const uint32_t* G = k_iq3s_grid;
             const __m256i g = _mm256_setr_epi32(
                 (int) G[qs[0] | ((qh << 8) & 256)], (int) G[qs[1] | ((qh << 7) & 256)], (int) G[qs[2] | ((qh << 6) & 256)],
@@ -705,4 +738,5 @@ void post_expert(Pool& pool, ExpertJob* job, int C, int F, float gcap, float uca
         }
 }
 
+void iq3s_rows_soa_host(uint8_t* m, size_t R, int K) { iq3s_rows_soa_host_impl(m, R, K); }
 }  // namespace ik2::cpu

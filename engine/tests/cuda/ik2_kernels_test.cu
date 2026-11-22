@@ -2805,6 +2805,57 @@ extern bool g_dp4a;
 }
 // the dp4a expert kernels (IQ3_S gate_up, IQ4_NL down; the input made int8 a scale per 32) against the fp32 ones on
 // random blocks: within the int8 rounding of the input (~1% of an output's scale)
+// the re-laid IQ3_S rows (k::g_iq3s_soa): the dp4a gate_up (a token, and a group of tokens) and the prompt's FP16
+// decode give the file layout's values, bit for bit
+void test_iq3s_soa() {
+    const int C = 2304, F = 64, S = 3, NE = 4;
+    const size_t rb = (size_t) C / 256 * 110, eb0 = (size_t) F * rb, eb = 2 * eb0 + 4096;
+    std::vector<uint8_t> hb(eb * NE);
+    for (auto& b : hb) b = (uint8_t) rng();
+    for (int e = 0; e < NE; ++e)
+        for (size_t o = 0; o < 2 * eb0; o += 110) {
+            const uint16_t d = f2h_host(0.002f + 0.001f * frand(1.0f));
+            std::memcpy(hb.data() + (size_t) e * eb + o, &d, 2);
+        }
+    uint8_t* db = dev(hb);
+    std::vector<const uint8_t*> tab = {db + 2 * eb, db, db + 3 * eb};
+    const uint8_t** dtab = dev_n<const uint8_t*>(S);
+    CU(cudaMemcpy(dtab, tab.data(), S * sizeof(void*), cudaMemcpyHostToDevice));
+    std::vector<int> tok = {0, 1, 0};
+    int* dtok = dev(tok);
+    auto x = fvec((size_t) 2 * C, 2.0f);
+    float* dx = dev(x);
+    uint16_t* h = dev_n<uint16_t>((size_t) S * F);
+    // a group: experts 1 and 0 with tokens {0, 1} and {1}
+    std::vector<const uint8_t*> gtab = {db + eb, db};
+    const uint8_t** dg = dev_n<const uint8_t*>(2);
+    CU(cudaMemcpy(dg, gtab.data(), 2 * sizeof(void*), cudaMemcpyHostToDevice));
+    std::vector<int> gn = {2, 1}, gt(2 * k::kGroupMax, 0), gr(2 * k::kGroupMax, 0);
+    gt[0] = 0, gt[1] = 1, gr[0] = 0, gr[1] = 1, gt[k::kGroupMax] = 1, gr[k::kGroupMax] = 2;
+    int *dgn = dev(gn), *dgt = dev(gt), *dgr = dev(gr);
+    uint16_t* hg = dev_n<uint16_t>((size_t) 3 * F);
+    uint16_t* w16 = dev_n<uint16_t>((size_t) 2 * F * C);
+    std::vector<uint16_t> a[3], b[3];
+    for (int pass = 0; pass < 2; ++pass) {
+        if (pass) {
+            for (int e = 0; e < NE; ++e) k::iq3s_rows_soa(db + (size_t) e * eb, 2 * F, C, 0);
+            k::g_iq3s_soa = true;
+        }
+        k::experts_gate_up_swiglu(dtab, dtok, S, k::kIQ3_S, k::kIQ3_S, eb0, dx, C, F, nullptr, nullptr, 10.0f, 10.0f, h, 0, 2);
+        k::experts_gate_up_swiglu_g(dg, dgn, dgt, dgr, 2, k::kIQ3_S, k::kIQ3_S, eb0, dx, C, F, nullptr, nullptr, 10.0f,
+                                    10.0f, hg, 0, 2);
+        k::decode_f16_slot(k::kIQ3_S, db + eb, (size_t) 2 * F * C, C, w16, 0);
+        CU(cudaDeviceSynchronize());
+        auto& o = pass ? b : a;
+        o[0] = host(h, (size_t) S * F), o[1] = host(hg, (size_t) 3 * F), o[2] = host(w16, (size_t) 2 * F * C);
+    }
+    k::g_iq3s_soa = false;
+    expect_true("IQ3_S re-laid: gate_up a token's, bit for bit", a[0] == b[0]);
+    expect_true("IQ3_S re-laid: gate_up a group's, bit for bit", a[1] == b[1]);
+    expect_true("IQ3_S re-laid: the FP16 decode, bit for bit", a[2] == b[2]);
+    cudaFree(db), cudaFree(dtab), cudaFree(dtok), cudaFree(dx), cudaFree(h), cudaFree(dg), cudaFree(dgn), cudaFree(dgt);
+    cudaFree(dgr), cudaFree(hg), cudaFree(w16);
+}
 void test_experts_dp4a() {
     const int C = 2304, F = 1152, S = 5;
     const size_t rb_gu = (size_t) C / 256 * 110, rb_dn = (size_t) F / 32 * 18;
@@ -3036,6 +3087,7 @@ int main() {
     test_token_path();
     test_experts_mma();
     test_experts_dp4a();
+    test_iq3s_soa();
     test_kv_i8();   // (after the others: its random data leaves theirs as it was)
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;

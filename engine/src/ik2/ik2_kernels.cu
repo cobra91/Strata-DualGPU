@@ -5305,6 +5305,66 @@ void experts_gate_up(const uint8_t* const* blob, const int* tok, int S, int ty_g
     else launch_experts_gate_up<4, 4>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, gu, s);
     check("experts_gate_up");
 }
+// ---- IQ3_S expert rows re-laid (g_iq3s_soa: the host copies at load, uploaded as they are; iq3s_rows_soa on the
+// device for the tests): a row of nb 110-byte blocks
+// keeps its place and size, its bytes grouped [g bytes of the d's][qs 64 nb][signs 32 nb][qh 8 nb][scales 4 nb][the
+// other d's], g = (8 - address % 8) % 8 (rows are 2-byte aligned: g even, <= 6 <= 2 nb), so a sub-block's qs are one
+// aligned 8-byte load and its signs one 4-byte load, a warp's side by side - the same bytes, the same sums
+struct Iq3sSoa {
+    const uint8_t *p, *qs, *sg, *qh, *sc;
+    int g, tail;
+    __device__ __forceinline__ Iq3sSoa(const uint8_t* row, int nb) {
+        p = row;
+        g = (int) ((8u - ((uint32_t) (uintptr_t) row & 7u)) & 7u);
+        qs = row + g, sg = qs + 64 * nb, qh = sg + 32 * nb, sc = qh + 8 * nb, tail = g + 108 * nb;
+    }
+    __device__ __forceinline__ uint16_t d_bits(int k) const {   // block k's scale
+        return __ldg((const uint16_t*) (p + (2 * k < g ? 2 * k : tail + 2 * k - g)));
+    }
+    __device__ __forceinline__ int nib(int sb) const { return (__ldg(sc + (sb >> 1)) >> (4 * (sb & 1))) & 15; }
+};
+__global__ void iq3s_rows_soa_kernel(uint8_t* m, int nb, size_t rb) {
+    extern __shared__ uint8_t row_s[];
+    uint8_t* row = m + (size_t) blockIdx.x * rb;
+    const int n = 110 * nb;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) row_s[i] = row[i];
+    __syncthreads();
+    const int g = (int) ((8u - ((uint32_t) (uintptr_t) row & 7u)) & 7u);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const int k = i / 110, o = i - 110 * k;
+        int dst;
+        if (o < 2) dst = (2 * k < g ? 2 * k : g + 108 * nb + 2 * k - g) + o;
+        else if (o < 66) dst = g + 64 * k + (o - 2);
+        else if (o < 74) dst = g + 96 * nb + 8 * k + (o - 66);
+        else if (o < 106) dst = g + 64 * nb + 32 * k + (o - 74);
+        else dst = g + 104 * nb + 4 * k + (o - 106);
+        row[dst] = row_s[i];
+    }
+}
+// the prompt path's decode of a re-laid matrix (rows of K values): a thread 8 values, as decode_f16_iq8_kernel
+__global__ void decode_f16_iq3s_soa_kernel(const uint8_t* __restrict__ blocks, size_t n8, int K, uint16_t* __restrict__ out) {
+    const size_t t = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n8) return;
+    const int nsb = K / 32;
+    const size_t sbg = t >> 2, r = sbg / nsb;
+    const int sb = (int) (sbg - r * nsb), l = (int) (t & 3);
+    const Iq3sSoa L(blocks + r * (size_t) (nsb / 8) * 110, nsb / 8);
+    const float db = half_bits_to_float(L.d_bits(sb >> 3)) * (float) (1 + 2 * L.nib(sb));
+    const uint32_t qh = __ldg(L.qh + sb);
+    const uint32_t g1 = __ldg(d_iq3s_grid + (__ldg(L.qs + 8 * sb + 2 * l) | ((qh << (8 - 2 * l)) & 256u)));
+    const uint32_t g2 = __ldg(d_iq3s_grid + (__ldg(L.qs + 8 * sb + 2 * l + 1) | ((qh << (7 - 2 * l)) & 256u)));
+    const uint32_t sg = __ldg(L.sg + 4 * sb + l);
+    float y[8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        y[j] = db * (float) ((g1 >> (8 * j)) & 0xFFu) * ((sg >> j) & 1u ? -1.0f : 1.0f);
+        y[4 + j] = db * (float) ((g2 >> (8 * j)) & 0xFFu) * ((sg >> (4 + j)) & 1u ? -1.0f : 1.0f);
+    }
+    uint4 o;
+    o.x = (uint32_t) f2h(y[0]) | ((uint32_t) f2h(y[1]) << 16), o.y = (uint32_t) f2h(y[2]) | ((uint32_t) f2h(y[3]) << 16);
+    o.z = (uint32_t) f2h(y[4]) | ((uint32_t) f2h(y[5]) << 16), o.w = (uint32_t) f2h(y[6]) | ((uint32_t) f2h(y[7]) << 16);
+    ((uint4*) out)[t] = o;
+}
 // ---- the decode's expert products by dp4a (IK2_DP4A, default on): IQ3_S gate_up and IQ4_NL down with the input made
 // int8 once a block (a scale per 32: the blocks of the weights' sub-blocks), four lanes a matrix row each taking whole
 // 32-value sub-blocks, the integer sums times the two scales.  The fp32 kernels spent ~5 instructions a weight on the
@@ -5342,7 +5402,7 @@ __global__ void quant_rows_i8_kernel(const float* x, int C, int8_t* xq, float* x
     const int r = blockIdx.x;
     quant_x_i8<WARPS>(x + (size_t) r * C, C, xq + (size_t) r * C, xs + (size_t) r * (C / 32));
 }
-template <int WARPS, int PAIRS, bool PREQ = false, bool SGNA = false, int NSB = 0>   // (NSB: C / 32 at compile time, 0: C's)
+template <int WARPS, int PAIRS, bool PREQ = false, bool SGNA = false, int NSB = 0, bool SOA = false>   // (NSB: C / 32 at compile time, 0: C's; SOA: rows re-laid)
 __global__ void __launch_bounds__(WARPS * 32) experts_gu_iq3s_dp4a_kernel(
     const uint8_t* const* blob, const int* tok, size_t eb0, const float* x, int C, int F, const float* sg,
     const float* su, float gcap, float ucap, uint16_t* h, const int* orow, int h_ld, const int8_t* xq_g = nullptr,
@@ -5379,20 +5439,33 @@ __global__ void __launch_bounds__(WARPS * 32) experts_gu_iq3s_dp4a_kernel(
 #pragma unroll (NSB ? 4 * NSB / 32 : 3)
     for (int p = lane; p < 4 * nsb; p += 32) {
         const int m = p / nsb, sb = p - m * nsb;
-        const uint8_t* b = rows[m] + (size_t) (sb >> 3) * 110;
-        const int ib = sb & 7;
-        const float d = half_bits_to_float(__ldg((const uint16_t*) b));
-        const int nib = (__ldg(b + 106 + (ib >> 1)) >> (4 * (ib & 1))) & 15;
-        const uint32_t qh = __ldg(b + 66 + ib);
-        const uint16_t* qs = (const uint16_t*) (b + 2 + 8 * ib);
-        const uint16_t* sp = (const uint16_t*) (b + 74 + 4 * ib);
-        const uint32_t sgw = (uint32_t) __ldg(sp) | ((uint32_t) __ldg(sp + 1) << 16);
+        float d;
+        int nib;
+        uint32_t qh, sgw, qw[4];
+        if constexpr (SOA) {
+            const Iq3sSoa L(rows[m], nsb / 8);
+            d = half_bits_to_float(L.d_bits(sb >> 3)), nib = L.nib(sb), qh = __ldg(L.qh + sb);
+            const uint2 q2 = __ldg((const uint2*) (L.qs + 8 * sb));
+            sgw = __ldg((const uint32_t*) (L.sg + 4 * sb));
+            qw[0] = q2.x & 0xFFFFu, qw[1] = q2.x >> 16, qw[2] = q2.y & 0xFFFFu, qw[3] = q2.y >> 16;
+        } else {
+            const uint8_t* b = rows[m] + (size_t) (sb >> 3) * 110;
+            const int ib = sb & 7;
+            d = half_bits_to_float(__ldg((const uint16_t*) b));
+            nib = (__ldg(b + 106 + (ib >> 1)) >> (4 * (ib & 1))) & 15;
+            qh = __ldg(b + 66 + ib);
+            const uint16_t* qs = (const uint16_t*) (b + 2 + 8 * ib);
+            const uint16_t* sp = (const uint16_t*) (b + 74 + 4 * ib);
+            sgw = (uint32_t) __ldg(sp) | ((uint32_t) __ldg(sp + 1) << 16);
+#pragma unroll
+            for (int l = 0; l < 4; ++l) qw[l] = __ldg(qs + l);
+        }
         const int4 xa = xq4[2 * sb], xb = xq4[2 * sb + 1];
         const int xw[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
         int sumi = 0;
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
-            const uint32_t q = __ldg(qs + l);
+            const uint32_t q = qw[l];
             const uint32_t g1 = grid_s[(q & 0xFFu) | ((qh << (8 - 2 * l)) & 256u)];
             const uint32_t g2 = grid_s[(q >> 8) | ((qh << (7 - 2 * l)) & 256u)];
             const uint2 mk = SGNA ? make_uint2(sign_bytes4((sgw >> (8 * l)) & 15u), sign_bytes4((sgw >> (8 * l + 4)) & 15u))
@@ -5477,6 +5550,28 @@ __global__ void __launch_bounds__(WARPS * 32) experts_down_iq4nl_dp4a_kernel(con
 }
 }  // namespace
 bool g_dp4a = !getenv("IK2_DP4A") || std::atoi(getenv("IK2_DP4A"));
+bool g_iq3s_soa = false;
+bool iq3s_soa_ok(int C) {
+    return g_dp4a && C % 256 == 0 && C >= 768 && (size_t) kGroupMax * C + (size_t) kGroupMax * (C / 32) * 4 + 2048 <= 48 * 1024;
+}
+void iq3s_rows_soa(uint8_t* m, int R, int K, cudaStream_t s) {
+    if (R <= 0) return;
+    const int nb = K / 256;
+    iq3s_rows_soa_kernel<<<(unsigned) R, 128, (size_t) 110 * nb, s>>>(m, nb, (size_t) 110 * nb);
+    check("iq3s_rows_soa");
+}
+void decode_f16_slot(int type, const uint8_t* blocks, size_t n, int K, uint16_t* out, cudaStream_t s) {
+    if (g_iq3s_soa && type == kIQ3_S) {
+        if (n % (size_t) K || ((uintptr_t) out & 15)) {
+            std::fprintf(stderr, "decode_f16_slot: re-laid IQ3_S rows of K values, a 16-byte aligned output\n");
+            std::abort();
+        }
+        decode_f16_iq3s_soa_kernel<<<grid(n / 8), kBlk, 0, s>>>(blocks, n / 8, K, out);
+        check("decode_f16 (IQ3_S re-laid)");
+        return;
+    }
+    decode_f16(type, blocks, n, out, s);
+}
 // the int8 inputs' scratch of the dp4a expert calls: one a device (the dual-GPU paths call them on both), grown only
 // outside a graph capture; scratch_epoch counts the growths (a captured graph holds the old pointers: see the engine)
 int g_scratch_epoch = 0;
@@ -5538,7 +5633,7 @@ void experts_gate_up_g(const uint8_t* const* blob, const int* n, const int* tok,
 }
 // ---- the grouped dp4a experts (a few tokens - a verify window - an expert's tokens a group, kGroupMax at most): a
 // sub-block's weights decoded once and dotted with each of the group's tokens (x / h made int8 once a call)
-template <int WARPS, int NT>
+template <int WARPS, int NT, bool SOA = false>
 __global__ void __launch_bounds__(WARPS * 32) experts_gu_iq3s_dp4a_g_kernel(
     const uint8_t* const* blob, const int* n, const int* tok, const int* row, size_t eb0, int C, int F,
     const float* sg, const float* su, float gcap, float ucap, uint16_t* h, const int8_t* xq_g, const float* xs_g) {
@@ -5569,18 +5664,31 @@ __global__ void __launch_bounds__(WARPS * 32) experts_gu_iq3s_dp4a_g_kernel(
     for (int t = 0; t < NT; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.0f;
     for (int p = lane; p < 4 * nsb; p += 32) {
         const int m = p / nsb, sb = p - m * nsb;
-        const uint8_t* b = rows[m] + (size_t) (sb >> 3) * 110;
-        const int ib = sb & 7;
-        const float db = half_bits_to_float(__ldg((const uint16_t*) b)) *
-                         (float) (1 + 2 * ((__ldg(b + 106 + (ib >> 1)) >> (4 * (ib & 1))) & 15));
-        const uint32_t qh = __ldg(b + 66 + ib);
-        const uint16_t* qs = (const uint16_t*) (b + 2 + 8 * ib);
-        const uint16_t* sp = (const uint16_t*) (b + 74 + 4 * ib);
-        const uint32_t sgw = (uint32_t) __ldg(sp) | ((uint32_t) __ldg(sp + 1) << 16);
+        float db;
+        uint32_t qh, sgw, qw[4];
+        if constexpr (SOA) {
+            const Iq3sSoa L(rows[m], nsb / 8);
+            db = half_bits_to_float(L.d_bits(sb >> 3)) * (float) (1 + 2 * L.nib(sb));
+            qh = __ldg(L.qh + sb);
+            const uint2 q2 = __ldg((const uint2*) (L.qs + 8 * sb));
+            sgw = __ldg((const uint32_t*) (L.sg + 4 * sb));
+            qw[0] = q2.x & 0xFFFFu, qw[1] = q2.x >> 16, qw[2] = q2.y & 0xFFFFu, qw[3] = q2.y >> 16;
+        } else {
+            const uint8_t* b = rows[m] + (size_t) (sb >> 3) * 110;
+            const int ib = sb & 7;
+            db = half_bits_to_float(__ldg((const uint16_t*) b)) *
+                 (float) (1 + 2 * ((__ldg(b + 106 + (ib >> 1)) >> (4 * (ib & 1))) & 15));
+            qh = __ldg(b + 66 + ib);
+            const uint16_t* qs = (const uint16_t*) (b + 2 + 8 * ib);
+            const uint16_t* sp = (const uint16_t*) (b + 74 + 4 * ib);
+            sgw = (uint32_t) __ldg(sp) | ((uint32_t) __ldg(sp + 1) << 16);
+#pragma unroll
+            for (int l = 0; l < 4; ++l) qw[l] = __ldg(qs + l);
+        }
         uint32_t wv[8];
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
-            const uint32_t q = __ldg(qs + l);
+            const uint32_t q = qw[l];
             const uint32_t g1 = grid_s[(q & 0xFFu) | ((qh << (8 - 2 * l)) & 256u)];
             const uint32_t g2 = grid_s[(q >> 8) | ((qh << (7 - 2 * l)) & 256u)];
             const uint32_t m1 = sign_bytes4((sgw >> (8 * l)) & 15u), m2 = sign_bytes4((sgw >> (8 * l + 4)) & 15u);
@@ -5725,7 +5833,15 @@ void launch_experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, i
         const dim3 g((unsigned) ((F + 2 * Wn * Pn - 1) / (2 * Wn * Pn)), (unsigned) S);
         const size_t sm = (size_t) C + (size_t) C / 32 * 4;
         const int hl = h_ld > 0 ? h_ld : F;
-        if (got) {
+        if (g_iq3s_soa) {   // (re-laid rows: the arithmetic signs, the codes made here when there is no scratch)
+            if (got) {
+                if (!preq) quant_rows_i8_kernel<8><<<(unsigned) nx, 256, 0, s>>>(x, C, xq, xs);
+                if (C == 2304) experts_gu_iq3s_dp4a_kernel<Wn, Pn, true, true, 72, true><<<g, Wn * 32, sm, s>>>(blob, tok, eb0, x, C, F, sg, su, gcap, ucap, h, orow, hl, xq, xs);
+                else experts_gu_iq3s_dp4a_kernel<Wn, Pn, true, true, 0, true><<<g, Wn * 32, sm, s>>>(blob, tok, eb0, x, C, F, sg, su, gcap, ucap, h, orow, hl, xq, xs);
+            } else {
+                experts_gu_iq3s_dp4a_kernel<Wn, Pn, false, true, 0, true><<<g, Wn * 32, sm, s>>>(blob, tok, eb0, x, C, F, sg, su, gcap, ucap, h, orow, hl);
+            }
+        } else if (got) {
             if (!preq) quant_rows_i8_kernel<8><<<(unsigned) nx, 256, 0, s>>>(x, C, xq, xs);
             if ((V & 4) && C == 2304) experts_gu_iq3s_dp4a_kernel<Wn, Pn, true, true, 72><<<g, Wn * 32, sm, s>>>(blob, tok, eb0, x, C, F, sg, su, gcap, ucap, h, orow, hl, xq, xs);
             else if (V & 2) experts_gu_iq3s_dp4a_kernel<Wn, Pn, true, true><<<g, Wn * 32, sm, s>>>(blob, tok, eb0, x, C, F, sg, su, gcap, ucap, h, orow, hl, xq, xs);
@@ -5737,6 +5853,10 @@ void launch_experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, i
         }
         check("experts_gate_up_swiglu (dp4a)");
         return;
+    }
+    if (g_iq3s_soa && (ty_gate == kIQ3_S || ty_up == kIQ3_S)) {
+        std::fprintf(stderr, "experts_gate_up_swiglu: re-laid IQ3_S rows need the dp4a path\n");
+        std::abort();
     }
     const dim3 g((unsigned) ((F + WARPS * ROWS - 1) / (WARPS * ROWS)), (unsigned) S);
     experts_gate_up_swiglu_kernel<WARPS, ROWS><<<g, WARPS * 32, xp_floats(C) * 4, s>>>(
@@ -5776,12 +5896,19 @@ void experts_gate_up_swiglu_g(const uint8_t* const* blob, const int* n, const in
         if (scr.get((size_t) n_x * C, (size_t) 1 << 16, s, xq, xs)) {
             quant_rows_i8_kernel<8><<<(unsigned) n_x, 256, 0, s>>>(x, C, xq, xs);
             constexpr int W = 8, NT = kGroupMax;
-            experts_gu_iq3s_dp4a_g_kernel<W, NT><<<dim3((unsigned) ((F + 2 * W - 1) / (2 * W)), (unsigned) G), W * 32,
-                                                   (size_t) NT * C + (size_t) NT * (C / 32) * 4, s>>>(
-                blob, n, tok, row, eb0, C, F, sg, su, gcap, ucap, h, xq, xs);
+            const dim3 gg((unsigned) ((F + 2 * W - 1) / (2 * W)), (unsigned) G);
+            const size_t sm = (size_t) NT * C + (size_t) NT * (C / 32) * 4;
+            if (g_iq3s_soa)
+                experts_gu_iq3s_dp4a_g_kernel<W, NT, true><<<gg, W * 32, sm, s>>>(blob, n, tok, row, eb0, C, F, sg, su, gcap, ucap, h, xq, xs);
+            else
+                experts_gu_iq3s_dp4a_g_kernel<W, NT><<<gg, W * 32, sm, s>>>(blob, n, tok, row, eb0, C, F, sg, su, gcap, ucap, h, xq, xs);
             check("experts_gate_up_swiglu_g (dp4a)");
             return;
         }
+    }
+    if (g_iq3s_soa && (ty_gate == kIQ3_S || ty_up == kIQ3_S)) {
+        std::fprintf(stderr, "experts_gate_up_swiglu_g: re-laid IQ3_S rows need the dp4a path\n");
+        std::abort();
     }
     const dim3 g((unsigned) ((F + kGroupWarps * kGroupSwigluRows - 1) / (kGroupWarps * kGroupSwigluRows)), (unsigned) G);
     experts_gate_up_swiglu_g_kernel<<<g, kGroupWarps * 32, 0, s>>>(blob, n, tok, row, ty_gate, ty_up, eb0, x, C, F,
