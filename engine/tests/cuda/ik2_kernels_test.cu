@@ -650,7 +650,7 @@ void ggml_iq3_xxs(const uint8_t* x, float* y, size_t k) {
         }
     }
 }
-// ggml's dequantize_row_iq3_s / dequantize_row_iq4_nl, transcribed (kmask_iq2xs[j] = 1 << j)
+// ggml's dequantize_row_iq3_s / dequantize_row_iq4_nl, transcribed
 static const uint32_t g_iq3s_grid[512] = {IK2_IQ3S_GRID};
 void ggml_iq3_s(const uint8_t* x, float* y, size_t k) {
     for (size_t i = 0; i < k / 256; ++i) {
@@ -2959,6 +2959,7 @@ void bench_experts() {
                 float ms = 0;
                 CU(cudaEventElapsedTime(&ms, a0, a1));
                 std::printf("bench %-28s %8.2f us (in a graph)\n", nm, ms * 1e3 / 5000);
+                cudaEventDestroy(a0), cudaEventDestroy(a1);
                 cudaGraphExecDestroy(ge), cudaGraphDestroy(gr), cudaStreamDestroy(cs);
             }
         for (float* p : sts) cudaFree(p);

@@ -1491,6 +1491,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     float *kd_p = W.dyn, *vd_p = W.dyn;
     // (a token over the planar Q8 rows: k's and v's short convs ride the product's launch, as on the resident path)
     const bool qkv_conv = Ly.sliding && T == 1 && !g_rec && g_dense_q8 && Ly.wqkvrg.N > 0 && Ly.wqkvrg.q8;
+    static const bool sink_prep = !getenv("IK2_SINK_PREP") || std::atoi(getenv("IK2_SINK_PREP"));
     if (Ly.sliding) {
         if (qkv_conv) {
             const Mat& m = Ly.wqkvrg;
@@ -1505,8 +1506,8 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             k_p = q_p + HD;
             v_p = k_p + KD;
             r_p = v_p + KD;
-            gate_p = r_p + HR;
-            gemm16(Ly.sink16, c.H, C, W.x16, T, sink_p, c.H);
+            gate_p = r_p + HR;   // (the sinks: the prep's launch, below)
+            if (!sink_prep) gemm16(Ly.sink16, c.H, C, W.x16, T, sink_p, c.H);
         } else if (Ly.wqkvrg.N > 0) {
             if (msg) {   // the fused rows by the input they take: q | k | v | r, gate (and the sink)
                 const int N = Ly.wqkvrg.N;
@@ -1609,18 +1610,23 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     // (a token's attention on the tensor cores: q made FP16 by the prep, the output gate applied by the merge)
     const bool mma1 = T == 1 && (g_attn_mma == 1 || (g_attn_mma == 2 && !Ly.sliding));
     uint16_t* q16 = mma1 ? W.x16 : nullptr;
+    // (qkv_conv: the token's sinks [H] = sink16 . x by the prep, as on the resident path - over x in F32)
+    const uint16_t* sk_w = qkv_conv && sink_prep ? Ly.sink16 : nullptr;
+    const float* sk_x = qkv_conv && sink_prep ? in_q : nullptr;
+    const int sk_k = qkv_conv && sink_prep ? C : 0;
+    float* sk_y = qkv_conv && sink_prep ? sink_p : nullptr;
     if (g_kv_i8) {
         k::prep_qkv_r_i8(q_p, Ly.q_clip, W.kconv, (int8_t*) Ly.kc8, W.vconv, (int8_t*) Ly.vc8, r_p, Ly.r_clip, T, c.H,
                          c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha,
-                         c.n_floor, pos0, Ly.kv_cap, g_s, q16);
+                         c.n_floor, pos0, Ly.kv_cap, g_s, q16, sk_w, sk_x, sk_k, sk_y);
     } else if (g_kv_fp8) {
         k::prep_qkv_r_fp8(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel,
                           c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
-                          Ly.kv_cap, k_scale, v_scale, g_s, q16);
+                          Ly.kv_cap, k_scale, v_scale, g_s, q16, sk_w, sk_x, sk_k, sk_y);
     } else {
         k::prep_qkv_r_f16(q_p, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel,
                           c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
-                          Ly.kv_cap, g_s, q16);
+                          Ly.kv_cap, g_s, q16, sk_w, sk_x, sk_k, sk_y);
     }
 
     const int extent = Ly.sliding ? c.extent_swa : c.extent;
@@ -3076,6 +3082,9 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         if (!g_dp.M) dp_init(M);
         dp_sync_tab(M, dev_cache(0));
         g_dp.dirty = false;
+        // (the captured tokens' graphs may hold what the change moved - the full layers' K / V after a growth - and a
+        //  later request's positions come round again: captured afresh)
+        g_dp.exec_pos[0] = g_dp.exec_pos[1] = -1;
     }
     if (!dp_tok && g_dp.M && !g_dp.dirty) {   // (another forward may change the cache: the copies drained, written back)
         CU(cudaDeviceSynchronize());
@@ -3207,7 +3216,9 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             }
         }
         g_pf.lap(g_pf.attn);
-        gemm16(Ly.router16, c.E, C, W.x16, T, W.rlog, c.E);
+        static const bool r32 = !getenv("IK2_ROUTER_F32X") || std::atoi(getenv("IK2_ROUTER_F32X"));
+        if (T == 1 && r32) k::mv_f16(Ly.router16, c.E, C, W.xq, W.rlog, g_s);   // (as the resident path: x in F32)
+        else gemm16(Ly.router16, c.E, C, W.x16, T, W.rlog, c.E);
         const int S = T * c.K;
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
@@ -5189,10 +5200,10 @@ int run(int argc, char** argv) {
     W.vconv = dalloc<float>(Tm * KD);
     W.rr = dalloc<float>(Tm * c.H * c.d_rel), W.sink = dalloc<float>(Tm * c.H);
     W.dyn = dalloc<float>(2 * Tm * c.KV * 4);   // (a full layer's dynamic taps: k's, and on the resident path v's beside)
-    // (at least 64 MiB of logits, which the prompt attention's non-flash path batches its queries into; with the flash
-    //  path's prompts a small card keeps only what a decode token's attention needs, plus 4 MiB - IK2_LG_MIN_MB, MiB)
-    const size_t lg_floor = getenv("IK2_LG_MIN_MB") ? (size_t) std::max(1, std::atoi(getenv("IK2_LG_MIN_MB"))) << 20
-                                                    : (size_t) (small_card && g_flash && !g_kv_fp8 ? 16 : 256) << 18;
+    // (at least 256 MiB of logits, which the prompt attention's non-flash path batches its queries into; with the flash
+    //  path's prompts a small card keeps only what a decode token's attention needs, plus 16 MiB - IK2_LG_MIN_MB)
+    const size_t lg_floor = (size_t) (getenv("IK2_LG_MIN_MB") ? std::max(1, std::atoi(getenv("IK2_LG_MIN_MB")))
+                                                              : (small_card && g_flash && !g_kv_fp8 ? 16 : 256)) << 18;   // (floats: N MiB)
     W.lg_cap = std::max((size_t) 8 * c.H * (size_t) ctx + (size_t) 8 * c.H * 128 * 130, lg_floor);
     W.lg = dalloc<float>(W.lg_cap);
     W.blocks = dalloc<float>((size_t) (c.n_layer / c.block + 1) * T_buf * C);
@@ -5485,6 +5496,19 @@ int run(int argc, char** argv) {
         return v;
     };
 
+    {   // the decode's one-token cuBLAS products run once before any token: their kernels' modules load lazily, and a
+        // first load in a device-plan token takes the driver's lock while the GPU waits on the plan's service thread
+        // - which needs that lock for its copies (a deadlock)
+        for (Layer& Ly : M.L) {
+            use_dev(Ly.dev);
+            Work& W = dev_work(Ly.dev);
+            if (Ly.sink16) gemm16(Ly.sink16, c.H, c.C, W.x16, 1, W.tmp, c.H);
+            if (Ly.sc_k_dyn16) gemm16(Ly.sc_k_dyn16, c.KV * 4, c.C, W.x16, 1, W.tmp, c.KV * 4);
+            if (Ly.router16) gemm16(Ly.router16, c.E, c.C, W.x16, 1, W.tmp, c.E);
+            CU(cudaDeviceSynchronize());
+        }
+        use_dev(0);
+    }
     if (serve) {
         // --serve: requests on stdin, a line each - "GEN max_new temperature top_p seed stop,stop ids,ids,..." - and
         // the answer on stdout as "@TOK id" lines then "@END reason prompt_tokens cached_tokens prompt_s gen_s".  The

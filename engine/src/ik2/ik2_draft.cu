@@ -301,9 +301,14 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     auto* d = new Drafter;
     {
         int dev = 0, mj = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, dev);
-        d->h16 = getenv("IK2_DRAFT_F16") ? std::atoi(getenv("IK2_DRAFT_F16")) != 0 : mj < 8;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            std::fprintf(stderr, "ik2 drafter: the device's compute capability unknown (%s): the BF16 path\n",
+                         cudaGetErrorString(cudaGetLastError()));
+            mj = 8;
+        }
+        const char* e = getenv("IK2_DRAFT_F16");
+        d->h16 = e ? std::atoi(e) != 0 : mj < 8;
     }
     d->C = C, d->ctx = ctx, d->blas = blas, d->s = s;
 

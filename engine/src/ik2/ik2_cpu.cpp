@@ -260,8 +260,8 @@ IK2_AVX2 void quant_q8_32(const float* x, int K, int8_t* q, float* sc) {
         a = _mm_max_ps(a, _mm_movehl_ps(a, a));
         a = _mm_max_ss(a, _mm_movehdup_ps(a));
         const float mx = _mm_cvtss_f32(a);
-        sc[b] = mx * (1.0f / 127.0f);
-        const __m256 f = _mm256_set1_ps(mx > 1e-30f ? 127.0f / mx : 0.0f);   // (a subnormal max: zero codes)
+        sc[b] = mx > 1e-30f ? mx * (1.0f / 127.0f) : 0.0f;   // (a subnormal max: zero codes, a zero scale)
+        const __m256 f = _mm256_set1_ps(mx > 1e-30f ? 127.0f / mx : 0.0f);
         __m256i v[4];
         for (int j = 0; j < 4; ++j) v[j] = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xb + 8 * j), f));   // (nearest)
         const __m256i p01 = _mm256_packs_epi32(v[0], v[1]), p23 = _mm256_packs_epi32(v[2], v[3]);
