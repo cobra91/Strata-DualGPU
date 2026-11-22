@@ -255,7 +255,8 @@ struct Layer {
     std::vector<float> scale[3];                   // empty: 1
     // a looped core's layer: its later passes' message gates by module (0 q's, 1 k's, 2 v's, 3 the MoE's) -
     // down [rank][2 C], forget and gain [rank][C] - and the four messages' queries [4][C] in that order (F32)
-    float *lp_down[4] = {}, *lp_forget[4] = {}, *lp_gain[4] = {}, *lp_query = nullptr;
+    uint16_t *lp_down[4] = {}, *lp_forget[4] = {}, *lp_gain[4] = {};   // (FP16)
+    float* lp_query = nullptr;
     // the resident token path (every expert in VRAM): where each expert's blocks are, and the experts' scales, on the
     // device ([E] each; a scale's null: 1)
     const uint8_t** tab_blob = nullptr;
@@ -675,6 +676,14 @@ std::vector<float> host_f32(const Shards& S, const std::string& n, size_t expect
         die(n + ": type " + t->type_name());
     }
     return v;
+}
+// F32 values as FP16 on the device (round to nearest)
+uint16_t* dev_f16_of(const std::vector<float>& v) {
+    std::vector<uint16_t> h(v.size());
+    for (size_t i = 0; i < v.size(); ++i) h[i] = __half_as_ushort(__float2half_rn(v[i]));
+    uint16_t* p = dalloc<uint16_t>(h.size());
+    CU(cudaMemcpy(p, h.data(), h.size() * 2, cudaMemcpyHostToDevice));
+    return p;
 }
 float* dev_f32(const std::vector<float>& v) {
     float* p = dalloc<float>(v.size());
@@ -1380,14 +1389,26 @@ void loop_gates_chunk(Work& W, const k::LoopGate* gt, int n, int T, int C, int R
     const float one = 1.0f, zero = 0.0f;
     float *a1 = W.lp_a, *a2 = a1 + (size_t) T * R, *g = a2 + (size_t) T * R;
     float *f = W.lp_f, *gn = f + (size_t) T * C;
+    // (the gates' FP16 weights as F32 for cuBLAS's SGEMMs: D [R][2 C], F, G [R][C], a gate at a time)
+    static float* w32 = nullptr;
+    static size_t w32_n = 0;
+    const size_t wn = (size_t) R * 2 * C + (size_t) 2 * R * C;
+    if (wn > w32_n) {
+        if (w32) cudaFree(w32);
+        w32 = dalloc<float>(w32_n = wn);
+    }
+    float *Dw = w32, *Fw = Dw + (size_t) R * 2 * C, *Gw = Fw + (size_t) R * C;
     for (int j = 0; j < n; ++j) {
+        k::f16_to_f32(gt[j].D, (size_t) R * 2 * C, Dw, g_s);
+        k::f16_to_f32(gt[j].F, (size_t) R * C, Fw, g_s);
+        k::f16_to_f32(gt[j].G, (size_t) R * C, Gw, g_s);
         // a1 [T][R] = x D_x^T, a2 = m D_m^T (D [R][2 C]: its rows' halves)
-        CB(cublasSgemm(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, R, T, C, &one, gt[j].D, 2 * C, gt[j].x, C, &zero, a1, R));
-        CB(cublasSgemm(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, R, T, C, &one, gt[j].D + C, 2 * C, gt[j].m, C, &zero, a2, R));
+        CB(cublasSgemm(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, R, T, C, &one, Dw, 2 * C, gt[j].x, C, &zero, a1, R));
+        CB(cublasSgemm(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, R, T, C, &one, Dw + C, 2 * C, gt[j].m, C, &zero, a2, R));
         k::loop_gate_mix(gt[j].x, gt[j].m, a1, a2, T, C, R, eps, g, g_s);
         // f [T][C] = g F, gn = g G (F, G [R][C])
-        CB(cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, C, T, R, &one, gt[j].F, C, g, R, &zero, f, C));
-        CB(cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, C, T, R, &one, gt[j].G, C, g, R, &zero, gn, C));
+        CB(cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, C, T, R, &one, Fw, C, g, R, &zero, f, C));
+        CB(cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, C, T, R, &one, Gw, C, g, R, &zero, gn, C));
         k::loop_gate_blend(gt[j].x, gt[j].m, f, gn, (size_t) T * C, gt[j].y, g_s);
     }
 }
@@ -4644,13 +4665,13 @@ int run(int argc, char** argv) {
             static const char* mod_loop[4] = {"q", "k", "v", "ffn"};   // (inkling2_loop: loop_<m>_ctrl_*)
             for (int m = 0; m < 4; ++m) {
                 const std::string p = loop_arch ? b + "loop_" + mod_loop[m] + "_ctrl_" : b + "loop_" + mod[m] + "_";
-                Ly.lp_down[m] = load_f32(S, p + "down.weight", (size_t) c.rank * 2 * C);
+                Ly.lp_down[m] = dev_f16_of(host_f32(S, p + "down.weight", (size_t) c.rank * 2 * C));
                 for (int fg = 0; fg < 2; ++fg) {   // (the file's [C][rank] by rank, [rank][C]: k::loop_gate's layout)
                     const auto w = host_f32(S, p + (fg ? "gain.weight" : "forget.weight"), C * c.rank);
                     std::vector<float> t(w.size());
                     for (size_t ch = 0; ch < C; ++ch)
                         for (int r = 0; r < c.rank; ++r) t[(size_t) r * C + ch] = w[ch * c.rank + r];
-                    (fg ? Ly.lp_gain[m] : Ly.lp_forget[m]) = dev_f32(t);
+                    (fg ? Ly.lp_gain[m] : Ly.lp_forget[m]) = dev_f16_of(t);
                 }
             }
             // loop_res_query: rows 2 i (q's) and 2 i + 1 (the MoE's) of core layer i; loop_kv_res_query: k's and v's

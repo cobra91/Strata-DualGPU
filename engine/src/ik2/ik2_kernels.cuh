@@ -149,12 +149,13 @@ void softcap(float* x, size_t n, float cap, cudaStream_t s);
 /// y = (1 - tanh(F g)) x + tanh(G g) m (F, G by rank: [R][C]).  x: the input, m: the message from the pass before,
 /// [T][C]; R <= 128; y may be x.  n <= 3 gates (a layer's q, k and v inputs) in two launches.
 /// sc: scratch, [n][T][2 R + 2] floats.
-struct LoopGate {
-    const float *x, *m, *D, *F, *G;
+struct LoopGate {   // (D, F, G: the gate's weights in FP16)
+    const float *x, *m;
+    const uint16_t *D, *F, *G;
     float* y;
 };
 void loop_gates(const LoopGate* gates, int n, int T, int C, int R, float eps, float* sc, cudaStream_t s);
-void loop_gate(const float* x, const float* m, const float* D, const float* F, const float* G, int T, int C, int R,
+void loop_gate(const float* x, const float* m, const uint16_t* D, const uint16_t* F, const uint16_t* G, int T, int C, int R,
                float eps, float* sc, float* y, cudaStream_t s);
 /// Sampling's candidates found on the device: of x [n] (its values within [lo, hi]: softcapped logits) every value
 /// of the highest bins that together hold K values at least (1024 bins over [lo, hi]) - K and a few more - gathered
@@ -433,6 +434,7 @@ void decode_host(int type, const uint8_t* blocks, size_t n, float* out);
 void mv_q8p_t(const int8_t* q, const uint16_t* d, int N, int K, const float* x, int T, float* y, int ldy,
               cudaStream_t s);
 size_t kv_row_bytes_i8(int KD);
+void f16_to_f32(const uint16_t* x, size_t n, float* y, cudaStream_t s);
 /// the dp4a expert calls' scratch growths so far (a captured graph from before a growth holds freed pointers)
 int scratch_epoch();
 void prep_qkv_r_i8(float* q, const float* q_clip, const float* k_in, int8_t* kc, const float* v_in, int8_t* vc,

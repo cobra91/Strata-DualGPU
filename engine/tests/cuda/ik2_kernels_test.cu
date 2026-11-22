@@ -1314,6 +1314,11 @@ void test_token_path() {
         const float eps = 1e-6f;
         auto x = fvec((size_t) T * C, 2.0f), m = fvec((size_t) T * C, 2.0f), D = fvec((size_t) R * 2 * C, 0.05f),
              F = fvec((size_t) R * C, 0.3f), G = fvec((size_t) R * C, 0.3f);
+        // (the gates' weights are FP16 on the device: the reference's are those values)
+        std::vector<uint16_t> D16(D.size()), F16(F.size()), G16(G.size());
+        for (size_t i = 0; i < D.size(); ++i) D16[i] = f2h_host(D[i]), D[i] = h2f_host(D16[i]);
+        for (size_t i = 0; i < F.size(); ++i) F16[i] = f2h_host(F[i]), F[i] = h2f_host(F16[i]);
+        for (size_t i = 0; i < G.size(); ++i) G16[i] = f2h_host(G[i]), G[i] = h2f_host(G16[i]);
         std::vector<double> want((size_t) T * C), a1((size_t) T * R), a2((size_t) T * R), fw((size_t) T * C), gw((size_t) T * C);
         for (int t = 0; t < T; ++t) {
             double sx = 0, sm = 0;
@@ -1336,7 +1341,8 @@ void test_token_path() {
                 want[(size_t) t * C + c] = (1.0 - std::tanh(f)) * x[(size_t) t * C + c] + std::tanh(gn) * m[(size_t) t * C + c];
             }
         }
-        float *dx = dev(x), *dm = dev(m), *dD = dev(D), *dF = dev(F), *dG = dev(G), *dy = dev_n<float>((size_t) T * C);
+        float *dx = dev(x), *dm = dev(m), *dy = dev_n<float>((size_t) T * C);
+        uint16_t *dD = dev(D16), *dF = dev(F16), *dG = dev(G16);
         float* dsc = dev_n<float>((size_t) 3 * T * (2 * R + 2));
         const k::LoopGate gt{dx, dm, dD, dF, dG, dy};
         k::loop_gates(&gt, 1, T, C, R, eps, dsc, 0);
@@ -1357,7 +1363,8 @@ void test_token_path() {
         CU(cudaMemset(dy, 0, (size_t) T * C * sizeof(float)));
         k::loop_gate_blend(dx, dm, df, dgn, (size_t) T * C, dy, 0);
         expect("loop_gate_mix, loop_gate_blend (a chunk's)", host(dy, want.size()), want, 2e-4, 2e-4);
-        for (float* p : {dx, dm, dD, dF, dG, dy, dsc, da1, da2, dg, df, dgn}) cudaFree(p);
+        for (float* p : {dx, dm, dy, dsc, da1, da2, dg, df, dgn}) cudaFree(p);
+        cudaFree(dD), cudaFree(dF), cudaFree(dG);
     }
 }
 

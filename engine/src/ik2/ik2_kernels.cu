@@ -1993,7 +1993,8 @@ __global__ void softcap_kernel(float* x, size_t n, float cap) {
 // sc [n][T][2 R + 2]: per gate and token, the two halves of each g before the norms (D's x columns . x, its m columns
 // . m), then the two sums of squares.
 struct LoopGateArgs {
-    const float *x[3], *m[3], *D[3], *F[3], *G[3];
+    const float *x[3], *m[3];
+    const uint16_t *D[3], *F[3], *G[3];   // (FP16: the gates' weights, half the bytes - ~0.2 GB a token in F32)
     float* y[3];
 };
 constexpr int kLoopRankMax = 128;
@@ -2003,11 +2004,11 @@ __global__ void loop_gate_dots_kernel(LoopGateArgs a, int T, int C, int R, float
     const int r = blockIdx.x, j = blockIdx.y, t = blockIdx.z, tid = threadIdx.x, warp = tid >> 5;
     const float* xr = a.x[j] + (size_t) t * C;
     const float* mr = a.m[j] + (size_t) t * C;
-    const float* dr = a.D[j] + (size_t) r * 2 * C;
+    const uint16_t* dr = a.D[j] + (size_t) r * 2 * C;
     float ax = 0.0f, am = 0.0f, sx = 0.0f, sm = 0.0f;
     for (int c = tid; c < C; c += 128) {
         const float xv = xr[c], mv = mr[c];
-        ax += dr[c] * xv, am += dr[C + c] * mv;
+        ax += h2f(dr[c]) * xv, am += h2f(dr[C + c]) * mv;
         sx += xv * xv, sm += mv * mv;
     }
     ax = wsum(ax), am = wsum(am), sx = wsum(sx), sm = wsum(sm);
@@ -2036,12 +2037,12 @@ __global__ void loop_gate_apply_kernel(LoopGateArgs a, int T, int C, int R, floa
     __syncthreads();
     const int c = (int) blockIdx.x * kBlk + tid;
     if (c >= C) return;
-    const float* F = a.F[j];
-    const float* G = a.G[j];
+    const uint16_t* F = a.F[j];
+    const uint16_t* G = a.G[j];
     float f = 0.0f, gn = 0.0f;
     for (int r = 0; r < R; ++r) {
         const float gv = sh_g[r];
-        f += F[(size_t) r * C + c] * gv, gn += G[(size_t) r * C + c] * gv;
+        f += h2f(F[(size_t) r * C + c]) * gv, gn += h2f(G[(size_t) r * C + c]) * gv;
     }
     const size_t i = (size_t) t * C + c;
     a.y[j][i] = (1.0f - tanhf(f)) * a.x[j][i] + tanhf(gn) * a.m[j][i];
@@ -4870,7 +4871,7 @@ void loop_gates(const LoopGate* gt, int n, int T, int C, int R, float eps, float
         a, T, C, R, eps, sc);
     check("loop_gates (apply)");
 }
-void loop_gate(const float* x, const float* m, const float* D, const float* F, const float* G, int T, int C, int R,
+void loop_gate(const float* x, const float* m, const uint16_t* D, const uint16_t* F, const uint16_t* G, int T, int C, int R,
                float eps, float* sc, float* y, cudaStream_t s) {
     const LoopGate g{x, m, D, F, G, y};
     loop_gates(&g, 1, T, C, R, eps, sc, s);
@@ -6009,3 +6010,15 @@ size_t kv_row_bytes_i8(int KD) { return (size_t) kv_row<int8_t>(KD); }
 namespace ik2::k {
 int scratch_epoch() { return g_scratch_epoch; }
 }
+
+namespace ik2::k {
+__global__ void f16_to_f32_kernel_k(const uint16_t* x, size_t n, float* y) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = h2f(x[i]);
+}
+void f16_to_f32(const uint16_t* x, size_t n, float* y, cudaStream_t s) {
+    if (!n) return;
+    f16_to_f32_kernel_k<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(x, n, y);
+    check("f16_to_f32");
+}
+}  // namespace ik2::k
