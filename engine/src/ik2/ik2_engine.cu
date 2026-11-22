@@ -3730,7 +3730,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                     continue;
                 }
                 k::experts_gate_up_swiglu(pb + p0, ptk + p0, n, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, F, psg + p0,
-                                          psu + p0, c.gate_cap, c.up_cap, W.h16 + (size_t) p0 * F, g_s);
+                                          psu + p0, c.gate_cap, c.up_cap, W.h16 + (size_t) p0 * F, g_s, T);
                 k::experts_down(pb + p0, n, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16 + (size_t) p0 * F, C, F,
                                 W.y32 + (size_t) p0 * C, g_s);
             }
