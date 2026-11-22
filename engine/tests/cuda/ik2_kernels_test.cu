@@ -14,6 +14,7 @@
 //     exact), NVFP4 against the format's definition.  (Q8_0 / Q5_K / Q6_K against ggml's values: not here yet - the
 //     real model's seams cover them.)
 #include "../../src/ik2/ik2_iq_tables.h"
+#include "../../src/ik2/ik2_cpu.hpp"
 #include "../../src/ik2/ik2_kernels.cuh"
 
 #include <cuda_fp16.h>
@@ -2836,6 +2837,8 @@ void test_iq3s_soa() {
     uint16_t* hg = dev_n<uint16_t>((size_t) 3 * F);
     uint16_t* w16 = dev_n<uint16_t>((size_t) 2 * F * C);
     std::vector<uint16_t> a[3], b[3];
+    const bool dp4a_was = k::g_dp4a;
+    k::g_dp4a = true;   // (the re-laid rows' readers are the dp4a kernels)
     for (int pass = 0; pass < 2; ++pass) {
         if (pass) {
             for (int e = 0; e < NE; ++e) k::iq3s_rows_soa(db + (size_t) e * eb, 2 * F, C, 0);
@@ -2850,6 +2853,22 @@ void test_iq3s_soa() {
         o[0] = host(h, (size_t) S * F), o[1] = host(hg, (size_t) 3 * F), o[2] = host(w16, (size_t) 2 * F * C);
     }
     k::g_iq3s_soa = false;
+    k::g_dp4a = dp4a_was;
+    {   // the host's re-laying (the engine's: ik2::cpu::iq3s_rows_soa_host) = the device's, and the CPU lane's dots
+        std::vector<uint8_t> hs(hb.begin(), hb.begin() + 2 * eb0), ds = host(db, 2 * eb0);   // (expert 0's gate / up)
+        ik2::cpu::iq3s_rows_soa_host(hs.data(), 2 * F, C);
+        // (the layout follows the address mod 8: the host copy's base and the device's are both 8-byte aligned)
+        expect_true("IQ3_S re-laid: the host's bytes = the device's", hs == ds);
+        if (ik2::cpu::available_for(k::kIQ3_S)) {
+            std::vector<float> xf((size_t) C), y0(F), y1(F);
+            for (int i = 0; i < C; ++i) xf[i] = x[i];
+            ik2::cpu::rows(k::kIQ3_S, hb.data(), C, 0, F, xf.data(), y0.data());
+            ik2::cpu::g_iq3s_soa = true;
+            ik2::cpu::rows(k::kIQ3_S, hs.data(), C, 0, F, xf.data(), y1.data());
+            ik2::cpu::g_iq3s_soa = false;
+            expect_true("IQ3_S re-laid: the CPU lane's dot, bit for bit", y0 == y1);
+        }
+    }
     expect_true("IQ3_S re-laid: gate_up a token's, bit for bit", a[0] == b[0]);
     expect_true("IQ3_S re-laid: gate_up a group's, bit for bit", a[1] == b[1]);
     expect_true("IQ3_S re-laid: the FP16 decode, bit for bit", a[2] == b[2]);

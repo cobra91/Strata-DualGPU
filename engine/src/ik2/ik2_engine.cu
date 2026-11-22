@@ -3753,9 +3753,9 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             k::experts_gate_up_swiglu_g((const uint8_t* const*) W.rg_d, (const int*) (W.rg_d + o_n),
                                         (const int*) (W.rg_d + o_tok), (const int*) (W.rg_d + o_row), G, Ly.ty[0],
                                         Ly.ty[1], Ly.eb[0], W.xq, C, c.F, (const float*) (W.rg_d + o_sg),
-                                        (const float*) (W.rg_d + o_su), c.gate_cap, c.up_cap, W.h16, g_s);
+                                        (const float*) (W.rg_d + o_su), c.gate_cap, c.up_cap, W.h16, g_s, T);
             k::experts_down_g((const uint8_t* const*) W.rg_d, (const int*) (W.rg_d + o_n), (const int*) (W.rg_d + o_row),
-                              G, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+                              G, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s, T * c.K);
             k::moe_combine_f32(W.y32, (const int*) (W.rg_d + o_id), (const float*) (W.rg_d + o_wt), T, c.K, C, W.tmp,
                                false, g_s);
             g_pf.lap(g_pf.experts);
@@ -4600,8 +4600,11 @@ int run(int argc, char** argv) {
     if (c.n_layer <= 0 || c.core1 > c.n_layer) die("the looped core runs past the model's layers");
     {   // the pattern is a visit's; a layer's is its first visit's (the same in every pass)
         const auto* sp = S.get(a + "attention.sliding_window_pattern");
-        const bool per_layer = loop_arch && sp && (int) sp->items.size() == c.n_layer && c.n_layer != c.n_visit;
-        if (!sp || ((int) sp->items.size() != c.n_visit && !per_layer)) die("sliding_window_pattern");
+        // (the reader keeps 64 of an array's items: its count is the length)
+        const int np = sp ? (int) sp->count : 0;
+        const bool per_layer = loop_arch && sp && np == c.n_layer && c.n_layer != c.n_visit;
+        if (!sp || (np != c.n_visit && !per_layer)) die("sliding_window_pattern");
+        if ((int) sp->items.size() < np) die("sliding_window_pattern: longer than the GGUF reader keeps (64)");
         for (int l = 0; l < c.n_layer; ++l)
             c.sliding.push_back(sp->items[per_layer || l < c.core1 ? l : l + (c.n_pass - 1) * n_core].u != 0);
     }
@@ -5509,15 +5512,28 @@ int run(int argc, char** argv) {
     }
     // the link's time an expert for the CPU lane's choice: one slot copied in from pinned host memory, timed (the
     // estimate 0.36 ms is PCIe 5's; an RTX 2060 SUPER on PCIe 3.0 x8 takes ~0.55 ms a 3.6 MiB expert)
-    if (small_card && g_pool && !getenv("IK2_UP_MS") && !EC.pools.empty() && EC.pools[0].n_slots > 0 && M.L[0].host[0]) {
-        const auto& P0 = EC.pools[0];
+    // (an expert in VRAM copied onto its own slot again - the same bytes - at its layer's slot size)
+    int tl = -1, te = -1;
+    for (int l = 0; l < c.n_layer && tl < 0 && EC.tp < 0 && !EC.loc.empty(); ++l)
+        for (int e = 0; e < c.E && tl < 0; ++e)
+            if (EC.layer_pool[l] >= 0 && EC.loc[(size_t) l * c.E + e] >= 0 && M.L[l].host_contig && M.L[l].host[0]) tl = l, te = e;
+    int tslot = tl >= 0 ? EC.loc[(size_t) tl * c.E + te] : -1;
+    if (tl < 0 && EC.tp < 0 && !EC.layer_pool.empty() && EC.layer_pool[0] >= 0 && M.L[0].host_contig && M.L[0].host[0]) {
+        const auto& P = EC.pools[EC.layer_pool[0]];   // (none in VRAM yet: a slot nobody holds, layer 0's expert 0)
+        for (int s2 = 0; s2 < P.n_active && tslot < 0; ++s2)
+            if (P.owner[s2] < 0) tl = 0, te = 0, tslot = s2;
+    }
+    if (small_card && g_pool && !getenv("IK2_UP_MS") && tl >= 0 && tslot >= 0) {
+        const auto& P0 = EC.pools[EC.layer_pool[tl]];
+        uint8_t* const t_dst = P0.data + (size_t) tslot * P0.slot_bytes;
+        const uint8_t* const t_src = M.L[tl].host[0] + (size_t) te * M.L[tl].slot_bytes;
         float best = 1e9f;
         cudaEvent_t e0, e1;
         CU(cudaEventCreate(&e0));
         CU(cudaEventCreate(&e1));
         for (int i = 0; i < 4; ++i) {
             CU(cudaEventRecord(e0, g_s));
-            CU(cudaMemcpyAsync(P0.data, M.L[0].host[0], P0.slot_bytes, cudaMemcpyHostToDevice, g_s));
+            CU(cudaMemcpyAsync(t_dst, t_src, M.L[tl].slot_bytes, cudaMemcpyHostToDevice, g_s));
             CU(cudaEventRecord(e1, g_s));
             CU(cudaEventSynchronize(e1));
             float ms = 0;
@@ -5527,7 +5543,7 @@ int run(int argc, char** argv) {
         CU(cudaEventDestroy(e0));
         CU(cudaEventDestroy(e1));
         g_t_up = 1.1 * best * 1e-3;   // (+10%: the copies queue behind each other in a layer)
-        std::printf("CPU lane: the link takes %.2f ms an expert (%.1f GB/s)\n", g_t_up * 1e3, P0.slot_bytes / (best * 1e6));
+        std::printf("CPU lane: the link takes %.2f ms an expert (%.1f GB/s)\n", g_t_up * 1e3, M.L[tl].slot_bytes / (best * 1e6));
     }
     const char* wf = getenv("IK2_WARM");
     if ((wf && *wf) || g_ep) {   // the cache filled with the most picked experts (IK2_POP_OUT's file or all owned for EP)
@@ -5675,7 +5691,7 @@ int run(int argc, char** argv) {
             Work& W = dev_work(Ly.dev);
             if (Ly.sink16) gemm16(Ly.sink16, c.H, c.C, W.x16, 1, W.tmp, c.H);
             if (Ly.sc_k_dyn16) gemm16(Ly.sc_k_dyn16, c.KV * 4, c.C, W.x16, 1, W.tmp, c.KV * 4);
-            if (Ly.router16) gemm16(Ly.router16, c.E, c.C, W.x16, 1, W.tmp, c.E);
+            if (Ly.router16) gemm16(Ly.router16, c.E, c.C, W.x16, 1, W.tmp, c.E), k::mv_f16(Ly.router16, c.E, c.C, W.xq, W.tmp, g_s);
             CU(cudaDeviceSynchronize());
         }
         use_dev(0);

@@ -301,11 +301,13 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     auto* d = new Drafter;
     {
         int dev = 0, mj = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess ||
-            cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
-            std::fprintf(stderr, "ik2 drafter: the device's compute capability unknown (%s): the BF16 path\n",
-                         cudaGetErrorString(cudaGetLastError()));
-            mj = 8;
+        cudaError_t er = cudaGetDevice(&dev);
+        if (er == cudaSuccess) er = cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, dev);
+        if (er != cudaSuccess) {
+            std::fprintf(stderr, "ik2 drafter: the device's compute capability unknown (%s): the FP16 path\n",
+                         cudaGetErrorString(er));
+            cudaGetLastError();
+            mj = 0;   // (FP16 works on every card; BF16 only from sm_80)
         }
         const char* e = getenv("IK2_DRAFT_F16");
         d->h16 = e ? std::atoi(e) != 0 : mj < 8;

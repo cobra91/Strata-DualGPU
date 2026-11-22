@@ -5922,6 +5922,10 @@ void prep_qkv_r_f16(float* q, const float* q_clip, const float* k_in, uint16_t* 
                     float rel_clip, float eps, const int* pos, float alpha, float n_floor, int pos0, int kv_cap,
                     cudaStream_t s, uint16_t* q16, const uint16_t* sink_w, const float* sink_x, int sink_k, float* sink_y) {
     if (T <= 0) return;
+    if (sink_w && T != 1) {   // (the sinks' blocks are one token's)
+        std::fprintf(stderr, "ik2::k::prep_qkv_r: the sinks for T %d (one token's only)\n", T);
+        std::abort();
+    }
     const int total = T * (2 * H + 2 * KV) + (sink_w ? H : 0);   // (and T 1's sinks: H blocks more)
     prep_qkv_r_impl_kernel<uint16_t><<<(unsigned) total, 32, 0, s>>>(
         q, q_clip, k_in, kc, v_in, vc, r, r_clip, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, pos, alpha, n_floor,
@@ -5934,6 +5938,10 @@ void prep_qkv_r_fp8(float* q, const float* q_clip, const float* k_in, uint8_t* k
                     float rel_clip, float eps, const int* pos, float alpha, float n_floor, int pos0, int kv_cap,
                     float k_scale, float v_scale, cudaStream_t s, uint16_t* q16, const uint16_t* sink_w, const float* sink_x, int sink_k, float* sink_y) {
     if (T <= 0) return;
+    if (sink_w && T != 1) {   // (the sinks' blocks are one token's)
+        std::fprintf(stderr, "ik2::k::prep_qkv_r: the sinks for T %d (one token's only)\n", T);
+        std::abort();
+    }
     const int total = T * (2 * H + 2 * KV) + (sink_w ? H : 0);   // (and T 1's sinks: H blocks more)
     prep_qkv_r_impl_kernel<uint8_t><<<(unsigned) total, 32, 0, s>>>(
         q, q_clip, k_in, kc, v_in, vc, r, r_clip, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, pos, alpha, n_floor,
@@ -6322,6 +6330,10 @@ void prep_qkv_r_i8(float* q, const float* q_clip, const float* k_in, int8_t* kc,
                    float rel_clip, float eps, const int* pos, float alpha, float n_floor, int pos0, int kv_cap,
                    cudaStream_t s, uint16_t* q16, const uint16_t* sink_w, const float* sink_x, int sink_k, float* sink_y) {
     if (T <= 0) return;
+    if (sink_w && T != 1) {   // (the sinks' blocks are one token's)
+        std::fprintf(stderr, "ik2::k::prep_qkv_r: the sinks for T %d (one token's only)\n", T);
+        std::abort();
+    }
     if (D % 64) {
         std::fprintf(stderr, "ik2::k::prep_qkv_r_i8: D = %d, not a multiple of 64\n", D);
         std::abort();
