@@ -433,6 +433,8 @@ void decode_host(int type, const uint8_t* blocks, size_t n, float* out);
 void mv_q8p_t(const int8_t* q, const uint16_t* d, int N, int K, const float* x, int T, float* y, int ldy,
               cudaStream_t s);
 size_t kv_row_bytes_i8(int KD);
+/// the dp4a expert calls' scratch growths so far (a captured graph from before a growth holds freed pointers)
+int scratch_epoch();
 void prep_qkv_r_i8(float* q, const float* q_clip, const float* k_in, int8_t* kc, const float* v_in, int8_t* vc,
                    float* r, const float* r_clip, int T, int H, int KV, int D, int d_rel, float qk_clip,
                    float rel_clip, float eps, const int* pos, float alpha, float n_floor, int pos0, int kv_cap,

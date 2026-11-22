@@ -5228,28 +5228,45 @@ __global__ void __launch_bounds__(WARPS * 32) experts_down_iq4nl_dp4a_kernel(con
 }
 }  // namespace
 bool g_dp4a = !getenv("IK2_DP4A") || std::atoi(getenv("IK2_DP4A"));
+// the int8 inputs' scratch of the dp4a expert calls: one a device (the dual-GPU paths call them on both), grown only
+// outside a graph capture; scratch_epoch counts the growths (a captured graph holds the old pointers: see the engine)
+int g_scratch_epoch = 0;
+struct Q8Scratch {
+    int8_t* q[16] = {};
+    float* sc[16] = {};
+    size_t cap[16] = {};
+    bool get(size_t need, size_t floor_, cudaStream_t s, int8_t*& qo, float*& so) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (dev < 0 || dev >= 16) return false;
+        if (need > cap[dev]) {
+            cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+            cudaStreamIsCapturing(s, &cs);
+            if (cs != cudaStreamCaptureStatusNone) return false;
+            if (q[dev]) cudaFree(q[dev]), cudaFree(sc[dev]);
+            cap[dev] = std::max(need, floor_);
+            if (cudaMalloc(&q[dev], cap[dev]) != cudaSuccess || cudaMalloc(&sc[dev], cap[dev] / 32 * 4) != cudaSuccess)
+                check("dp4a scratch");
+            ++g_scratch_epoch;
+        }
+        qo = q[dev], so = sc[dev];
+        return true;
+    }
+};
+
 void experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_down, const uint16_t* h, int C, int F,
                   float* y, cudaStream_t s) {
     if (S <= 0) return;
     if (g_dp4a && ty_down == kIQ4_NL && F % 32 == 0) {
         constexpr int W = 4;
         static const bool pre = !getenv("IK2_DN_PRE") || std::atoi(getenv("IK2_DN_PRE"));
-        static int8_t* xq = nullptr;   // (the activations made int8 once a call; allocated outside any graph capture)
-        static float* xs = nullptr;
-        static size_t cap = 0;
-        const size_t need = (size_t) S * F;
-        if (pre && need > cap) {
-            cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
-            cudaStreamIsCapturing(s, &cs);
-            if (cs == cudaStreamCaptureStatusNone) {
-                if (xq) cudaFree(xq), cudaFree(xs);
-                cap = std::max<size_t>(need, (size_t) 64 * F);
-                if (cudaMalloc(&xq, cap) != cudaSuccess || cudaMalloc(&xs, cap / 32 * 4) != cudaSuccess) check("down scratch");
-            }
-        }
+        static Q8Scratch scr;   // (the activations made int8 once a call)
+        int8_t* xq = nullptr;
+        float* xs = nullptr;
+        const bool got = pre && scr.get((size_t) S * F, (size_t) 64 * F, s, xq, xs);
         const dim3 g((unsigned) ((C + 8 * W - 1) / (8 * W)), (unsigned) S);
         const size_t sm = (size_t) F + (size_t) F / 32 * 4;
-        if (pre && need <= cap) {
+        if (got) {
             quant_h_rows_i8_kernel<8><<<(unsigned) S, 256, 0, s>>>((const uint16_t* const*) blob, h, F, xq, xs);
             experts_down_iq4nl_dp4a_kernel<W, true><<<g, W * 32, sm, s>>>(blob, off_down, h, C, F, y, xq, xs);
         } else {
@@ -5416,25 +5433,14 @@ __global__ void __launch_bounds__(WARPS * 32) experts_down_iq4nl_dp4a_g_kernel(
         }
     }
 }
-// (the scratch for the grouped dp4a calls' int8 inputs: grown outside graph captures only)
-static bool grow_q8_scratch(int8_t*& q, float*& sc, size_t& cap, size_t need, cudaStream_t s) {
-    if (need <= cap) return true;
-    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
-    cudaStreamIsCapturing(s, &cs);
-    if (cs != cudaStreamCaptureStatusNone) return false;
-    if (q) cudaFree(q), cudaFree(sc);
-    cap = std::max<size_t>(need, (size_t) 1 << 16);
-    if (cudaMalloc(&q, cap) != cudaSuccess || cudaMalloc(&sc, cap / 32 * 4) != cudaSuccess) check("grouped dp4a scratch");
-    return true;
-}
 void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, int G, int ty_down, size_t off_down,
                     const uint16_t* h, int C, int F, float* y, cudaStream_t s, int n_h) {
     if (G <= 0) return;
     if (g_dp4a && ty_down == kIQ4_NL && F % 32 == 0 && n_h > 0) {   // (n_h: h's rows, made int8 once)
-        static int8_t* xq = nullptr;
-        static float* xs = nullptr;
-        static size_t cap = 0;
-        if (grow_q8_scratch(xq, xs, cap, (size_t) n_h * F, s)) {
+        static Q8Scratch scr;
+        int8_t* xq = nullptr;
+        float* xs = nullptr;
+        if (scr.get((size_t) n_h * F, (size_t) 1 << 16, s, xq, xs)) {
             quant_rows_h_i8_kernel<8><<<(unsigned) n_h, 256, 0, s>>>(h, F, xq, xs);
             constexpr int W = 4, NT = kGroupMax;
             experts_down_iq4nl_dp4a_g_kernel<W, NT><<<dim3((unsigned) ((C + 8 * W - 1) / (8 * W)), (unsigned) G), W * 32,
@@ -5459,23 +5465,14 @@ void launch_experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, i
         constexpr int Wn = 8, Pn = 1;   // (RTX 2060 SUPER: 8 warps and a row pair each, 145 us for 8 experts; 4 x 2: 153)
         static const int V = getenv("IK2_GU_VAR") ? std::atoi(getenv("IK2_GU_VAR")) : 7;   // 1: x once a call, 2: signs by arithmetic
         // (the codes made once a call - n_x rows of x - into a scratch that exists before any graph capture)
-        static int8_t* xq = nullptr;
-        static float* xs = nullptr;
-        static size_t cap = 0;
-        const size_t need = (size_t) std::max(0, n_x) * C;
-        if ((V & 1) && n_x > 0 && need > cap) {
-            cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
-            cudaStreamIsCapturing(s, &cs);
-            if (cs == cudaStreamCaptureStatusNone) {
-                if (xq) cudaFree(xq), cudaFree(xs);
-                cap = std::max<size_t>(need, (size_t) 8 * C);
-                if (cudaMalloc(&xq, cap) != cudaSuccess || cudaMalloc(&xs, cap / 32 * 4) != cudaSuccess) check("gate_up scratch");
-            }
-        }
+        static Q8Scratch scr;
+        int8_t* xq = nullptr;
+        float* xs = nullptr;
+        const bool got = (V & 1) && n_x > 0 && scr.get((size_t) n_x * C, (size_t) 8 * C, s, xq, xs);
         const dim3 g((unsigned) ((F + 2 * Wn * Pn - 1) / (2 * Wn * Pn)), (unsigned) S);
         const size_t sm = (size_t) C + (size_t) C / 32 * 4;
         const int hl = h_ld > 0 ? h_ld : F;
-        if ((V & 1) && n_x > 0 && need <= cap) {
+        if (got) {
             quant_rows_i8_kernel<8><<<(unsigned) n_x, 256, 0, s>>>(x, C, xq, xs);
             if ((V & 4) && C == 2304) experts_gu_iq3s_dp4a_kernel<Wn, Pn, true, true, 72><<<g, Wn * 32, sm, s>>>(blob, tok, eb0, x, C, F, sg, su, gcap, ucap, h, orow, hl, xq, xs);
             else if (V & 2) experts_gu_iq3s_dp4a_kernel<Wn, Pn, true, true><<<g, Wn * 32, sm, s>>>(blob, tok, eb0, x, C, F, sg, su, gcap, ucap, h, orow, hl, xq, xs);
@@ -5507,7 +5504,7 @@ void experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, int S, i
                             uint16_t* h, cudaStream_t s, int n_x) {
     if (S <= 0) return;
     if (S <= 8) launch_experts_gate_up_swiglu<4, 2>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, sg, su, gcap, ucap, h, s, nullptr, 0, n_x);
-    else launch_experts_gate_up_swiglu<4, 4>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, sg, su, gcap, ucap, h, s);
+    else launch_experts_gate_up_swiglu<4, 4>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, sg, su, gcap, ucap, h, s, nullptr, 0, n_x);
     check("experts_gate_up_swiglu");
 }
 
@@ -5516,10 +5513,10 @@ void experts_gate_up_swiglu_g(const uint8_t* const* blob, const int* n, const in
                               const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s, int n_x) {
     if (G <= 0) return;
     if (g_dp4a && ty_gate == kIQ3_S && ty_up == kIQ3_S && C % 256 == 0 && n_x > 0) {   // (n_x: x's rows)
-        static int8_t* xq = nullptr;
-        static float* xs = nullptr;
-        static size_t cap = 0;
-        if (grow_q8_scratch(xq, xs, cap, (size_t) n_x * C, s)) {
+        static Q8Scratch scr;
+        int8_t* xq = nullptr;
+        float* xs = nullptr;
+        if (scr.get((size_t) n_x * C, (size_t) 1 << 16, s, xq, xs)) {
             quant_rows_i8_kernel<8><<<(unsigned) n_x, 256, 0, s>>>(x, C, xq, xs);
             constexpr int W = 8, NT = kGroupMax;
             experts_gu_iq3s_dp4a_g_kernel<W, NT><<<dim3((unsigned) ((F + 2 * W - 1) / (2 * W)), (unsigned) G), W * 32,
@@ -6008,3 +6005,7 @@ void unpack_kv_i8_to_f16(const int8_t* kc, const int8_t* vc, int kv_cap, int k0,
 }
 size_t kv_row_bytes_i8(int KD) { return (size_t) kv_row<int8_t>(KD); }
 }  // namespace ik2::k
+
+namespace ik2::k {
+int scratch_epoch() { return g_scratch_epoch; }
+}

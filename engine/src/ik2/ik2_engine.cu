@@ -311,9 +311,9 @@ cublasHandle_t g_blas;
 cudaStream_t g_s;
 cudaStream_t g_cs;          // the experts' copies of the token path, beside the compute stream
 cudaEvent_t g_ev;
-bool g_tg_capturing = false;
+bool g_tg_capturing = false;   // IK2_TOKGRAPH: a decode token's graph being captured
 // the device plan's counters set back once this many visits were planned (a token past it runs without a graph)
-const long long g_dp_reset_at = getenv("IK2_DP_RESET_AT") ? std::atoll(getenv("IK2_DP_RESET_AT")) : (1LL << 30);   // IK2_TOKGRAPH: a decode token's graph being captured
+const long long g_dp_reset_at = getenv("IK2_DP_RESET_AT") ? std::atoll(getenv("IK2_DP_RESET_AT")) : (1LL << 30);
 bool g_overlap = true;      // IK2_OVERLAP=0: the copies on the compute stream, before the experts
 // The CPU lane (IK2_CPU=1: on): a missing NVFP4 expert computed in host memory by the pool while the others' blocks
 // are copied; its own blocks follow on the copy stream without being waited for ("lazy"), so it is in VRAM next time.
@@ -2489,6 +2489,7 @@ struct DevPlan {
     float* emb = nullptr;
     cudaGraphExec_t exec[2] = {nullptr, nullptr};
     int exec_pos[2] = {-1, -1};
+    int exec_ep = 0;   // (k::scratch_epoch() the graphs were captured at: a growth since frees what they hold)
 } g_dp;
 __global__ void k_set_int(int* p, int v) { *p = v; }
 __device__ __forceinline__ int dp_ld_sys(const volatile int* p) {
@@ -2745,7 +2746,8 @@ void dp_service() {
         const uint8_t* rec = g_dp.rec_h + (size_t) (next % g_dp.R) * g_dp.rec_bytes;
         const int* hd = (const int*) rec;
         const float* xr = (const float*) (rec + kDpHdr);
-        const Layer& Ly = M.L[hd[1]];
+        const int lay = hd[1];   // (read before the record is released: ctl[2] lets the GPU reuse it)
+        const Layer& Ly = M.L[lay];
         const int T = std::max(1, std::min(kDpT, hd[2])), S = T * g_dp.K;
         float* ey = g_dp.ey_h + (size_t) (next % g_dp.R) * kDpS * g_dp.C;
         const uint64_t t = ++g_dp.tick;
@@ -2785,7 +2787,7 @@ void dp_service() {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         g_dp.ctl[2] = next;
         ++next;
-        for (int j = 0; j < n; ++j) dp_request(hd[1], ej[j]);
+        for (int j = 0; j < n; ++j) dp_request(lay, ej[j]);
         if (n) dp_advance(false);
     }
 }
@@ -4174,7 +4176,9 @@ int run(int argc, char** argv) {
         else die("unknown IK2_KV=" + kv + " (expected fp8, i8 or f16)");
         if (g_kv_fp8) {   // (the prompt attention's FP8 tiles need more shared memory than a block gets before sm_80)
             int mj = 99;
-            for (int d = 0; d < std::max(1, n_gpu); ++d) {   // (every GPU that may hold layers)
+            int n_dev = 0;
+            CU(cudaGetDeviceCount(&n_dev));
+            for (int d = 0; d < std::max(1, std::min(n_gpu, n_dev)); ++d) {   // (every GPU that may hold layers)
                 int m = 0;
                 CU(cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d));
                 mj = std::min(mj, m);
@@ -4257,7 +4261,7 @@ int run(int argc, char** argv) {
     c.n_layer = c.n_visit - (c.n_pass - 1) * n_core;
     {   // the pattern is a visit's; a layer's is its first visit's (the same in every pass)
         const auto* sp = S.get(a + "attention.sliding_window_pattern");
-        const bool per_layer = sp && (int) sp->items.size() == c.n_layer && c.n_layer != c.n_visit;   // (inkling2_loop)
+        const bool per_layer = loop_arch && sp && (int) sp->items.size() == c.n_layer && c.n_layer != c.n_visit;
         if (!sp || ((int) sp->items.size() != c.n_visit && !per_layer)) die("sliding_window_pattern");
         for (int l = 0; l < c.n_layer; ++l)
             c.sliding.push_back(sp->items[per_layer || l < c.core1 ? l : l + (c.n_pass - 1) * n_core].u != 0);
@@ -5806,6 +5810,7 @@ int run(int argc, char** argv) {
         const int pos = (int) prompt.size() + i;
         if (g_dp.ok && g_dp.graph && !lo && i > 0 && !g_dp.dirty && g_dp.planned <= g_dp_reset_at) {   // IK2_TOKGRAPH
             const int sl = i & 1;
+            if (g_dp.exec_ep != k::scratch_epoch()) g_dp.exec_pos[0] = g_dp.exec_pos[1] = -1, g_dp.exec_ep = k::scratch_epoch();
             if (g_dp.exec_pos[sl] != pos) tg_capture(M, pos, sl);
             if (g_dp.exec_pos[sl] != pos) goto plain;   // (not captured: see tg_capture)
             const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
