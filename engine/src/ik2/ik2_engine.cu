@@ -1587,18 +1587,21 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const float k_scale = c.qk_clip <= 28.0f ? 16.0f : 1.0f;
     const float v_scale = 32.0f;
     const float k_inv = 1.0f / k_scale, v_inv = 1.0f / v_scale;
+    // (a token's attention on the tensor cores: q made FP16 by the prep, the output gate applied by the merge)
+    const bool mma1 = T == 1 && (g_attn_mma == 1 || (g_attn_mma == 2 && !Ly.sliding));
+    uint16_t* q16 = mma1 ? W.x16 : nullptr;
     if (g_kv_i8) {
         k::prep_qkv_r_i8(q_p, Ly.q_clip, W.kconv, (int8_t*) Ly.kc8, W.vconv, (int8_t*) Ly.vc8, r_p, Ly.r_clip, T, c.H,
                          c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha,
-                         c.n_floor, pos0, Ly.kv_cap, g_s);
+                         c.n_floor, pos0, Ly.kv_cap, g_s, q16);
     } else if (g_kv_fp8) {
         k::prep_qkv_r_fp8(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel,
                           c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
-                          Ly.kv_cap, k_scale, v_scale, g_s);
+                          Ly.kv_cap, k_scale, v_scale, g_s, q16);
     } else {
         k::prep_qkv_r_f16(q_p, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel,
                           c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
-                          Ly.kv_cap, g_s);
+                          Ly.kv_cap, g_s, q16);
     }
 
     const int extent = Ly.sliding ? c.extent_swa : c.extent;
@@ -1608,21 +1611,19 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const float one = 1.0f, zero = 0.0f;
     const float qk_scale = 1.0f / std::sqrt((float) c.D);
     const int attn_kv_cap = Ly.sliding ? Ly.kv_cap : 0;
-    const bool mma1 = T == 1 && (g_attn_mma == 1 || (g_attn_mma == 2 && !Ly.sliding));
     if (mma1) {   // a token's attention on the tensor cores (q in FP16; a K / V head's query heads share its tiles)
         const int ns = Ly.sliding ? std::min(g_mma_split, std::max(1, (c.window + 63) / 64)) : g_mma_split;
-        k::to_f16(q_p, (size_t) HD, W.x16, g_s);
         if (g_kv_i8)
-            k::attn_decode_mma_i8(W.x16, r_p, sink_p, (const int8_t*) Ly.kc8, (const int8_t*) Ly.vc8, attn_kv_cap, c.H,
+            k::attn_decode_mma_i8(q16, r_p, sink_p, (const int8_t*) Ly.kc8, (const int8_t*) Ly.vc8, attn_kv_cap, c.H,
                                   c.KV, nullptr, pos0, ns, qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o,
-                                  nullptr, nullptr, g_s);
+                                  gate_p, W.x16, g_s);
         else if (g_kv_fp8)
-            k::attn_decode_mma_fp8(W.x16, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, nullptr, pos0, ns,
-                                   qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, nullptr,
-                                   nullptr, g_s);
+            k::attn_decode_mma_fp8(q16, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, nullptr, pos0, ns,
+                                   qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p,
+                                   W.x16, g_s);
         else
-            k::attn_decode_mma_f16(W.x16, r_p, sink_p, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, nullptr, pos0, ns, qk_scale,
-                                   Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, nullptr, nullptr, g_s);
+            k::attn_decode_mma_f16(q16, r_p, sink_p, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, nullptr, pos0, ns, qk_scale,
+                                   Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, W.x16, g_s);
     } else if (T == 1) {
         if (g_kv_i8) {
             k::attn_decode_i8(q_p, r_p, sink_p, (const int8_t*) Ly.kc8, (const int8_t*) Ly.vc8, attn_kv_cap, c.H, c.KV,
@@ -1776,7 +1777,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             ts += Tq;
         }
     }
-    k::gate_mul_f16(W.o, gate_p, (size_t) T * HD, W.x16, g_dense_q8 && (T == 1 || (T <= 8 && g_q8_t)), g_s);
+    if (!mma1) k::gate_mul_f16(W.o, gate_p, (size_t) T * HD, W.x16, g_dense_q8 && (T == 1 || (T <= 8 && g_q8_t)), g_s);
     matmul(Ly.wo, W.o, W.x16, T, W.tmp, C);
     conv_rec(Ly, 2, W.tmp, Ly.h_attn, T, C);
     if (l % c.block == 0) {
@@ -3167,6 +3168,10 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             k_dp_wait<<<1, 32, 0, g_s>>>(g_dp.mflag, S1, g_dp.seqd, g_dp.ctl_d);
             k_dp_merge<<<dim3((unsigned) ((C + 255) / 256), (unsigned) S1), 256, 0, g_s>>>(W.y32, g_dp.ey_d, g_dp.mflag,
                                                                                          g_dp.seqd, C, g_dp.R);
+            if (T == 1 && !g_rec) {   // (the experts' sum and the short conv in one launch: the same values)
+                k::moe_combine_conv(W.y32, g_dp.inv, g_dp.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
+                continue;
+            }
             k::moe_combine_f32(W.y32, g_dp.inv, g_dp.wt, T, c.K, C, W.tmp, false, g_s);
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
             k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);

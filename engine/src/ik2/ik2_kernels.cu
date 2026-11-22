@@ -5787,24 +5787,24 @@ void experts_gate_up_swiglu_g(const uint8_t* const* blob, const int* n, const in
 void prep_qkv_r_f16(float* q, const float* q_clip, const float* k_in, uint16_t* kc, const float* v_in, uint16_t* vc,
                     float* r, const float* r_clip, int T, int H, int KV, int D, int d_rel, float qk_clip,
                     float rel_clip, float eps, const int* pos, float alpha, float n_floor, int pos0, int kv_cap,
-                    cudaStream_t s) {
+                    cudaStream_t s, uint16_t* q16) {
     if (T <= 0) return;
     const int total = T * (2 * H + 2 * KV);
     prep_qkv_r_impl_kernel<uint16_t><<<(unsigned) total, 32, 0, s>>>(
         q, q_clip, k_in, kc, v_in, vc, r, r_clip, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, pos, alpha, n_floor,
-        pos0, kv_cap, 1.0f, 1.0f, nullptr, nullptr, nullptr, nullptr, 0, nullptr);
+        pos0, kv_cap, 1.0f, 1.0f, nullptr, q16, nullptr, nullptr, 0, nullptr);
     check("prep_qkv_r_f16");
 }
 
 void prep_qkv_r_fp8(float* q, const float* q_clip, const float* k_in, uint8_t* kc, const float* v_in, uint8_t* vc,
                     float* r, const float* r_clip, int T, int H, int KV, int D, int d_rel, float qk_clip,
                     float rel_clip, float eps, const int* pos, float alpha, float n_floor, int pos0, int kv_cap,
-                    float k_scale, float v_scale, cudaStream_t s) {
+                    float k_scale, float v_scale, cudaStream_t s, uint16_t* q16) {
     if (T <= 0) return;
     const int total = T * (2 * H + 2 * KV);
     prep_qkv_r_impl_kernel<uint8_t><<<(unsigned) total, 32, 0, s>>>(
         q, q_clip, k_in, kc, v_in, vc, r, r_clip, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, pos, alpha, n_floor,
-        pos0, kv_cap, k_scale, v_scale, nullptr, nullptr, nullptr, nullptr, 0, nullptr);
+        pos0, kv_cap, k_scale, v_scale, nullptr, q16, nullptr, nullptr, 0, nullptr);
     check("prep_qkv_r_fp8");
 }
 
@@ -6187,7 +6187,7 @@ namespace ik2::k {
 void prep_qkv_r_i8(float* q, const float* q_clip, const float* k_in, int8_t* kc, const float* v_in, int8_t* vc,
                    float* r, const float* r_clip, int T, int H, int KV, int D, int d_rel, float qk_clip,
                    float rel_clip, float eps, const int* pos, float alpha, float n_floor, int pos0, int kv_cap,
-                   cudaStream_t s) {
+                   cudaStream_t s, uint16_t* q16) {
     if (T <= 0) return;
     if (D % 64) {
         std::fprintf(stderr, "ik2::k::prep_qkv_r_i8: D = %d, not a multiple of 64\n", D);
@@ -6195,7 +6195,7 @@ void prep_qkv_r_i8(float* q, const float* q_clip, const float* k_in, int8_t* kc,
     }
     prep_qkv_r_impl_kernel<int8_t><<<(unsigned) (T * (2 * H + 2 * KV)), 32, 0, s>>>(
         q, q_clip, k_in, kc, v_in, vc, r, r_clip, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, pos, alpha, n_floor,
-        pos0, kv_cap, 1.0f, 1.0f, nullptr, nullptr, nullptr, nullptr, 0, nullptr, g_v_rot);
+        pos0, kv_cap, 1.0f, 1.0f, nullptr, q16, nullptr, nullptr, 0, nullptr, g_v_rot);
     check("prep_qkv_r_i8");
 }
 void prep_qkv_r_i8_at(float* q, const float* q_clip, const float* k_in, int8_t* kc, const float* v_in, int8_t* vc,

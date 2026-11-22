@@ -226,7 +226,7 @@ void experts_gate_up_swiglu_g(const uint8_t* const* blob, const int* n, const in
 void prep_qkv_r_f16(float* q, const float* q_clip, const float* k_in, uint16_t* kc, const float* v_in, uint16_t* vc,
                     float* r, const float* r_clip, int T, int H, int KV, int D, int d_rel, float qk_clip,
                     float rel_clip, float eps, const int* pos, float alpha, float n_floor, int pos0, int kv_cap,
-                    cudaStream_t s);
+                    cudaStream_t s, uint16_t* q16 = nullptr);   // (q16: q in FP16 too)
 /// attn_decode for nq queries at positions qpos0 .. qpos0 + nq - 1 (q [nq][H][128], r [nq][H][d_rel], sink [nq][H],
 /// out [nq][H][128]), each over the keys k0 .. k0 + nk - 1 it may see.  scratch: nq x H x (nk + 128 x 130) floats.
 void attn_multi(const float* q, const float* r, const float* sink, const float* kc, const float* vc, int nq, int H,
@@ -256,7 +256,7 @@ void attn_decode_f16(const float* q, const float* r, const float* sink, const ui
 void prep_qkv_r_fp8(float* q, const float* q_clip, const float* k_in, uint8_t* kc, const float* v_in, uint8_t* vc,
                     float* r, const float* r_clip, int T, int H, int KV, int D, int d_rel, float qk_clip,
                     float rel_clip, float eps, const int* pos, float alpha, float n_floor, int pos0, int kv_cap,
-                    float k_scale, float v_scale, cudaStream_t s);
+                    float k_scale, float v_scale, cudaStream_t s, uint16_t* q16 = nullptr);
 void attn_multi_fp8(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
                     int kv_cap, int nq, int H, int Hkv, int k0, int nk, int qpos0, float qk_scale,
                     float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
@@ -444,7 +444,7 @@ int scratch_epoch();
 void prep_qkv_r_i8(float* q, const float* q_clip, const float* k_in, int8_t* kc, const float* v_in, int8_t* vc,
                    float* r, const float* r_clip, int T, int H, int KV, int D, int d_rel, float qk_clip,
                    float rel_clip, float eps, const int* pos, float alpha, float n_floor, int pos0, int kv_cap,
-                   cudaStream_t s);
+                   cudaStream_t s, uint16_t* q16 = nullptr);
 void prep_qkv_r_i8_at(float* q, const float* q_clip, const float* k_in, int8_t* kc, const float* v_in, int8_t* vc,
                       float* r, const float* r_clip, int H, int KV, int D, int d_rel, float qk_clip, float rel_clip,
                       float eps, const int* pos, bool log_scale, float alpha, float n_floor, int kv_cap,
