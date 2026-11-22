@@ -575,6 +575,9 @@ void spin_start(int workers) {
     for (auto& t : g_spin.th) t.detach();
 }
 void experts_batch(const BatchJob* J, int n, int C, int F, float gcap, float ucap) {
+    // (one caller at a time on the spin pool: the device plan's service and a verify window's host path)
+    static std::mutex one;
+    std::lock_guard<std::mutex> lk(one);
     if (n <= 0) return;
     thread_local std::vector<float> gu_tl;   // (the caller's: the workers below see its pointer, not their own copy)
     if (gu_tl.size() < (size_t) n * 2 * F) gu_tl.resize((size_t) n * 2 * F);

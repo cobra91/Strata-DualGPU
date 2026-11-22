@@ -512,6 +512,10 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
         k::to_f16(d->h + C, (size_t) (T - 1) * C, (uint16_t*) d->x16, d->s);
         gemm_h(d, lm_f16, n_rows, C, d->x16, T - 1, d->base, n_rows);
     } else {
+        if (!lm_q8 || !lm_q8d) {
+            std::fprintf(stderr, "ik2 drafter: propose without the target's head (FP16 or Q8)\n");
+            std::abort();
+        }
         k::mv_q8p_t(lm_q8, lm_q8d, n_rows, C, d->h + C, T - 1, d->base, n_rows, d->s);
     }
     // the Markov head, a token at a time (note: k::rnn_gates keeps state/latent in F32 whereas SGLang mtp.py

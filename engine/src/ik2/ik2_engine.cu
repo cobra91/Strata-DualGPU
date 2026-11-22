@@ -314,7 +314,8 @@ cudaStream_t g_cs;          // the experts' copies of the token path, beside the
 cudaEvent_t g_ev;
 bool g_tg_capturing = false;   // IK2_TOKGRAPH: a decode token's graph being captured
 // the device plan's counters set back once this many visits were planned (a token past it runs without a graph)
-const long long g_dp_reset_at = getenv("IK2_DP_RESET_AT") ? std::atoll(getenv("IK2_DP_RESET_AT")) : (1LL << 30);
+const long long g_dp_reset_at =   // (at most 2^30: the counters are 32-bit)
+    std::min(1LL << 30, std::max(1LL, getenv("IK2_DP_RESET_AT") ? std::atoll(getenv("IK2_DP_RESET_AT")) : (1LL << 30)));
 bool g_overlap = true;      // IK2_OVERLAP=0: the copies on the compute stream, before the experts
 // The CPU lane (IK2_CPU=1: on): a missing NVFP4 expert computed in host memory by the pool while the others' blocks
 // are copied; its own blocks follow on the copy stream without being waited for ("lazy"), so it is in VRAM next time.
@@ -2135,6 +2136,7 @@ struct FastGraph {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
     bool disabled = false;
+    int ep = 0;   // (k::scratch_epoch() at the capture: a growth since frees the dp4a scratch it holds)
 };
 FastGraph g_fgraph[4];      // by OutMode
 
@@ -2422,7 +2424,13 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
         fast_token_launches(M, W, out_mode);
     } else {
         FastGraph& G = g_fgraph[(int) out_mode];
+        if (G.exec && G.ep != k::scratch_epoch()) {   // (captured before a scratch growth: captured again)
+            CU(cudaGraphExecDestroy(G.exec));
+            CU(cudaGraphDestroy(G.graph));
+            G.exec = nullptr, G.graph = nullptr;
+        }
         if (!G.exec && !G.disabled) {
+            G.ep = k::scratch_epoch();
             cudaError_t ce = cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal);
             if (ce == cudaSuccess) {
                 fast_token_launches(M, W, out_mode);
@@ -2789,7 +2797,8 @@ void dp_service() {
                 const bool rs = g_dp.reset.load(std::memory_order_acquire);
                 g_dp.quiesce.store(2, std::memory_order_release);
                 if (rs) {   // (the counters set back by the host: its quiesce 0 says they are)
-                    while (g_dp.quiesce.load(std::memory_order_acquire) != 0) std::this_thread::yield();
+                    // (until the host takes the 2 back: its 0, or already the next quiesce's 1)
+                    while (g_dp.quiesce.load(std::memory_order_acquire) == 2) std::this_thread::yield();
                     next = 1;
                 }
             }
@@ -4162,7 +4171,7 @@ int run(int argc, char** argv) {
     std::vector<int> eos_ids;                 // --eos a,b: the tokens a request ends at (the engine protocol)
     double cache_gb = 60;
     double vram_reserve_mib = 0;
-    bool vram_reserve_given = false;   // (an explicit 0 leaves 0: see the expert cache's room)
+    bool vram_reserve_given = false;   // (an explicit value is kept, but the resident path's 256 MiB floor: see the room)
     int image_token = 200054;   // --image-token: Inkling 2's <|unused_200054|>, the template's placeholder of a picture
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -5080,10 +5089,10 @@ int run(int argc, char** argv) {
     W.vconv = dalloc<float>(Tm * KD);
     W.rr = dalloc<float>(Tm * c.H * c.d_rel), W.sink = dalloc<float>(Tm * c.H);
     W.dyn = dalloc<float>(2 * Tm * c.KV * 4);   // (a full layer's dynamic taps: k's, and on the resident path v's beside)
-    // (at least 256 MiB, which the prompt attention's non-flash path batches its queries into; with the flash path's
-    //  prompts a small card keeps only what a decode token's attention needs, plus 16 MiB - IK2_LG_MIN_MB)
-    const size_t lg_floor = (size_t) std::max(1, getenv("IK2_LG_MIN_MB") ? std::atoi(getenv("IK2_LG_MIN_MB"))
-                                                                        : (small_card && g_flash && !g_kv_fp8 ? 16 : 256)) << 18;
+    // (at least 64 MiB of logits, which the prompt attention's non-flash path batches its queries into; with the flash
+    //  path's prompts a small card keeps only what a decode token's attention needs, plus 4 MiB - IK2_LG_MIN_MB, MiB)
+    const size_t lg_floor = getenv("IK2_LG_MIN_MB") ? (size_t) std::max(1, std::atoi(getenv("IK2_LG_MIN_MB"))) << 20
+                                                    : (size_t) (small_card && g_flash && !g_kv_fp8 ? 16 : 256) << 18;
     W.lg_cap = std::max((size_t) 8 * c.H * (size_t) ctx + (size_t) 8 * c.H * 128 * 130, lg_floor);
     W.lg = dalloc<float>(W.lg_cap);
     W.blocks = dalloc<float>((size_t) (c.n_layer / c.block + 1) * T_buf * C);
