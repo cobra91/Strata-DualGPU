@@ -2723,7 +2723,119 @@ void test_experts_mma() {
     expect_true("experts_mma_fits", k::experts_mma_fits(ty, ty, ty, 2304, 1152) && !k::experts_mma_fits(ty, k::kQ8_0, ty, 2304, 1152));
 }
 
+namespace ik2::k {
+extern bool g_dp4a;
+}
+// the dp4a expert kernels (IQ3_S gate_up, IQ4_NL down; the input made int8 a scale per 32) against the fp32 ones on
+// random blocks: within the int8 rounding of the input (~1% of an output's scale)
+void test_experts_dp4a() {
+    const int C = 2304, F = 1152, S = 5;
+    const size_t rb_gu = (size_t) C / 256 * 110, rb_dn = (size_t) F / 32 * 18;
+    const size_t eb0 = (size_t) F * rb_gu, eb = 2 * eb0 + (size_t) C * rb_dn;
+    std::vector<uint8_t> hb(eb * S);
+    for (auto& b : hb) b = (uint8_t) rng();
+    for (int e = 0; e < S; ++e) {
+        uint8_t* p = hb.data() + (size_t) e * eb;
+        for (size_t o = 0; o < 2 * eb0; o += 110) { const uint16_t d = f2h_host(0.002f + 0.001f * frand(1.0f)); std::memcpy(p + o, &d, 2); }
+        for (size_t o = 2 * eb0; o < eb; o += 18) { const uint16_t d = f2h_host(0.01f + 0.005f * frand(1.0f)); std::memcpy(p + o, &d, 2); }
+    }
+    uint8_t* db = dev(hb);
+    std::vector<const uint8_t*> tab(S);
+    for (int k = 0; k < S; ++k) tab[k] = db + (size_t) k * eb;
+    tab[2] = nullptr;   // (a slot without an expert: skipped)
+    const uint8_t** dtab = dev_n<const uint8_t*>(S);
+    CU(cudaMemcpy(dtab, tab.data(), S * sizeof(void*), cudaMemcpyHostToDevice));
+    std::vector<int> tok = {0, 1, 0, 1, 1};
+    int* dtok = dev(tok);
+    auto x = fvec((size_t) 2 * C, 2.0f);
+    std::vector<float> sgv = {1.0f, 0.9f, 1.0f, 1.1f, 1.0f};
+    float *dx = dev(x), *dsg = dev(sgv);
+    uint16_t *h_a = dev_n<uint16_t>((size_t) S * F), *h_b = dev_n<uint16_t>((size_t) S * F);
+    float *y_a = dev_n<float>((size_t) S * C), *y_b = dev_n<float>((size_t) S * C);
+    const bool was = k::g_dp4a;
+    k::g_dp4a = false;
+    k::experts_gate_up_swiglu(dtab, dtok, S, k::kIQ3_S, k::kIQ3_S, eb0, dx, C, F, dsg, nullptr, 10.0f, 10.0f, h_a, 0);
+    k::experts_down(dtab, S, k::kIQ4_NL, 2 * eb0, h_a, C, F, y_a, 0);
+    k::g_dp4a = true;
+    k::experts_gate_up_swiglu(dtab, dtok, S, k::kIQ3_S, k::kIQ3_S, eb0, dx, C, F, dsg, nullptr, 10.0f, 10.0f, h_b, 0);
+    k::experts_down(dtab, S, k::kIQ4_NL, 2 * eb0, h_a, C, F, y_b, 0);   // (the same input as the fp32 one)
+    k::g_dp4a = was;
+    const auto ha = host(h_a, (size_t) S * F), hb2 = host(h_b, (size_t) S * F);
+    const auto ya = host(y_a, (size_t) S * C), yb = host(y_b, (size_t) S * C);
+    std::vector<float> gh, gy;
+    std::vector<double> wh, wy;
+    double mh = 0, my = 0;
+    for (int k2 = 0; k2 < S; ++k2) {
+        if (k2 == 2) continue;
+        for (int i = 0; i < F; ++i) mh = std::max(mh, (double) std::fabs(h2f_host(ha[(size_t) k2 * F + i])));
+        for (int i = 0; i < C; ++i) my = std::max(my, (double) std::fabs(ya[(size_t) k2 * C + i]));
+    }
+    for (int k2 = 0; k2 < S; ++k2) {
+        if (k2 == 2) continue;
+        for (int i = 0; i < F; ++i) gh.push_back(h2f_host(hb2[(size_t) k2 * F + i])), wh.push_back(h2f_host(ha[(size_t) k2 * F + i]));
+        for (int i = 0; i < C; ++i) gy.push_back(yb[(size_t) k2 * C + i]), wy.push_back(ya[(size_t) k2 * C + i]);
+    }
+    expect("dp4a gate_up IQ3_S vs fp32", gh, wh, 0.02, 0.02 * mh);
+    expect("dp4a down IQ4_NL vs fp32", gy, wy, 0.02, 0.02 * my);
+    cudaFree(db), cudaFree(dtab), cudaFree(dtok), cudaFree(dx), cudaFree(dsg);
+    cudaFree(h_a), cudaFree(h_b), cudaFree(y_a), cudaFree(y_b);
+}
+// IK2_BENCH=1: the decode's expert kernels timed on synthetic IQ3_S gate_up / IQ4_NL down experts (Inkling-2-Mini's
+// shapes: C 2304, F 1152, 8 picks of 64 experts in VRAM), the bytes read over the time
+void bench_experts() {
+    const int C = 2304, F = 1152, S = 8, NE = 64;
+    const size_t rb_gu = (size_t) C / 256 * 110, rb_dn = (size_t) F / 32 * 18;
+    const size_t eb0 = (size_t) F * rb_gu, eb = 2 * eb0 + (size_t) C * rb_dn;
+    std::vector<uint8_t> hb(eb * NE);
+    for (auto& b : hb) b = (uint8_t) rng();
+    for (int e = 0; e < NE; ++e) {
+        uint8_t* p = hb.data() + (size_t) e * eb;
+        for (size_t o = 0; o < 2 * eb0; o += 110) { const uint16_t d = f2h_host(0.002f + 0.001f * frand(1.0f)); std::memcpy(p + o, &d, 2); }
+        for (size_t o = 2 * eb0; o < eb; o += 18) { const uint16_t d = f2h_host(0.01f + 0.005f * frand(1.0f)); std::memcpy(p + o, &d, 2); }
+    }
+    uint8_t* db = dev(hb);
+    std::vector<const uint8_t*> tabs;
+    for (int r = 0; r < 16; ++r)   // (16 rounds of 8 distinct experts: no round's bytes left in L2)
+        for (int k = 0; k < S; ++k) tabs.push_back(db + (size_t) ((r * S + k) % NE) * eb);
+    const uint8_t** dtab = dev_n<const uint8_t*>(tabs.size());
+    CU(cudaMemcpy(dtab, tabs.data(), tabs.size() * sizeof(void*), cudaMemcpyHostToDevice));
+    std::vector<int> tok(S, 0);
+    int* dtok = dev(tok);
+    auto x = fvec(C, 2.0f);
+    float* dx = dev(x);
+    uint16_t* dh = dev_n<uint16_t>((size_t) S * F);
+    float* dy = dev_n<float>((size_t) S * C);
+    cudaEvent_t e0, e1;
+    CU(cudaEventCreate(&e0));
+    CU(cudaEventCreate(&e1));
+    const int n_it = 2000;
+    auto timeit = [&](const char* what, double bytes, auto&& f) {
+        for (int i = 0; i < 3000; ++i) f(i);   // (the clocks up)
+        CU(cudaEventRecord(e0));
+        for (int i = 0; i < n_it; ++i) f(i);
+        CU(cudaEventRecord(e1));
+        CU(cudaEventSynchronize(e1));
+        float ms = 0;
+        CU(cudaEventElapsedTime(&ms, e0, e1));
+        const double us = ms * 1e3 / n_it;
+        std::printf("bench %-28s %8.1f us  %6.1f GB/s\n", what, us, bytes / (us * 1e3));
+    };
+    timeit("gate_up IQ3_S x8", (double) S * 2 * eb0, [&](int i) {
+        k::experts_gate_up_swiglu(dtab + (size_t) (i % 16) * S, dtok, S, k::kIQ3_S, k::kIQ3_S, eb0, dx, C, F, nullptr,
+                                  nullptr, 10.0f, 10.0f, dh, 0);
+    });
+    timeit("down IQ4_NL x8", (double) S * C * rb_dn, [&](int i) {
+        k::experts_down(dtab + (size_t) (i % 16) * S, S, k::kIQ4_NL, 2 * eb0, dh, C, F, dy, 0);
+    });
+    CU(cudaDeviceSynchronize());
+    cudaFree(db), cudaFree(dtab), cudaFree(dtok), cudaFree(dx), cudaFree(dh), cudaFree(dy);
+}
+
 int main() {
+    if (getenv("IK2_BENCH")) {
+        bench_experts();
+        return 0;
+    }
     int dev_count = 0;
     CU(cudaGetDeviceCount(&dev_count));
     cudaDeviceProp p{};
@@ -2753,6 +2865,7 @@ int main() {
     test_cand_topk();
     test_token_path();
     test_experts_mma();
+    test_experts_dp4a();
     test_kv_i8();   // (after the others: its random data leaves theirs as it was)
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;

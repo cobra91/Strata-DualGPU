@@ -4967,9 +4967,153 @@ void experts_gate_up(const uint8_t* const* blob, const int* tok, int S, int ty_g
     else launch_experts_gate_up<4, 4>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, gu, s);
     check("experts_gate_up");
 }
+// ---- the decode's expert products by dp4a (IK2_DP4A, default on): IQ3_S gate_up and IQ4_NL down with the input made
+// int8 once a block (a scale per 32: the blocks of the weights' sub-blocks), four lanes a matrix row each taking whole
+// 32-value sub-blocks, the integer sums times the two scales.  The fp32 kernels spent ~5 instructions a weight on the
+// byte-to-float conversions and the sign flips and ran at ~95 GB/s; an IQ3_S weight here is a lookup, an xor and add
+// (the sign: bytes 0xFF / 0x00 from a 256-entry table; (g ^ m) + (m & 1) negates g, never 0) and a quarter dp4a.
+namespace {
+template <int WARPS>
+__device__ __forceinline__ void quant_x_i8(const float* xr, int K, int8_t* xq, float* xsc) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int sb = warp; sb < K / 32; sb += WARPS) {
+        const float v = xr[sb * 32 + lane];
+        const float m = wmax(fabsf(v));
+        xq[sb * 32 + lane] = (int8_t) __float2int_rn(m > 0.0f ? v * (127.0f / m) : 0.0f);
+        if (lane == 0) xsc[sb] = m * (1.0f / 127.0f);
+    }
+}
+template <int WARPS>
+__device__ __forceinline__ void quant_h_i8(const uint16_t* hr, int K, int8_t* xq, float* xsc) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int sb = warp; sb < K / 32; sb += WARPS) {
+        const float v = h2f(hr[sb * 32 + lane]);
+        const float m = wmax(fabsf(v));
+        xq[sb * 32 + lane] = (int8_t) __float2int_rn(m > 0.0f ? v * (127.0f / m) : 0.0f);
+        if (lane == 0) xsc[sb] = m * (1.0f / 127.0f);
+    }
+}
+__device__ __forceinline__ uint32_t sign_bytes4(uint32_t nib) {   // bit k of nib -> byte k 0xFF
+    return ((nib * 0x00204081u) & 0x01010101u) * 0xFFu;
+}
+// a warp: 2 output rows - its 4 matrix rows (gate r, r + 1, up r, r + 1) as one run of 4 x C / 32 sub-blocks, lane
+// i taking i, i + 32, ...: consecutive lanes read consecutive sub-blocks (coalesced), and 4 x 72 = 9 x 32 (balanced)
+template <int WARPS, int PAIRS>
+__global__ void __launch_bounds__(WARPS * 32) experts_gu_iq3s_dp4a_kernel(
+    const uint8_t* const* blob, const int* tok, size_t eb0, const float* x, int C, int F, const float* sg,
+    const float* su, float gcap, float ucap, uint16_t* h, const int* orow, int h_ld) {
+    const int s = blockIdx.y;
+    const uint8_t* bl = blob[s];
+    if (!bl) return;
+    __shared__ uint32_t grid_s[512];
+    __shared__ uint2 sgn_s[256];
+    extern __shared__ __align__(16) int8_t gu_xq[];   // [C] int8, then [C / 32] scales
+    float* xsc = (float*) (gu_xq + C);
+    for (int i = threadIdx.x; i < 512; i += WARPS * 32) grid_s[i] = d_iq3s_grid[i];
+    for (int i = threadIdx.x; i < 256; i += WARPS * 32) sgn_s[i] = make_uint2(sign_bytes4(i & 15u), sign_bytes4(i >> 4));
+    quant_x_i8<WARPS>(x + (size_t) tok[s] * C, C, gu_xq, xsc);
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int pr = 0; pr < PAIRS; ++pr) {   // (a block's rows: its setup above shared by PAIRS row pairs a warp)
+    const int r0 = ((blockIdx.x * PAIRS + pr) * WARPS + warp) * 2;
+    if (r0 >= F) return;
+    const int nsb = C / 32;
+    const size_t rb = (size_t) (C / 256) * 110;
+    const uint8_t* rows[4] = {bl + (size_t) r0 * rb, bl + (size_t) min(r0 + 1, F - 1) * rb, bl + eb0 + (size_t) r0 * rb,
+                              bl + eb0 + (size_t) min(r0 + 1, F - 1) * rb};
+    const int4* xq4 = (const int4*) gu_xq;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll 3
+    for (int p = lane; p < 4 * nsb; p += 32) {
+        const int m = p / nsb, sb = p - m * nsb;
+        const uint8_t* b = rows[m] + (size_t) (sb >> 3) * 110;
+        const int ib = sb & 7;
+        const float d = half_bits_to_float(__ldg((const uint16_t*) b));
+        const int nib = (__ldg(b + 106 + (ib >> 1)) >> (4 * (ib & 1))) & 15;
+        const uint32_t qh = __ldg(b + 66 + ib);
+        const uint16_t* qs = (const uint16_t*) (b + 2 + 8 * ib);
+        const uint16_t* sp = (const uint16_t*) (b + 74 + 4 * ib);
+        const uint32_t sgw = (uint32_t) __ldg(sp) | ((uint32_t) __ldg(sp + 1) << 16);
+        const int4 xa = xq4[2 * sb], xb = xq4[2 * sb + 1];
+        const int xw[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+        int sumi = 0;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t q = __ldg(qs + l);
+            const uint32_t g1 = grid_s[(q & 0xFFu) | ((qh << (8 - 2 * l)) & 256u)];
+            const uint32_t g2 = grid_s[(q >> 8) | ((qh << (7 - 2 * l)) & 256u)];
+            const uint2 mk = sgn_s[(sgw >> (8 * l)) & 255u];
+            sumi = __dp4a((int) ((g1 ^ mk.x) + (mk.x & 0x01010101u)), xw[2 * l], sumi);
+            sumi = __dp4a((int) ((g2 ^ mk.y) + (mk.y & 0x01010101u)), xw[2 * l + 1], sumi);
+        }
+        const float v = d * (float) (1 + 2 * nib) * xsc[sb] * (float) sumi;
+        acc[0] += m == 0 ? v : 0.0f, acc[1] += m == 1 ? v : 0.0f, acc[2] += m == 2 ? v : 0.0f, acc[3] += m == 3 ? v : 0.0f;
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc[j] = wsum(acc[j]);
+    if (lane < 2 && r0 + lane < F) {
+        const float g = (lane ? acc[1] : acc[0]) * (sg ? sg[s] : 1.0f), u = (lane ? acc[3] : acc[2]) * (su ? su[s] : 1.0f);
+        h[(size_t) (orow ? orow[s] : s) * h_ld + r0 + lane] =
+            f2h(gcap * tanhf(g / gcap) * (1.0f / (1.0f + expf(-g))) * ucap * tanhf(u / ucap));
+    }
+    }
+}
+// down: a warp 8 rows of C as one run of 8 x F / 32 blocks (8 x 36 = 9 x 32), lane i taking i, i + 32, ...
+template <int WARPS>
+__global__ void __launch_bounds__(WARPS * 32) experts_down_iq4nl_dp4a_kernel(const uint8_t* const* blob, size_t off_down,
+                                                                             const uint16_t* h, int C, int F, float* y) {
+    const int s = blockIdx.y;
+    const uint8_t* bl = blob[s];
+    if (!bl) return;
+    extern __shared__ __align__(16) int8_t dn_xq[];   // [F] int8, then [F / 32] scales
+    float* xsc = (float*) (dn_xq + F);
+    quant_h_i8<WARPS>(h + (size_t) s * F, F, dn_xq, xsc);
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int r0 = (blockIdx.x * WARPS + warp) * 8;
+    if (r0 >= C) return;
+    const int nb = F / 32, nr = min(8, C - r0);
+    const uint8_t* base = bl + off_down + (size_t) r0 * nb * 18;   // (the 8 rows are contiguous)
+    const int4* xq4 = (const int4*) dn_xq;
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (int p = lane; p < nr * nb; p += 32) {
+        const int m = p / nb, bk = p - m * nb;
+        const uint16_t* b = (const uint16_t*) (base + (size_t) p * 18);
+        const float d = half_bits_to_float(__ldg(b));
+        const int4 xa = xq4[2 * bk], xb = xq4[2 * bk + 1];
+        const int xw[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+        int sumi = 0;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t w = (uint32_t) __ldg(b + 1 + 2 * k) | ((uint32_t) __ldg(b + 2 + 2 * k) << 16);
+            sumi = __dp4a((int) iq4nl_lut4(w, false), xw[k], sumi);
+            sumi = __dp4a((int) iq4nl_lut4(w, true), xw[4 + k], sumi);
+        }
+        const float v = d * xsc[bk] * (float) sumi;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[j] += m == j ? v : 0.0f;
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[j] = wsum(acc[j]);
+    if (lane < nr) {
+        float v = acc[0];
+#pragma unroll
+        for (int j = 1; j < 8; ++j) v = lane == j ? acc[j] : v;
+        y[(size_t) s * C + r0 + lane] = v;
+    }
+}
+}  // namespace
+bool g_dp4a = !getenv("IK2_DP4A") || std::atoi(getenv("IK2_DP4A"));
 void experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_down, const uint16_t* h, int C, int F,
                   float* y, cudaStream_t s) {
     if (S <= 0) return;
+    if (g_dp4a && ty_down == kIQ4_NL && F % 32 == 0) {
+        constexpr int W = 4;
+        experts_down_iq4nl_dp4a_kernel<W><<<dim3((unsigned) ((C + 8 * W - 1) / (8 * W)), (unsigned) S), W * 32,
+                                            (size_t) F + (size_t) F / 32 * 4, s>>>(blob, off_down, h, C, F, y);
+        check("experts_down (dp4a)");
+        return;
+    }
     if (S <= 4) launch_experts_down<4, 2>(blob, S, ty_down, off_down, h, C, F, y, s);
     else launch_experts_down<4, 4>(blob, S, ty_down, off_down, h, C, F, y, s);
     check("experts_down");
@@ -4996,6 +5140,14 @@ void launch_experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, i
                                    size_t eb0, const float* x, int C, int F, const float* sg, const float* su,
                                    float gcap, float ucap, uint16_t* h, cudaStream_t s, const int* orow = nullptr,
                                    int h_ld = 0) {
+    if (g_dp4a && ty_gate == kIQ3_S && ty_up == kIQ3_S && C % 256 == 0) {
+        constexpr int Wn = 8, Pn = 1;   // (RTX 2060 SUPER: 8 warps and a row pair each, 145 us for 8 experts; 4 x 2: 153)
+        auto kfn = experts_gu_iq3s_dp4a_kernel<Wn, Pn>;
+        kfn<<<dim3((unsigned) ((F + 2 * Wn * Pn - 1) / (2 * Wn * Pn)), (unsigned) S), Wn * 32,
+                                         (size_t) C + (size_t) C / 32 * 4, s>>>(blob, tok, eb0, x, C, F, sg, su, gcap,
+                                                                                 ucap, h, orow, h_ld > 0 ? h_ld : F);
+        return;
+    }
     const dim3 g((unsigned) ((F + WARPS * ROWS - 1) / (WARPS * ROWS)), (unsigned) S);
     experts_gate_up_swiglu_kernel<WARPS, ROWS><<<g, WARPS * 32, xp_floats(C) * 4, s>>>(
         blob, tok, ty_gate, ty_up, eb0, x, C, F, mv_row_bytes(ty_gate, C), mv_row_bytes(ty_up, C), sg, su, gcap,
