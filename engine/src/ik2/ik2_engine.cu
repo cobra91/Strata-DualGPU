@@ -406,9 +406,12 @@ struct Prof {
 } g_pf;
 
 template <class T>
-T* dalloc(size_t n) {
+T* dalloc(size_t n, int line = __builtin_LINE()) {
     T* p = nullptr;
     CU(cudaMalloc(&p, std::max<size_t>(1, n) * sizeof(T)));
+    static const bool dbg = getenv("IK2_VRAM_DBG") != nullptr;
+    if (dbg && n * sizeof(T) >= (8u << 20))
+        std::printf("vram: %.1f MiB at line %d\n", n * sizeof(T) / 1048576.0, line);
     return p;
 }
 
@@ -1687,6 +1690,14 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             const int nk_s = pos0 + ts + Tq - k0_s;
             const long long qn = (long long) Tq * nk_s;
             if (kv_b8()) {
+                while (!W.kv_k16) {   // (the cache took the VRAM: as many keys a chunk as fit, halving)
+                    const size_t nb = (size_t) W.kv_tmp_cap * KD * sizeof(uint16_t);
+                    if (cudaMalloc(&W.kv_k16, nb) == cudaSuccess && cudaMalloc(&W.kv_v16, nb) == cudaSuccess) break;
+                    if (W.kv_k16) cudaFree(W.kv_k16), W.kv_k16 = nullptr;
+                    cudaGetLastError();
+                    if (W.kv_tmp_cap <= 256) die("the K / V unpack buffers: out of VRAM (--vram-reserve-mib)");
+                    W.kv_tmp_cap /= 2;
+                }
                 for (int k_off = 0; k_off < nk_s; k_off += W.kv_tmp_cap) {
                     const int nk_c = std::min(W.kv_tmp_cap, nk_s - k_off);
                     kv_unpack(Ly, attn_kv_cap, k0_s + k_off, nk_c, KD, k_inv, v_inv, W.kv_k16,
@@ -5078,8 +5089,8 @@ int run(int argc, char** argv) {
     }
     if (kv_b8()) {
         W.kv_tmp_cap = std::min(ctx, 32768);
-        W.kv_k16 = dalloc<uint16_t>((size_t) W.kv_tmp_cap * KD);
-        W.kv_v16 = dalloc<uint16_t>((size_t) W.kv_tmp_cap * KD);
+        // (kv_k16 / kv_v16: allocated at their first use - the GEMM path's; the flash path and the decode never take
+        //  it, and 2 x 64 MiB is ~35 expert slots on an 8 GB card)
     }
     W.pos = dalloc<int>(T_buf);
     W.rlog = dalloc<float>(T_buf * c.E), W.route_d = dalloc<int>(S_buf * 2);
@@ -5169,12 +5180,15 @@ int run(int argc, char** argv) {
     }
     ExpertCache& EC = g_dev[d].EC;
     CU(cudaMemGetInfo(&fr, &tot));
+    if (getenv("IK2_VRAM_DBG")) std::printf("vram: %.0f MiB free before the expert cache\n", fr / 1048576.0);
     // (what is left free: 2 GiB beside a cache that streams experts in and out; a quarter of one when every expert
     //  stays in VRAM - nothing more is allocated but a token's graph)
     //  --vram-reserve-mib given: that much instead (a small card: 2 GiB of 8 is a third of the cache)
+    //  a small card without it: 256 MiB - what is allocated after the cache is the plan's tables, the dp4a calls'
+    //  scratch and the graphs (RTX 2060 SUPER, Inkling-2-Mini IQ3_S: 1057 -> ~1560 slots, TG 43.5 -> ~50)
     const size_t room = vram_reserve_given ? std::max((size_t) (std::max(0.0, vram_reserve_mib) * 1048576.0),
                                                       g_fast_want ? (size_t) 256 << 20 : (size_t) 0)
-                                           : (g_fast_want ? (size_t) 256 << 20 : (size_t) 2 << 30);
+                                           : (g_fast_want || small_card ? (size_t) 256 << 20 : (size_t) 2 << 30);
     const size_t budget = std::min((size_t) (cache_gb * 1073741824.0), fr > room ? fr - room : (size_t) 0);
     EC.tp = g_tp ? d : -1;
     EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget);
