@@ -1864,14 +1864,16 @@ void prefetch_layer(Model& M, int l, Work& W, ExpertCache& EC, int T, const Work
 constexpr int kPcpuRows = 4096;
 void pc_alloc(Work& X, int C) {   // run_prefill_moe's staging for a short prompt's CPU experts (once; none: no room)
     if (X.pc_x16_h || X.pc_failed) return;
-    if (cudaMalloc(&X.pc_y_d, (size_t) kPcpuRows * C * 4) != cudaSuccess) {
+    // (the lane's rows are read by the scatter where the lane wrote them - mapped host memory, the same bytes over the
+    //  link as a copy - so no VRAM is taken)
+    if (cudaHostAlloc((void**) &X.pc_y_h, (size_t) kPcpuRows * C * 4, cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostGetDevicePointer((void**) &X.pc_y_d, X.pc_y_h, 0) != cudaSuccess) {
         cudaGetLastError();
         X.pc_failed = true;   // (every miss copied in)
         return;
     }
     CU(cudaHostAlloc((void**) &X.pc_x16_h, (size_t) kPcpuRows * C * 2, cudaHostAllocDefault));
     CU(cudaHostAlloc((void**) &X.pc_x_h, (size_t) kPcpuRows * C * 4, cudaHostAllocDefault));
-    CU(cudaHostAlloc((void**) &X.pc_y_h, (size_t) kPcpuRows * C * 4, cudaHostAllocDefault));
     CU(cudaEventCreateWithFlags(&X.pc_ev, cudaEventDisableTiming));
 }   // (a short prompt's picks the CPU lane may take: T * K up to this)
 void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq16, const int* top, const float* w,
@@ -2051,8 +2053,6 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
             g_n_cpu += cpu_exps.size();
             for (int e : cpu_exps) {
                 const int st_e = W.start[e], cnt_e = W.cnt[e];
-                CU(cudaMemcpyAsync(X.pc_y_d + (size_t) st_e * C, X.pc_y_h + (size_t) st_e * C, (size_t) cnt_e * C * 4,
-                                   cudaMemcpyHostToDevice, g_s));
                 scatter_add_rows_kernel<<<cnt_e, 256, 0, g_s>>>(X.pc_y_d + (size_t) st_e * C, X.gidx + st_e, X.wtr + st_e,
                                                                C, X.tmp, C);
             }
@@ -5484,11 +5484,11 @@ int run(int argc, char** argv) {
     // (what is left free: 2 GiB beside a cache that streams experts in and out; a quarter of one when every expert
     //  stays in VRAM - nothing more is allocated but a token's graph)
     //  --vram-reserve-mib given: that much instead (a small card: 2 GiB of 8 is a third of the cache)
-    //  a small card without it: 256 MiB - what is allocated after the cache is the plan's tables, the dp4a calls'
-    //  scratch and the graphs (RTX 2060 SUPER, Inkling-2-Mini IQ3_S: 1057 -> ~1560 slots, TG 43.5 -> ~50)
+    //  a small card without it: 218 MiB (165 MiB of it still free after a 20K-token prompt and its decode) - what is
+    //  allocated after the cache is the plan's tables, the dp4a calls' scratch and the graphs (RTX 2060 SUPER, Inkling-2-Mini IQ3_S: 1057 -> ~1560 slots, TG 43.5 -> ~50)
     const size_t room = vram_reserve_given ? std::max((size_t) (std::max(0.0, vram_reserve_mib) * 1048576.0),
                                                       g_fast_want ? (size_t) 256 << 20 : (size_t) 0)
-                                           : (g_fast_want || small_card ? (size_t) 256 << 20 : (size_t) 2 << 30);
+                                           : (g_fast_want ? (size_t) 256 << 20 : small_card ? (size_t) 218 << 20 : (size_t) 2 << 30);
     const size_t budget = std::min((size_t) (cache_gb * 1073741824.0), fr > room ? fr - room : (size_t) 0);
     EC.tp = g_tp ? d : -1;
     EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget);
@@ -6339,6 +6339,11 @@ int run(int argc, char** argv) {
     if (g_pool)
         std::printf("CPU lane: %d threads, %llu experts computed on the CPU (%.2f ms each at the end), %llu waited for\n",
                     g_pool->size(), (unsigned long long) g_n_cpu, g_t_cpu * 1e3, (unsigned long long) g_n_wait);
+        if (getenv("IK2_VRAM_END")) {
+            size_t fr = 0, tot = 0;
+            cudaMemGetInfo(&fr, &tot);
+            std::printf("vram at the end: %.0f MiB free of %.0f\n", fr / 1048576.0, tot / 1048576.0);
+        }
         if (getenv("IK2_PQ_CHECK")) {
             unsigned long long bad = 0, n = 0;
             cudaMemcpyFromSymbol(&bad, d_pq_bad, sizeof bad);
