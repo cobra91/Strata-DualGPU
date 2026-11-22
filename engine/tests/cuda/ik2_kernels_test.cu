@@ -2971,6 +2971,16 @@ void bench_experts() {
         k::experts_gate_up_swiglu(dtab + (size_t) (i % 16) * S, dtok, S, k::kIQ3_S, k::kIQ3_S, eb0, dx, C, F, nullptr,
                                   nullptr, 10.0f, 10.0f, dh, 0, 1);
     });
+    {   // the re-laid rows (the engine's default): the same experts' gate / up re-laid, then put back
+        for (int e = 0; e < NE; ++e) k::iq3s_rows_soa(db + (size_t) e * eb, 2 * F, C, 0);
+        k::g_iq3s_soa = true;
+        timeit("gate_up IQ3_S x8 (re-laid)", (double) S * 2 * eb0, [&](int i) {
+            k::experts_gate_up_swiglu(dtab + (size_t) (i % 16) * S, dtok, S, k::kIQ3_S, k::kIQ3_S, eb0, dx, C, F, nullptr,
+                                      nullptr, 10.0f, 10.0f, dh, 0, 1);
+        });
+        k::g_iq3s_soa = false;
+        CU(cudaMemcpy(db, hb.data(), hb.size(), cudaMemcpyHostToDevice));
+    }
     timeit("down IQ4_NL x8", (double) S * C * rb_dn, [&](int i) {
         k::experts_down(dtab + (size_t) (i % 16) * S, S, k::kIQ4_NL, 2 * eb0, dh, C, F, dy, 0);
     });

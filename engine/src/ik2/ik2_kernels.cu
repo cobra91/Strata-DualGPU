@@ -5432,8 +5432,11 @@ __global__ void __launch_bounds__(WARPS * 32) experts_gu_iq3s_dp4a_kernel(
     if (r0 >= F) return;
     const int nsb = NSB ? NSB : C / 32;
     const size_t rb = (size_t) (nsb / 8) * 110;
-    const uint8_t* rows[4] = {bl + (size_t) r0 * rb, bl + (size_t) min(r0 + 1, F - 1) * rb, bl + eb0 + (size_t) r0 * rb,
-                              bl + eb0 + (size_t) min(r0 + 1, F - 1) * rb};
+    // (matrix row m of the 4 - gate r0, r0 + 1, up r0, r0 + 1 - by arithmetic: an array indexed by a lane's m went to
+    //  the stack, a local load a sub-block)
+    const uint8_t* const row_g = bl + (size_t) r0 * rb;
+    const size_t row_d = (size_t) (min(r0 + 1, F - 1) - r0) * rb;
+#define IK2_GU_ROW(m) (row_g + ((m) >= 2 ? eb0 : 0) + (((m) & 1) ? row_d : 0))
     const int4* xq4 = (const int4*) gu_xq;
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll (NSB ? 4 * NSB / 32 : 3)
@@ -5443,13 +5446,13 @@ __global__ void __launch_bounds__(WARPS * 32) experts_gu_iq3s_dp4a_kernel(
         int nib;
         uint32_t qh, sgw, qw[4];
         if constexpr (SOA) {
-            const Iq3sSoa L(rows[m], nsb / 8);
+            const Iq3sSoa L(IK2_GU_ROW(m), nsb / 8);
             d = half_bits_to_float(L.d_bits(sb >> 3)), nib = L.nib(sb), qh = __ldg(L.qh + sb);
             const uint2 q2 = __ldg((const uint2*) (L.qs + 8 * sb));
             sgw = __ldg((const uint32_t*) (L.sg + 4 * sb));
             qw[0] = q2.x & 0xFFFFu, qw[1] = q2.x >> 16, qw[2] = q2.y & 0xFFFFu, qw[3] = q2.y >> 16;
         } else {
-            const uint8_t* b = rows[m] + (size_t) (sb >> 3) * 110;
+            const uint8_t* b = IK2_GU_ROW(m) + (size_t) (sb >> 3) * 110;
             const int ib = sb & 7;
             d = half_bits_to_float(__ldg((const uint16_t*) b));
             nib = (__ldg(b + 106 + (ib >> 1)) >> (4 * (ib & 1))) & 15;
@@ -5657,8 +5660,11 @@ __global__ void __launch_bounds__(WARPS * 32) experts_gu_iq3s_dp4a_g_kernel(
     if (r0 >= F) return;
     const int nsb = C / 32;
     const size_t rb = (size_t) (nsb / 8) * 110;
-    const uint8_t* rows[4] = {bl + (size_t) r0 * rb, bl + (size_t) min(r0 + 1, F - 1) * rb, bl + eb0 + (size_t) r0 * rb,
-                              bl + eb0 + (size_t) min(r0 + 1, F - 1) * rb};
+    // (matrix row m of the 4 - gate r0, r0 + 1, up r0, r0 + 1 - by arithmetic: an array indexed by a lane's m went to
+    //  the stack, a local load a sub-block)
+    const uint8_t* const row_g = bl + (size_t) r0 * rb;
+    const size_t row_d = (size_t) (min(r0 + 1, F - 1) - r0) * rb;
+#define IK2_GU_ROW(m) (row_g + ((m) >= 2 ? eb0 : 0) + (((m) & 1) ? row_d : 0))
     float acc[NT][4];
 #pragma unroll
     for (int t = 0; t < NT; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.0f;
@@ -5667,14 +5673,14 @@ __global__ void __launch_bounds__(WARPS * 32) experts_gu_iq3s_dp4a_g_kernel(
         float db;
         uint32_t qh, sgw, qw[4];
         if constexpr (SOA) {
-            const Iq3sSoa L(rows[m], nsb / 8);
+            const Iq3sSoa L(IK2_GU_ROW(m), nsb / 8);
             db = half_bits_to_float(L.d_bits(sb >> 3)) * (float) (1 + 2 * L.nib(sb));
             qh = __ldg(L.qh + sb);
             const uint2 q2 = __ldg((const uint2*) (L.qs + 8 * sb));
             sgw = __ldg((const uint32_t*) (L.sg + 4 * sb));
             qw[0] = q2.x & 0xFFFFu, qw[1] = q2.x >> 16, qw[2] = q2.y & 0xFFFFu, qw[3] = q2.y >> 16;
         } else {
-            const uint8_t* b = rows[m] + (size_t) (sb >> 3) * 110;
+            const uint8_t* b = IK2_GU_ROW(m) + (size_t) (sb >> 3) * 110;
             const int ib = sb & 7;
             db = half_bits_to_float(__ldg((const uint16_t*) b)) *
                  (float) (1 + 2 * ((__ldg(b + 106 + (ib >> 1)) >> (4 * (ib & 1))) & 15));
