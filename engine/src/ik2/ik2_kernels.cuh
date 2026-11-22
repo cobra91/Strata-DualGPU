@@ -210,7 +210,11 @@ void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, in
 /// indexed by row[g*8+t]).  sg, su may be null (scale 1).
 void experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, size_t eb0,
                             const float* x, int C, int F, const float* sg, const float* su, float gcap, float ucap,
-                            uint16_t* h, cudaStream_t s, int n_x = 0);   // (n_x > 0: x's rows, made int8 once a call)
+                            uint16_t* h, cudaStream_t s, int n_x = 0);   // (n_x > 0: x's rows, made int8 once a call;
+                                                                          //  < 0: -n_x rows made by the caller)
+// the dp4a gate_up's scratch for n_x rows of x made int8 by the caller (per 32 values: codes of v * 127 / max |v|
+// rounded, the scale max / 127; [rows][C] codes, [rows][C / 32] scales) - then experts_gate_up_swiglu with -n_x
+bool experts_gu_x_scratch(int n_x, int C, cudaStream_t s, int8_t** xq, float** xs);
 /// experts_gate_up_swiglu with slot s's F outputs written at h + orow[s] * h_ld (orow null: s; h_ld 0: F) - a tensor-
 /// parallel GPU's half of every row of a wider h
 void experts_gate_up_swiglu_rows(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up,

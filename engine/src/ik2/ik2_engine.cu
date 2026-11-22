@@ -2586,7 +2586,19 @@ __global__ void k_dp_plan(const float* __restrict__ logits, const float* __restr
                           const uint8_t* const* __restrict__ tab_l, int K, int C, const float* __restrict__ x, int T,
                           uint8_t* ring, size_t rec_bytes, int R, int l, int* seqd, volatile int* ctl,
                           const uint8_t** blob, int* tok, int* inv, float* sg, float* su, float* wt, int* mflag,
-                          const uint8_t** gblob, int* gn, int* gtok, int* grow) {
+                          const uint8_t** gblob, int* gn, int* gtok, int* grow, int8_t* xq8 = nullptr,
+                          float* xs8 = nullptr) {
+    if (xq8) {   // (a token's x made int8 for the dp4a gate_up, as its own quant_rows_i8 would: the same codes)
+        const int lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+        for (int sb = threadIdx.x >> 5; sb < C / 32; sb += nw) {
+            const float v = x[sb * 32 + lane];
+            float m = fabsf(v);
+#pragma unroll
+            for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+            xq8[sb * 32 + lane] = (int8_t) __float2int_rn(m > 0.0f ? v * (127.0f / m) : 0.0f);
+            if (lane == 0) xs8[sb] = m * (1.0f / 127.0f);
+        }
+    }
     __shared__ int s_seq;
     __shared__ float s_sig[256], s_val[256];
     __shared__ int s_flag[256], top[kDpS];
@@ -2701,6 +2713,31 @@ __global__ void k_dp_merge(float* __restrict__ y, const float* ey, const int* __
     const int k = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
     if (!mflag[k] || i >= C) return;
     y[(size_t) k * C + i] = __ldcv(ey + ((size_t) (seqd[1] % R) * kDpS + k) * C + i);
+}
+// a decode token's (T 1) k_dp_merge and k::moe_combine_conv in one launch, after k_dp_wait: the CPU lane's rows read
+// where it wrote them, the picks summed and the short conv run as moe_combine_conv does (the same values in the same
+// order: the same bits)
+__global__ void k_dp_combine_conv(const float* __restrict__ y, const float* ey, const int* __restrict__ mflag,
+                                  const int* __restrict__ seqd, int R, const int* __restrict__ inv,
+                                  const float* __restrict__ wt, int K, int C, float* hist, const float* __restrict__ w,
+                                  const float* res, float* out) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    const float* eyr = ey + (size_t) (seqd[1] % R) * kDpS * C;
+    float a = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        const int r = inv[k];
+        a += wt[k] * (mflag[r] ? __ldcv(eyr + (size_t) r * C + c) : y[(size_t) r * C + c]);
+    }
+    const float h0 = hist[c], h1 = hist[(size_t) C + c], h2 = hist[(size_t) 2 * C + c];
+    const float* wc = w + (size_t) c * 4;
+    const float w0 = wc[0], w1 = wc[1], w2 = wc[2], w3 = wc[3];
+    float b = w0 * h0 + w1 * h1 + w2 * h2 + w3 * a;
+    if (res) b += res[c];
+    out[c] = b;
+    hist[c] = h1;
+    hist[(size_t) C + c] = h2;
+    hist[(size_t) 2 * C + c] = a;
 }
 // IK2_DP_MULTI=1: a verify window (2 .. kDpT tokens) through the plan too - no host sync a visit; measured no faster
 // than the host-planned path on 8 GB (the window's CPU misses bound it) and drafting slower beside its threads
@@ -3176,13 +3213,18 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         float* rw = (float*) (W.route_d + S);
         if (dp_tok) {   // IK2_DEVPLAN: no wait for the routing (see k_dp_plan, which routes too)
             const int S1 = T * c.K;
+            int8_t* xq8 = nullptr;   // (a token: the plan makes x int8 for the dp4a gate_up - a launch less)
+            float* xs8 = nullptr;
+            const bool pq = T == 1 && Ly.ty[0] == k::kIQ3_S && Ly.ty[1] == k::kIQ3_S && C % 256 == 0 &&
+                            k::experts_gu_x_scratch(1, C, g_s, &xq8, &xs8);
             k_dp_plan<<<1, 256, 0, g_s>>>(W.rlog, Ly.probs_b, c.E, c.route_scale, g_dp.tab + (size_t) l * c.E, c.K, C,
                                           W.xq, T, g_dp.rec_d, g_dp.rec_bytes,
                                           g_dp.R, l, g_dp.seqd, g_dp.ctl_d, g_dp.blob, g_dp.tok, g_dp.inv, g_dp.sg,
-                                          g_dp.su, g_dp.wt, g_dp.mflag, g_dp.gblob, g_dp.gn, g_dp.gtok, g_dp.grow);
+                                          g_dp.su, g_dp.wt, g_dp.mflag, g_dp.gblob, g_dp.gn, g_dp.gtok, g_dp.grow,
+                                          pq ? xq8 : nullptr, xs8);
             if (T == 1) {
                 k::experts_gate_up_swiglu(g_dp.blob, g_dp.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, c.F, g_dp.sg,
-                                          g_dp.su, c.gate_cap, c.up_cap, W.h16, g_s, 1);
+                                          g_dp.su, c.gate_cap, c.up_cap, W.h16, g_s, pq ? -1 : 1);
                 k::experts_down(g_dp.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
             } else {   // (a verify window: the hits' groups, an expert's weights read once for its tokens)
                 k::experts_gate_up_swiglu_g(g_dp.gblob, g_dp.gn, g_dp.gtok, g_dp.grow, S1, Ly.ty[0], Ly.ty[1], Ly.eb[0],
@@ -3191,6 +3233,13 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                                   W.y32, g_s, S1);
             }
             k_dp_wait<<<1, 32, 0, g_s>>>(g_dp.mflag, S1, g_dp.seqd, g_dp.ctl_d);
+            static const bool dcc = !getenv("IK2_DP_CC") || std::atoi(getenv("IK2_DP_CC"));
+            if (T == 1 && !g_rec && dcc) {   // (the CPU rows, the experts' sum and the short conv: one launch)
+                k_dp_combine_conv<<<(unsigned) ((C + 127) / 128), 128, 0, g_s>>>(W.y32, g_dp.ey_d, g_dp.mflag, g_dp.seqd,
+                                                                                g_dp.R, g_dp.inv, g_dp.wt, c.K, C,
+                                                                                Ly.h_mlp, Ly.sc_mlp, W.r, W.h);
+                continue;
+            }
             k_dp_merge<<<dim3((unsigned) ((C + 255) / 256), (unsigned) S1), 256, 0, g_s>>>(W.y32, g_dp.ey_d, g_dp.mflag,
                                                                                          g_dp.seqd, C, g_dp.R);
             if (T == 1 && !g_rec) {   // (the experts' sum and the short conv in one launch: the same values)

@@ -5706,6 +5706,7 @@ void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, in
     check("experts_down_g");
 }
 
+Q8Scratch g_gu_scr;   // (the dp4a gate_up's int8 x: launch_experts_gate_up_swiglu's, or a caller's - experts_gu_x_scratch)
 template <int WARPS, int ROWS>
 void launch_experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up,
                                    size_t eb0, const float* x, int C, int F, const float* sg, const float* su,
@@ -5714,16 +5715,18 @@ void launch_experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, i
     if (g_dp4a && ty_gate == kIQ3_S && ty_up == kIQ3_S && C % 256 == 0) {
         constexpr int Wn = 8, Pn = 1;   // (RTX 2060 SUPER: 8 warps and a row pair each, 145 us for 8 experts; 4 x 2: 153)
         static const int V = getenv("IK2_GU_VAR") ? std::atoi(getenv("IK2_GU_VAR")) : 7;   // 1: x once a call, 2: signs by arithmetic
-        // (the codes made once a call - n_x rows of x - into a scratch that exists before any graph capture)
-        static Q8Scratch scr;
+        // (the codes made once a call - n_x rows of x - into a scratch that exists before any graph capture; n_x < 0:
+        //  -n_x rows the caller made already, into experts_gu_x_scratch's)
+        const bool preq = n_x < 0;
+        const int nx = preq ? -n_x : n_x;
         int8_t* xq = nullptr;
         float* xs = nullptr;
-        const bool got = (V & 1) && n_x > 0 && scr.get((size_t) n_x * C, (size_t) 8 * C, s, xq, xs);
+        const bool got = ((V & 1) || preq) && nx > 0 && g_gu_scr.get((size_t) nx * C, (size_t) 8 * C, s, xq, xs);
         const dim3 g((unsigned) ((F + 2 * Wn * Pn - 1) / (2 * Wn * Pn)), (unsigned) S);
         const size_t sm = (size_t) C + (size_t) C / 32 * 4;
         const int hl = h_ld > 0 ? h_ld : F;
         if (got) {
-            quant_rows_i8_kernel<8><<<(unsigned) n_x, 256, 0, s>>>(x, C, xq, xs);
+            if (!preq) quant_rows_i8_kernel<8><<<(unsigned) nx, 256, 0, s>>>(x, C, xq, xs);
             if ((V & 4) && C == 2304) experts_gu_iq3s_dp4a_kernel<Wn, Pn, true, true, 72><<<g, Wn * 32, sm, s>>>(blob, tok, eb0, x, C, F, sg, su, gcap, ucap, h, orow, hl, xq, xs);
             else if (V & 2) experts_gu_iq3s_dp4a_kernel<Wn, Pn, true, true><<<g, Wn * 32, sm, s>>>(blob, tok, eb0, x, C, F, sg, su, gcap, ucap, h, orow, hl, xq, xs);
             else experts_gu_iq3s_dp4a_kernel<Wn, Pn, true, false><<<g, Wn * 32, sm, s>>>(blob, tok, eb0, x, C, F, sg, su, gcap, ucap, h, orow, hl, xq, xs);
@@ -5748,6 +5751,9 @@ void experts_gate_up_swiglu_rows(const uint8_t* const* blob, const int* tok, int
     if (S <= 8) launch_experts_gate_up_swiglu<4, 2>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, sg, su, gcap, ucap, h, s, orow, h_ld);
     else launch_experts_gate_up_swiglu<4, 4>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, sg, su, gcap, ucap, h, s, orow, h_ld);
     check("experts_gate_up_swiglu_rows");
+}
+bool experts_gu_x_scratch(int n_x, int C, cudaStream_t s, int8_t** xq, float** xs) {
+    return g_dp4a && C % 32 == 0 && g_gu_scr.get((size_t) n_x * C, (size_t) 8 * C, s, *xq, *xs);
 }
 void experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, size_t eb0,
                             const float* x, int C, int F, const float* sg, const float* su, float gcap, float ucap,
