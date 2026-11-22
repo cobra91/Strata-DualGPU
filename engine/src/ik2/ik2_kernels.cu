@@ -4448,6 +4448,44 @@ __device__ __forceinline__ void store_f16x4(uint16_t* dst, float v0, float v1, f
 }
 
 // one thread per 32-value sub-block of IQ3_XXS / IQ4_XS -> 32 FP16 (ggml's dequantize_row_iq3_xxs / iq4_xs values)
+// IQ3_S / IQ4_NL as FP16, a thread 8 values: one 16-byte store, a warp's stores side by side (the thread-a-sub-block
+// kernel's 16 stores of 4 bytes 64 bytes apart were ~3x its loads' time); the same per-value float math, the same bits
+__global__ void decode_f16_iq8_kernel(int type, const uint8_t* __restrict__ blocks, size_t n8, uint16_t* __restrict__ out) {
+    const size_t t = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n8) return;
+    float y[8];
+    if (type == kIQ3_S) {
+        const size_t sb = t >> 2;
+        const int l = (int) (t & 3), ib = (int) (sb & 7);
+        const uint8_t* b = blocks + (sb >> 3) * 110;
+        const float db = half_bits_to_float(__ldg((const uint16_t*) b)) *
+                         (float) (1 + 2 * ((__ldg(b + 106 + (ib >> 1)) >> (4 * (ib & 1))) & 0xF));
+        const uint32_t qh = __ldg(b + 66 + ib);
+        const uint32_t g1 = __ldg(d_iq3s_grid + (__ldg(b + 2 + 8 * ib + 2 * l) | ((qh << (8 - 2 * l)) & 256u)));
+        const uint32_t g2 = __ldg(d_iq3s_grid + (__ldg(b + 3 + 8 * ib + 2 * l) | ((qh << (7 - 2 * l)) & 256u)));
+        const uint32_t sg = __ldg(b + 74 + 4 * ib + l);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            y[j] = db * (float) ((g1 >> (8 * j)) & 0xFFu) * ((sg >> j) & 1u ? -1.0f : 1.0f);
+            y[4 + j] = db * (float) ((g2 >> (8 * j)) & 0xFFu) * ((sg >> (4 + j)) & 1u ? -1.0f : 1.0f);
+        }
+    } else {   // IQ4_NL: 18-byte blocks, values 0..15 the low nibbles, 16..31 the high
+        const size_t bk = t >> 2;
+        const int q = (int) (t & 3);
+        const uint8_t* b = blocks + bk * 18;
+        const float d = half_bits_to_float(__ldg((const uint16_t*) b));
+        const int j0 = (q & 1) * 8;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const uint8_t v = __ldg(b + 2 + j0 + j);
+            y[j] = d * (float) d_iq4nl[q < 2 ? (v & 0xF) : (v >> 4)];
+        }
+    }
+    uint4 o;
+    o.x = (uint32_t) f2h(y[0]) | ((uint32_t) f2h(y[1]) << 16), o.y = (uint32_t) f2h(y[2]) | ((uint32_t) f2h(y[3]) << 16);
+    o.z = (uint32_t) f2h(y[4]) | ((uint32_t) f2h(y[5]) << 16), o.w = (uint32_t) f2h(y[6]) | ((uint32_t) f2h(y[7]) << 16);
+    ((uint4*) out)[t] = o;
+}
 __global__ void decode_f16_iq_kernel(int type, const uint8_t* blocks, size_t nsub, uint16_t* out) {
     const size_t sb = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (sb >= nsub) return;
@@ -5953,6 +5991,13 @@ void decode_f16(int type, const uint8_t* blocks, size_t n, uint16_t* out, cudaSt
     if (type == kQ8_0 && n % 32 == 0) {
         decode_f16_q8_kernel<<<grid(n / 32, kBlk / 8), kBlk, 0, s>>>(blocks, n / 32, out);
         check("decode_f16_q8");
+        return;
+    }
+    static const bool iq8 = !getenv("IK2_DEC8") || std::atoi(getenv("IK2_DEC8"));
+    if (iq8 && ((type == kIQ3_S && n % 256 == 0) || (type == kIQ4_NL && n % 32 == 0)) && (((uintptr_t) out & 15) == 0) &&
+        (((uintptr_t) blocks & 1) == 0)) {
+        decode_f16_iq8_kernel<<<grid(n / 8), kBlk, 0, s>>>(type, blocks, n / 8, out);
+        check("decode_f16_iq8");
         return;
     }
     if ((((type == kIQ3_XXS || type == kIQ4_XS || type == kIQ3_S) && n % 256 == 0) || (type == kIQ4_NL && n % 32 == 0)) &&
