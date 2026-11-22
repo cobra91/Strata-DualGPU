@@ -204,7 +204,7 @@ constexpr int kGroupMax = 8;
 void experts_gate_up_g(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int ty_gate,
                        int ty_up, size_t eb0, const float* x, int C, int F, float* gu, cudaStream_t s);
 void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, int G, int ty_down, size_t off_down,
-                    const uint16_t* h, int C, int F, float* y, cudaStream_t s);
+                    const uint16_t* h, int C, int F, float* y, cudaStream_t s, int n_h = 0);   // (n_h: h's rows: dp4a)
 /// Fused gate+up+softcapped-SwiGLU straight to h [S][F] FP16 (or h[row[g*8+t]][F] in _g, where sg/su are also
 /// indexed by row[g*8+t]).  sg, su may be null (scale 1).
 void experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, size_t eb0,
@@ -217,7 +217,8 @@ void experts_gate_up_swiglu_rows(const uint8_t* const* blob, const int* tok, int
                                  float ucap, uint16_t* h, const int* orow, int h_ld, cudaStream_t s);
 void experts_gate_up_swiglu_g(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G,
                               int ty_gate, int ty_up, size_t eb0, const float* x, int C, int F, const float* sg,
-                              const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s);
+                              const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s,
+                              int n_x = 0);   // (n_x: x's rows - the dp4a kernel)
 
 /// Fused attention-input prep: l2clip(q) in place, l2clip(k_in) -> FP16 kc[slot], rms(v_in) -> FP16 vc[slot],
 /// l2clip(r) in place, where slot = kv_cap > 0 ? (pos0 + t) % kv_cap : (pos0 + t).  pos may be null (sliding layers).

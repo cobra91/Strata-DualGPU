@@ -313,6 +313,73 @@ IK2_AVX2 float dot_iq4nl_q8(const uint8_t* row, const int8_t* xq, const float* x
     }
     return hsum8(acc);
 }
+// ... several tokens' dots of one row (a verify window's tokens on one expert): each sub-block's weights made once
+// (IQ3_S's grid vector and sign mask, IQ4_NL's book lookup), then one maddubs a token
+template <int NT>
+IK2_AVX2 void dot_iq3s_q8_n(const uint8_t* row, const int8_t* const* xq, const float* const* xs, int K, float* out) {
+    const __m256i shuf = _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3,
+                                          3, 3, 3, 3, 3);
+    const __m256i bits = _mm256_set1_epi64x((long long) 0x8040201008040201ull);
+    const __m256i one8 = _mm256_set1_epi8(1), one16 = _mm256_set1_epi16(1);
+    __m256 acc[NT];
+    for (int t = 0; t < NT; ++t) acc[t] = _mm256_setzero_ps();
+    for (int sb = 0; sb < K / 256; ++sb) {
+        const uint8_t* b = row + (size_t) sb * 110;
+        const float d = f16_at(b);
+        for (int ib = 0; ib < 8; ++ib) {
+            const float db = d * (float) (1 + 2 * ((b[106 + (ib >> 1)] >> (4 * (ib & 1))) & 15));
+            const uint32_t qh = b[66 + ib];
+            const uint8_t* qs = b + 2 + 8 * ib;
+            uint32_t s32;
+            std::memcpy(&s32, b + 74 + 4 * ib, 4);
+            const uint32_t* G = k_iq3s_grid;
+            const __m256i g = _mm256_setr_epi32(
+                (int) G[qs[0] | ((qh << 8) & 256)], (int) G[qs[1] | ((qh << 7) & 256)], (int) G[qs[2] | ((qh << 6) & 256)],
+                (int) G[qs[3] | ((qh << 5) & 256)], (int) G[qs[4] | ((qh << 4) & 256)], (int) G[qs[5] | ((qh << 3) & 256)],
+                (int) G[qs[6] | ((qh << 2) & 256)], (int) G[qs[7] | ((qh << 1) & 256)]);
+            const __m256i sv = _mm256_or_si256(
+                _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32((int) s32), shuf), bits), bits), one8);
+            const int blk = sb * 8 + ib;
+            for (int t = 0; t < NT; ++t) {
+                const __m256i x = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i*) (xq[t] + blk * 32)), sv);
+                const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(g, x), one16);
+                acc[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(db * xs[t][blk]), acc[t]);
+            }
+        }
+    }
+    for (int t = 0; t < NT; ++t) out[t] = hsum8(acc[t]);
+}
+template <int NT>
+IK2_AVX2 void dot_iq4nl_q8_n(const uint8_t* row, const int8_t* const* xq, const float* const* xs, int K, float* out) {
+    const __m256i book = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*) k_iq4nl));
+    const __m256i m4 = _mm256_set1_epi8(15), one16 = _mm256_set1_epi16(1);
+    __m256 acc[NT];
+    for (int t = 0; t < NT; ++t) acc[t] = _mm256_setzero_ps();
+    for (int bk = 0; bk < K / 32; ++bk) {
+        const uint8_t* b = row + (size_t) bk * 18;
+        const __m128i q = _mm_loadu_si128((const __m128i*) (b + 2));
+        const __m256i w = _mm256_shuffle_epi8(book, _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(q, 4), q), m4));
+        const __m256i wa = _mm256_sign_epi8(w, w);
+        const float d = f16_at(b);
+        for (int t = 0; t < NT; ++t) {
+            const __m256i x = _mm256_loadu_si256((const __m256i*) (xq[t] + bk * 32));
+            const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(wa, _mm256_sign_epi8(x, w)), one16);
+            acc[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(d * xs[t][bk]), acc[t]);
+        }
+    }
+    for (int t = 0; t < NT; ++t) out[t] = hsum8(acc[t]);
+}
+template <int NT>
+IK2_AVX2 void rows_q8_n_t(int type, const uint8_t* W, int K, int r0, int r1, const int8_t* const* xq,
+                          const float* const* xs, float* const* out) {
+    const size_t rb = type == 21 ? (size_t) K / 256 * 110 : (size_t) K / 32 * 18;
+    float v[NT];
+    for (int r = r0; r < r1; ++r) {
+        if (type == 21) dot_iq3s_q8_n<NT>(W + (size_t) r * rb, xq, xs, K, v);
+        else dot_iq4nl_q8_n<NT>(W + (size_t) r * rb, xq, xs, K, v);
+        for (int t = 0; t < NT; ++t) out[t][r - r0] = v[t];
+    }
+}
 #undef IK2_AVX2
 #endif
 
@@ -414,6 +481,29 @@ void quant_q8(const float* x, int K, int8_t* q, float* sc) {
     std::abort();
 #endif
 }
+// nt tokens' rows of one matrix (1 <= nt <= 8): out[t] [r1 - r0]
+void rows_q8_n(int type, const uint8_t* W, int K, int r0, int r1, int nt, const int8_t* const* xq,
+               const float* const* xs, float* const* out) {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    if ((type != 21 && type != 20) || !available_for(type) || K % (type == 21 ? 256 : 32) || nt < 1 || nt > 8) {
+        std::fprintf(stderr, "ik2 CPU lane: rows_q8_n: type %d, K %d, %d tokens\n", type, K, nt);
+        std::abort();
+    }
+    switch (nt) {
+        case 1: rows_q8_n_t<1>(type, W, K, r0, r1, xq, xs, out); break;
+        case 2: rows_q8_n_t<2>(type, W, K, r0, r1, xq, xs, out); break;
+        case 3: rows_q8_n_t<3>(type, W, K, r0, r1, xq, xs, out); break;
+        case 4: rows_q8_n_t<4>(type, W, K, r0, r1, xq, xs, out); break;
+        case 5: rows_q8_n_t<5>(type, W, K, r0, r1, xq, xs, out); break;
+        case 6: rows_q8_n_t<6>(type, W, K, r0, r1, xq, xs, out); break;
+        case 7: rows_q8_n_t<7>(type, W, K, r0, r1, xq, xs, out); break;
+        default: rows_q8_n_t<8>(type, W, K, r0, r1, xq, xs, out); break;
+    }
+#else
+    std::fprintf(stderr, "ik2 CPU lane: no int8 CPU dots in this build\n");
+    std::abort();
+#endif
+}
 bool g_cpu_q8 = !getenv("IK2_CPU_Q8") || std::atoi(getenv("IK2_CPU_Q8"));
 
 namespace {
@@ -496,34 +586,67 @@ void experts_batch(const BatchJob* J, int n, int C, int F, float gcap, float uca
     bool q8 = g_cpu_q8 && C % 256 == 0 && F % 128 == 0;   // (F % 128: whole 32-row tasks for any RG of 32, 64, 128)
     for (int j = 0; q8 && j < n; ++j) q8 = J[j].tg == 21 && J[j].tu == 21 && J[j].td == 20;
     if (q8) {   // the int8 dots: the inputs made int8 (x here, the activations by the tasks that make them)
+        // (a job's nt tokens - 1 for the device plan's, up to 8 for a verify window's - share each weight's decode)
+        int ntm = 1;
+        for (int j = 0; j < n; ++j) ntm = std::max(ntm, J[j].nt);
         thread_local std::vector<int8_t> q_tl;
-        thread_local std::vector<float> s_tl;
-        const size_t per = (size_t) C + F;   // (x's codes, then the activations')
-        if (q_tl.size() < (size_t) n * per) q_tl.resize((size_t) n * per), s_tl.resize((size_t) n * per / 32);
+        thread_local std::vector<float> s_tl, g_tl;
+        const size_t per = (size_t) C + F;   // (a token's x codes, then its activations')
+        const size_t slots = (size_t) n * ntm;
+        if (q_tl.size() < slots * per) q_tl.resize(slots * per), s_tl.resize(slots * per / 32);
+        if (g_tl.size() < slots * 2 * F) g_tl.resize(slots * 2 * F);
         int8_t* const qb = q_tl.data();
         float* const sb = s_tl.data();
-        for (int j = 0; j < n; ++j) quant_q8(J[j].x, C, qb + j * per, sb + j * per / 32);
+        float* const gb = g_tl.data();
+        auto xin = [&](int j, int t) { return t == 0 || J[j].nt <= 1 ? J[j].x : J[j].xt[t]; };
+        auto yout = [&](int j, int t) { return t == 0 || J[j].nt <= 1 ? J[j].y : J[j].yt[t]; };
+        for (int j = 0; j < n; ++j)
+            for (int t = 0; t < std::max(1, J[j].nt); ++t) {
+                const size_t sl = (size_t) j * ntm + t;
+                quant_q8(xin(j, t), C, qb + sl * per, sb + sl * per / 32);
+            }
         constexpr int RG = 32;   // (gate_up rows a task: a 32-block of the activations; 64 measured the same)
         const int pg = F / RG;
         spin_for(n * pg, [&](int i) {   // a task: RG rows of gate and the same of up, their activation, made int8
-            const int j = i / pg, f0 = (i % pg) * RG;
-            float* g = gu + (size_t) j * 2 * F;
-            const int8_t* xq = qb + j * per;
-            const float* xs = sb + j * per / 32;
-            rows_q8(21, J[j].gate, C, f0, f0 + RG, xq, xs, g + f0);
-            rows_q8(21, J[j].up, C, f0, f0 + RG, xq, xs, g + F + f0);
-            for (int f = f0; f < f0 + RG; ++f) {
-                const float a = g[f] * J[j].sg, u = g[F + f] * J[j].su;
-                g[f] = gcap * std::tanh(a / gcap) * (1.0f / (1.0f + std::exp(-a))) * ucap * std::tanh(u / ucap);
+            const int j = i / pg, f0 = (i % pg) * RG, nt = std::max(1, J[j].nt);
+            const int8_t* xq[8];
+            const float* xs[8];
+            float *og[8], *ou[8];
+            for (int t = 0; t < nt; ++t) {
+                const size_t sl = (size_t) j * ntm + t;
+                xq[t] = qb + sl * per, xs[t] = sb + sl * per / 32;
+                og[t] = gb + sl * 2 * F + f0, ou[t] = gb + sl * 2 * F + F + f0;
             }
-            quant_q8(g + f0, RG, qb + j * per + C + f0, sb + (j * per + C + f0) / 32);
+            rows_q8_n(21, J[j].gate, C, f0, f0 + RG, nt, xq, xs, og);
+            rows_q8_n(21, J[j].up, C, f0, f0 + RG, nt, xq, xs, ou);
+            for (int t = 0; t < nt; ++t) {
+                const size_t sl = (size_t) j * ntm + t;
+                float* g = gb + sl * 2 * F;
+                for (int f = f0; f < f0 + RG; ++f) {
+                    const float a = g[f] * J[j].sg, u = g[F + f] * J[j].su;
+                    g[f] = gcap * std::tanh(a / gcap) * (1.0f / (1.0f + std::exp(-a))) * ucap * std::tanh(u / ucap);
+                }
+                quant_q8(g + f0, RG, qb + sl * per + C + f0, sb + (sl * per + C + f0) / 32);
+            }
         });
         spin_for(n * pc, [&](int i) {
-            const int j = i / pc, r0 = (i % pc) * RP;
-            rows_q8(20, J[j].down, F, r0, r0 + RP, qb + j * per + C, sb + (j * per + C) / 32, J[j].y + r0);
+            const int j = i / pc, r0 = (i % pc) * RP, nt = std::max(1, J[j].nt);
+            const int8_t* xq[8];
+            const float* xs[8];
+            float* oy[8];
+            for (int t = 0; t < nt; ++t) {
+                const size_t sl = (size_t) j * ntm + t;
+                xq[t] = qb + sl * per + C, xs[t] = sb + (sl * per + C) / 32, oy[t] = yout(j, t) + r0;
+            }
+            rows_q8_n(20, J[j].down, F, r0, r0 + RP, nt, xq, xs, oy);
         });
         return;
     }
+    for (int j = 0; j < n; ++j)
+        if (J[j].nt > 1) {
+            std::fprintf(stderr, "ik2 CPU lane: several tokens a job need the int8 dots (IQ3_S / IQ4_NL)\n");
+            std::abort();
+        }
     spin_for(n * pa, [&](int i) {   // gate's rows [0, F), up's [F, 2F)
         const int j = i / pa, r0 = (i % pa) * RP;
         float* g = gu + (size_t) j * 2 * F;

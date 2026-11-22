@@ -71,6 +71,11 @@ struct BatchJob {
     const float* x = nullptr;
     float sg = 1.0f, su = 1.0f;
     float* y = nullptr;   // [C]
+    // (nt > 1: a verify window's tokens on this expert - x / y token 0's, xt / yt [1 .. nt) the others'; IQ3_S /
+    // IQ4_NL by the int8 dots only)
+    int nt = 1;
+    const float* xt[8] = {};
+    float* yt[8] = {};
 };
 void spin_start(int workers);
 void experts_batch(const BatchJob* J, int n, int C, int F, float gcap, float ucap);

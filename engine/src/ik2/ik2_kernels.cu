@@ -5110,6 +5110,11 @@ __global__ void __launch_bounds__(WARPS * 32) experts_gu_iq3s_dp4a_kernel(
 }
 // down: a warp 8 rows of C as one run of 8 x F / 32 blocks (8 x 36 = 9 x 32), lane i taking i, i + 32, ...
 template <int WARPS>
+__global__ void quant_rows_h_i8_kernel(const uint16_t* h, int F, int8_t* xq, float* xs) {
+    const int r = blockIdx.x;
+    quant_h_i8<WARPS>(h + (size_t) r * F, F, xq + (size_t) r * F, xs + (size_t) r * (F / 32));
+}
+template <int WARPS>
 __global__ void quant_h_rows_i8_kernel(const uint16_t* const* blob, const uint16_t* h, int F, int8_t* xq, float* xs) {
     const int r = blockIdx.x;
     if (!blob[r]) return;
@@ -5210,9 +5215,180 @@ void experts_gate_up_g(const uint8_t* const* blob, const int* n, const int* tok,
                                                             mv_row_bytes(ty_gate, C), mv_row_bytes(ty_up, C), gu);
     check("experts_gate_up_g");
 }
+// ---- the grouped dp4a experts (a few tokens - a verify window - an expert's tokens a group, kGroupMax at most): a
+// sub-block's weights decoded once and dotted with each of the group's tokens (x / h made int8 once a call)
+template <int WARPS, int NT>
+__global__ void __launch_bounds__(WARPS * 32) experts_gu_iq3s_dp4a_g_kernel(
+    const uint8_t* const* blob, const int* n, const int* tok, const int* row, size_t eb0, int C, int F,
+    const float* sg, const float* su, float gcap, float ucap, uint16_t* h, const int8_t* xq_g, const float* xs_g) {
+    const int g = blockIdx.y, ng = min(n[g], NT);
+    if (ng <= 0) return;
+    const uint8_t* bl = blob[g];
+    if (!bl) return;
+    __shared__ uint32_t grid_s[512];
+    extern __shared__ __align__(16) int8_t gg_xq[];   // [NT][C] codes, then [NT][C / 32] scales
+    float* xsc = (float*) (gg_xq + (size_t) NT * C);
+    for (int i = threadIdx.x; i < 512; i += WARPS * 32) grid_s[i] = d_iq3s_grid[i];
+    for (int t = 0; t < ng; ++t) {
+        const int tk = tok[g * kGroupMax + t];
+        const int4* src = (const int4*) (xq_g + (size_t) tk * C);
+        for (int i = threadIdx.x; i < C / 16; i += WARPS * 32) ((int4*) (gg_xq + (size_t) t * C))[i] = __ldg(src + i);
+        for (int i = threadIdx.x; i < C / 32; i += WARPS * 32) xsc[t * (C / 32) + i] = __ldg(xs_g + (size_t) tk * (C / 32) + i);
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int r0 = (blockIdx.x * WARPS + warp) * 2;
+    if (r0 >= F) return;
+    const int nsb = C / 32;
+    const size_t rb = (size_t) (nsb / 8) * 110;
+    const uint8_t* rows[4] = {bl + (size_t) r0 * rb, bl + (size_t) min(r0 + 1, F - 1) * rb, bl + eb0 + (size_t) r0 * rb,
+                              bl + eb0 + (size_t) min(r0 + 1, F - 1) * rb};
+    float acc[NT][4];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.0f;
+    for (int p = lane; p < 4 * nsb; p += 32) {
+        const int m = p / nsb, sb = p - m * nsb;
+        const uint8_t* b = rows[m] + (size_t) (sb >> 3) * 110;
+        const int ib = sb & 7;
+        const float db = half_bits_to_float(__ldg((const uint16_t*) b)) *
+                         (float) (1 + 2 * ((__ldg(b + 106 + (ib >> 1)) >> (4 * (ib & 1))) & 15));
+        const uint32_t qh = __ldg(b + 66 + ib);
+        const uint16_t* qs = (const uint16_t*) (b + 2 + 8 * ib);
+        const uint16_t* sp = (const uint16_t*) (b + 74 + 4 * ib);
+        const uint32_t sgw = (uint32_t) __ldg(sp) | ((uint32_t) __ldg(sp + 1) << 16);
+        uint32_t wv[8];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t q = __ldg(qs + l);
+            const uint32_t g1 = grid_s[(q & 0xFFu) | ((qh << (8 - 2 * l)) & 256u)];
+            const uint32_t g2 = grid_s[(q >> 8) | ((qh << (7 - 2 * l)) & 256u)];
+            const uint32_t m1 = sign_bytes4((sgw >> (8 * l)) & 15u), m2 = sign_bytes4((sgw >> (8 * l + 4)) & 15u);
+            wv[2 * l] = (g1 ^ m1) + (m1 & 0x01010101u), wv[2 * l + 1] = (g2 ^ m2) + (m2 & 0x01010101u);
+        }
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            if (t < ng) {
+                const int4* x4 = (const int4*) (gg_xq + (size_t) t * C);
+                const int4 xa = x4[2 * sb], xb = x4[2 * sb + 1];
+                int sumi = 0;
+                sumi = STRATA_DP4A((int) wv[0], xa.x, sumi), sumi = STRATA_DP4A((int) wv[1], xa.y, sumi);
+                sumi = STRATA_DP4A((int) wv[2], xa.z, sumi), sumi = STRATA_DP4A((int) wv[3], xa.w, sumi);
+                sumi = STRATA_DP4A((int) wv[4], xb.x, sumi), sumi = STRATA_DP4A((int) wv[5], xb.y, sumi);
+                sumi = STRATA_DP4A((int) wv[6], xb.z, sumi), sumi = STRATA_DP4A((int) wv[7], xb.w, sumi);
+                const float v = db * xsc[t * nsb + sb] * (float) sumi;
+                acc[t][0] += m == 0 ? v : 0.0f, acc[t][1] += m == 1 ? v : 0.0f;
+                acc[t][2] += m == 2 ? v : 0.0f, acc[t][3] += m == 3 ? v : 0.0f;
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        if (t >= ng) break;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[t][j] = wsum(acc[t][j]);
+        const int rw = row[g * kGroupMax + t];
+        if (lane < 2 && r0 + lane < F) {
+            const float gv = (lane ? acc[t][1] : acc[t][0]) * (sg ? sg[rw] : 1.0f);
+            const float uv = (lane ? acc[t][3] : acc[t][2]) * (su ? su[rw] : 1.0f);
+            h[(size_t) rw * F + r0 + lane] =
+                f2h(gcap * tanhf(gv / gcap) * (1.0f / (1.0f + expf(-gv))) * ucap * tanhf(uv / ucap));
+        }
+    }
+}
+template <int WARPS, int NT>
+__global__ void __launch_bounds__(WARPS * 32) experts_down_iq4nl_dp4a_g_kernel(
+    const uint8_t* const* blob, const int* n, const int* row, size_t off_down, int C, int F, float* y,
+    const int8_t* xq_g, const float* xs_g) {
+    const int g = blockIdx.y, ng = min(n[g], NT);
+    if (ng <= 0) return;
+    const uint8_t* bl = blob[g];
+    if (!bl) return;
+    extern __shared__ __align__(16) int8_t dg_xq[];   // [NT][F] codes, then [NT][F / 32] scales
+    float* xsc = (float*) (dg_xq + (size_t) NT * F);
+    for (int t = 0; t < ng; ++t) {
+        const int rw = row[g * kGroupMax + t];
+        const int4* src = (const int4*) (xq_g + (size_t) rw * F);
+        for (int i = threadIdx.x; i < F / 16; i += WARPS * 32) ((int4*) (dg_xq + (size_t) t * F))[i] = __ldg(src + i);
+        for (int i = threadIdx.x; i < F / 32; i += WARPS * 32) xsc[t * (F / 32) + i] = __ldg(xs_g + (size_t) rw * (F / 32) + i);
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int r0 = (blockIdx.x * WARPS + warp) * 8;
+    if (r0 >= C) return;
+    const int nb = F / 32, nr = min(8, C - r0);
+    const uint8_t* base = bl + off_down + (size_t) r0 * nb * 18;
+    float acc[NT][8];
+#pragma unroll
+    for (int t = 0; t < NT; ++t)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[t][j] = 0.0f;
+    for (int p = lane; p < nr * nb; p += 32) {
+        const int m = p / nb, bk = p - m * nb;
+        const uint16_t* b = (const uint16_t*) (base + (size_t) p * 18);
+        const float d = half_bits_to_float(__ldg(b));
+        uint32_t wl[4], wh[4];
+#pragma unroll
+        for (int k2 = 0; k2 < 4; ++k2) {
+            const uint32_t w = (uint32_t) __ldg(b + 1 + 2 * k2) | ((uint32_t) __ldg(b + 2 + 2 * k2) << 16);
+            wl[k2] = iq4nl_lut4(w, false), wh[k2] = iq4nl_lut4(w, true);
+        }
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            if (t < ng) {
+                const int4* x4 = (const int4*) (dg_xq + (size_t) t * F);
+                const int4 xa = x4[2 * bk], xb = x4[2 * bk + 1];
+                int sumi = 0;
+                sumi = STRATA_DP4A((int) wl[0], xa.x, sumi), sumi = STRATA_DP4A((int) wh[0], xb.x, sumi);
+                sumi = STRATA_DP4A((int) wl[1], xa.y, sumi), sumi = STRATA_DP4A((int) wh[1], xb.y, sumi);
+                sumi = STRATA_DP4A((int) wl[2], xa.z, sumi), sumi = STRATA_DP4A((int) wh[2], xb.z, sumi);
+                sumi = STRATA_DP4A((int) wl[3], xa.w, sumi), sumi = STRATA_DP4A((int) wh[3], xb.w, sumi);
+                const float v = d * xsc[t * nb + bk] * (float) sumi;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) acc[t][j] += m == j ? v : 0.0f;
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        if (t >= ng) break;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[t][j] = wsum(acc[t][j]);
+        if (lane < nr) {
+            float v = acc[t][0];
+#pragma unroll
+            for (int j = 1; j < 8; ++j) v = lane == j ? acc[t][j] : v;
+            y[(size_t) row[g * kGroupMax + t] * C + r0 + lane] = v;
+        }
+    }
+}
+// (the scratch for the grouped dp4a calls' int8 inputs: grown outside graph captures only)
+static bool grow_q8_scratch(int8_t*& q, float*& sc, size_t& cap, size_t need, cudaStream_t s) {
+    if (need <= cap) return true;
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(s, &cs);
+    if (cs != cudaStreamCaptureStatusNone) return false;
+    if (q) cudaFree(q), cudaFree(sc);
+    cap = std::max<size_t>(need, (size_t) 1 << 16);
+    if (cudaMalloc(&q, cap) != cudaSuccess || cudaMalloc(&sc, cap / 32 * 4) != cudaSuccess) check("grouped dp4a scratch");
+    return true;
+}
 void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, int G, int ty_down, size_t off_down,
-                    const uint16_t* h, int C, int F, float* y, cudaStream_t s) {
+                    const uint16_t* h, int C, int F, float* y, cudaStream_t s, int n_h) {
     if (G <= 0) return;
+    if (g_dp4a && ty_down == kIQ4_NL && F % 32 == 0 && n_h > 0) {   // (n_h: h's rows, made int8 once)
+        static int8_t* xq = nullptr;
+        static float* xs = nullptr;
+        static size_t cap = 0;
+        if (grow_q8_scratch(xq, xs, cap, (size_t) n_h * F, s)) {
+            quant_rows_h_i8_kernel<8><<<(unsigned) n_h, 256, 0, s>>>(h, F, xq, xs);
+            constexpr int W = 4, NT = kGroupMax;
+            experts_down_iq4nl_dp4a_g_kernel<W, NT><<<dim3((unsigned) ((C + 8 * W - 1) / (8 * W)), (unsigned) G), W * 32,
+                                                      (size_t) NT * F + (size_t) NT * (F / 32) * 4, s>>>(
+                blob, n, row, off_down, C, F, y, xq, xs);
+            check("experts_down_g (dp4a)");
+            return;
+        }
+    }
     const dim3 g((unsigned) ((C + kGroupWarps * kGroupRows - 1) / (kGroupWarps * kGroupRows)), (unsigned) G);
     experts_down_g_kernel<<<g, kGroupWarps * 32, 0, s>>>(blob, n, row, ty_down, off_down, h, C, F,
                                                          mv_row_bytes(ty_down, F), y);
@@ -5282,8 +5458,22 @@ void experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, int S, i
 
 void experts_gate_up_swiglu_g(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G,
                               int ty_gate, int ty_up, size_t eb0, const float* x, int C, int F, const float* sg,
-                              const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s) {
+                              const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s, int n_x) {
     if (G <= 0) return;
+    if (g_dp4a && ty_gate == kIQ3_S && ty_up == kIQ3_S && C % 256 == 0 && n_x > 0) {   // (n_x: x's rows)
+        static int8_t* xq = nullptr;
+        static float* xs = nullptr;
+        static size_t cap = 0;
+        if (grow_q8_scratch(xq, xs, cap, (size_t) n_x * C, s)) {
+            quant_rows_i8_kernel<8><<<(unsigned) n_x, 256, 0, s>>>(x, C, xq, xs);
+            constexpr int W = 8, NT = kGroupMax;
+            experts_gu_iq3s_dp4a_g_kernel<W, NT><<<dim3((unsigned) ((F + 2 * W - 1) / (2 * W)), (unsigned) G), W * 32,
+                                                   (size_t) NT * C + (size_t) NT * (C / 32) * 4, s>>>(
+                blob, n, tok, row, eb0, C, F, sg, su, gcap, ucap, h, xq, xs);
+            check("experts_gate_up_swiglu_g (dp4a)");
+            return;
+        }
+    }
     const dim3 g((unsigned) ((F + kGroupWarps * kGroupSwigluRows - 1) / (kGroupWarps * kGroupSwigluRows)), (unsigned) G);
     experts_gate_up_swiglu_g_kernel<<<g, kGroupWarps * 32, 0, s>>>(blob, n, tok, row, ty_gate, ty_up, eb0, x, C, F,
                                                                    mv_row_bytes(ty_gate, C), mv_row_bytes(ty_up, C),

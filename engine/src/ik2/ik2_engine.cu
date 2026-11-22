@@ -334,6 +334,8 @@ void lazy_poll() {
 // IK2_PROF=1: the stream waited for at each phase's end, its time added to the phase (slower, but where it goes)
 bool g_prof = false;
 bool g_mv = true;   // IK2_MV=0: a few tokens' experts through the FP16 GEMMs too
+bool g_verify_cpu = !getenv("IK2_VERIFY_CPU") || std::atoi(getenv("IK2_VERIFY_CPU"));   // (see multi below)
+int g_verify_copies = getenv("IK2_VERIFY_COPIES") ? std::atoi(getenv("IK2_VERIFY_COPIES")) : 1;
 // How often each expert is picked by a token (prefill and decode), [n_layer * E]: IK2_POP_OUT=FILE writes it at
 // the end (int32 n_layer, int32 E, then uint64 counts); IK2_WARM=FILE fills the expert cache with the most picked
 // experts at load, so the first requests do not start from an empty cache.
@@ -3402,7 +3404,10 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             }
             const uint32_t stp = W.stamp;
             lazy_poll();
-            const bool lazy_ok = g_cpu_lazy && g_seq_next - 1 - g_seq_done < (uint64_t) g_lazy_max;
+            // (a few tokens - a verify window: every miss on the CPU, grouped by expert, and copied in afterwards)
+            const bool multi = cpu_lane && T > 1 && g_verify_cpu;
+            const bool lazy_ok = (g_cpu_lazy && g_seq_next - 1 - g_seq_done < (uint64_t) g_lazy_max) ||
+                                 (multi && g_seq_next - 1 - g_seq_done < (uint64_t) kRing - 1);
             double acc_up = 0, acc_cpu = 0;
             int urgent[64], lazy[64];
             int n_urgent = 0, n_lazy = 0;
@@ -3421,9 +3426,11 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                     continue;
                 }
                 // a miss: the CPU's or the link's, whichever is free first
-                if (cpu_lane && acc_cpu + g_t_cpu <= acc_up + g_t_up) {
+                if (cpu_lane && (multi || acc_cpu + g_t_cpu <= acc_up + g_t_up)) {
                     late[i] = 2, acc_cpu += g_t_cpu;
-                    if (lazy_ok) {   // a slot for its blocks, copied in afterwards
+                    // (a verify window copies in at most g_verify_copies of its misses a visit: the link moves ~1.5
+                    //  experts in the window's time, more stalls the host on the copy ring)
+                    if (lazy_ok && (!multi || n_lazy < g_verify_copies)) {   // a slot for its blocks, copied in afterwards
                         where[i] = EC.get(Ly, l, e, tick, cst, nullptr, false, false);
                         slot_of[i] = EC.last_handle;
                         lazy[n_lazy++] = i;
@@ -3477,7 +3484,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 sg[p] = Ly.scale[0].empty() ? 1.0f : Ly.scale[0][e];
                 su[p] = Ly.scale[1].empty() ? 1.0f : Ly.scale[1][e];
                 wt[i] = w[i] * (Ly.scale[2].empty() ? 1.0f : Ly.scale[2][e]);
-                if (late[i] == 2) {
+                if (late[i] == 2 && !multi) {
                     auto& J = jobs[p - nh - nw];
                     J.gate = Ly.host[0] + (size_t) e * Ly.stride[0];
                     J.up = Ly.host[1] + (size_t) e * Ly.stride[1];
@@ -3487,6 +3494,40 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                     J.sg = sg[p], J.su = su[p];
                     J.y = yh + (size_t) (p - nh - nw) * C;
                     ik2::cpu::post_expert(*g_pool, &J, C, c.F, c.gate_cap, c.up_cap);
+                }
+            }
+            // the window's CPU misses as one batch, an expert's tokens a job (its weights read once for all of them)
+            ik2::cpu::BatchJob bj[64];
+            int n_bj = 0;
+            if (multi && n_jobs > 0) {
+                int ej[64];
+                for (int i = 0; i < S; ++i) {
+                    if (late[i] != 2) continue;
+                    const int e = top[i], p = id[i];
+                    int j = 0;
+                    while (j < n_bj && ej[j] != e) ++j;
+                    float* y = yh + (size_t) (p - nh - nw) * C;
+                    const float* x = W.x_h + (size_t) (i / c.K) * C;
+                    if (j == n_bj) {
+                        ej[n_bj++] = e;
+                        auto& J = bj[j];
+                        J = ik2::cpu::BatchJob{};
+                        J.gate = Ly.host[0] + (size_t) e * Ly.stride[0];
+                        J.up = Ly.host[1] + (size_t) e * Ly.stride[1];
+                        J.down = Ly.host[2] + (size_t) e * Ly.stride[2];
+                        J.tg = Ly.ty[0], J.tu = Ly.ty[1], J.td = Ly.ty[2];
+                        J.sg = sg[p], J.su = su[p];
+                        J.x = x, J.y = y;
+                    } else if (bj[j].nt < 8) {
+                        auto& J = bj[j];
+                        J.xt[J.nt] = x, J.yt[J.nt] = y;
+                        ++J.nt;
+                    } else {   // (more than 8 tokens on one expert: a job more)
+                        auto& J = bj[n_bj];
+                        J = bj[j];
+                        J.nt = 1, J.x = x, J.y = y;
+                        ej[n_bj++] = -1;
+                    }
                 }
             }
             g_n_cpu += n_jobs, g_n_wait += nw;
@@ -3556,9 +3597,9 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                     const int g0 = part ? ng[0] : 0, gc = ng[part];
                     k::experts_gate_up_swiglu_g(pgb + g0, pgn + g0, pgt + (size_t) g0 * k::kGroupMax,
                                                 pgr + (size_t) g0 * k::kGroupMax, gc, Ly.ty[0], Ly.ty[1], Ly.eb[0],
-                                                W.xq, C, F, psg, psu, c.gate_cap, c.up_cap, W.h16, g_s);
+                                                W.xq, C, F, psg, psu, c.gate_cap, c.up_cap, W.h16, g_s, T);
                     k::experts_down_g(pgb + g0, pgn + g0, pgr + (size_t) g0 * k::kGroupMax, gc, Ly.ty[2],
-                                      Ly.eb[0] + Ly.eb[1], W.h16, C, F, W.y32, g_s);
+                                      Ly.eb[0] + Ly.eb[1], W.h16, C, F, W.y32, g_s, S);
                     continue;
                 }
                 k::experts_gate_up_swiglu(pb + p0, ptk + p0, n, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, F, psg + p0,
@@ -3567,7 +3608,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                                 W.y32 + (size_t) p0 * C, g_s);
             }
             if (n_jobs > 0) {
-                g_pool->wait();
+                if (multi) ik2::cpu::experts_batch(bj, n_bj, C, F, c.gate_cap, c.up_cap);   // (the GPU's groups run)
+                else g_pool->wait();
                 g_t_cpu = 0.9 * g_t_cpu + 0.1 * (now() - tc0) / n_jobs;
                 CU(cudaMemcpyAsync(W.y32 + (size_t) (nh + nw) * C, yh, (size_t) n_jobs * C * 4, cudaMemcpyHostToDevice,
                                    g_s));
@@ -4290,6 +4332,7 @@ int run(int argc, char** argv) {
         threads = std::max(2, (int) std::thread::hardware_concurrency() / 2);
     if (cpu_want && ik2::cpu::available_any() && threads > 1 && n_gpu == 1)
         g_pool = new ik2::cpu::Pool(threads - 1);
+    if (g_pool) ik2::cpu::spin_start(g_pool->size());   // (the batches' workers: the device plan's and a verify's)
     if (small_card && g_pool) g_lazy_max = 0;
     // a small card with a looped model: a long prompt takes lent layer-major passes (forward_prefill_sup), so forward()'s
     // chunk only sizes the short prompts' and the decode's buffers and the sliding layers' rings - 512 instead of 2048
