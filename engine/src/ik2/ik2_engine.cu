@@ -1199,6 +1199,12 @@ struct Work {
     int T_host = 0;          // tokens the pinned host staging (pos_h, route_h, gidx_h, ..) holds
     std::vector<int> cnt, start, fill, hit_exps, miss_exps;
     std::vector<uint8_t*> slot_ptrs;
+    // a short prompt's misses on the CPU lane (run_prefill_moe): x and the rows' outputs staged, up to pc_rows rows
+    uint16_t* pc_x16_h = nullptr;
+    float *pc_x_h = nullptr, *pc_y_h = nullptr, *pc_y_d = nullptr;
+    bool pc_failed = false;
+    cudaEvent_t pc_ev = nullptr;
+    std::vector<char> pc_on;
     std::vector<uint32_t> seen_stamp, gi_stamp;
     std::vector<char> seen_late;
     std::vector<int> gi_idx;
@@ -1855,6 +1861,19 @@ void prefetch_layer(Model& M, int l, Work& W, ExpertCache& EC, int T, const Work
     W.pf_layers[pr] = l;
 }
 
+constexpr int kPcpuRows = 4096;
+void pc_alloc(Work& X, int C) {   // run_prefill_moe's staging for a short prompt's CPU experts (once; none: no room)
+    if (X.pc_x16_h || X.pc_failed) return;
+    if (cudaMalloc(&X.pc_y_d, (size_t) kPcpuRows * C * 4) != cudaSuccess) {
+        cudaGetLastError();
+        X.pc_failed = true;   // (every miss copied in)
+        return;
+    }
+    CU(cudaHostAlloc((void**) &X.pc_x16_h, (size_t) kPcpuRows * C * 2, cudaHostAllocDefault));
+    CU(cudaHostAlloc((void**) &X.pc_x_h, (size_t) kPcpuRows * C * 4, cudaHostAllocDefault));
+    CU(cudaHostAlloc((void**) &X.pc_y_h, (size_t) kPcpuRows * C * 4, cudaHostAllocDefault));
+    CU(cudaEventCreateWithFlags(&X.pc_ev, cudaEventDisableTiming));
+}   // (a short prompt's picks the CPU lane may take: T * K up to this)
 void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq16, const int* top, const float* w,
                      const float* r_in, float* h_out, Work& W, ExpertCache& EC, double& t_exp) {
     const Config& c = M.c;
@@ -1919,7 +1938,39 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
                 X.miss_exps.push_back(e);
             }
         }
+        // (a short prompt: the misses that cost the CPU lane least - fewest tokens - computed there while the link
+        //  brings the rest, as many as keep the lane's time under the link's; IK2_PCPU=0: every miss copied in)
+        static const bool pcpu_on = !getenv("IK2_PCPU") || std::atoi(getenv("IK2_PCPU"));
+        if (pcpu_on && g_pool && T > 8 && T * c.K <= kPcpuRows) pc_alloc(X, C);   // (at load already, normally)
+        const bool pcpu = pcpu_on && X.pc_x16_h && d < 0 && g_pool && g_overlap && !g_prof && T > 8 &&
+                          T * c.K <= kPcpuRows && ik2::cpu::batch_multi_ok(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, F);
+        std::vector<int> cpu_exps;
+        X.pc_on.assign(c.E, 0);
+        if (pcpu && !X.miss_exps.empty()) {
+            std::vector<int> ms = X.miss_exps;
+            std::stable_sort(ms.begin(), ms.end(), [&](int a, int b) { return W.cnt[a] < W.cnt[b]; });
+            const double a0 = 0.2e-3, a1 = 0.02e-3;   // (the lane's seconds an expert, and a token more)
+            double tc = 0;
+            int taken = 0;
+            for (int e : ms) {
+                const double ce = a0 + a1 * (W.cnt[e] - 1);
+                if (tc + ce > (double) ((int) ms.size() - taken - 1) * g_t_up) break;
+                tc += ce, ++taken;
+                X.pc_on[e] = 1;
+                cpu_exps.push_back(e);
+            }
+            if (taken) {
+                std::vector<int> rest;
+                for (int e : X.miss_exps)
+                    if (!X.pc_on[e]) rest.push_back(e);
+                X.miss_exps.swap(rest);
+            }
+        }
         for (int e : X.miss_exps) X.slot_ptrs[e] = XC.get(Ly, l, e, tick, cst, nullptr, false, true);
+        if (!cpu_exps.empty()) {   // (x to the host first: ahead of every expert's kernels on the stream)
+            CU(cudaMemcpyAsync(X.pc_x16_h, xin, (size_t) T * C * 2, cudaMemcpyDeviceToHost, g_s));
+            CU(cudaEventRecord(X.pc_ev, g_s));
+        }
 
         // the layer's routing tables first: the host-to-device copies share one copy engine in order, and these small
         // ones queued behind the misses' (megabytes each) held every expert's kernels back until the last miss landed
@@ -1967,12 +2018,44 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
         for (int m = 0; m < n_miss; ++m) X.miss_pos[X.miss_exps[m]] = m;
         int pf_waited = -1, miss_waited = -1;
         for (int e = 0; e < c.E; ++e) {
-            if (!W.cnt[e] || (d >= 0 && ep_owner(l, e) != d)) continue;
+            if (!W.cnt[e] || (d >= 0 && ep_owner(l, e) != d) || X.pc_on[e]) continue;
             if (pf && X.pf_bs[l % Work::kPfRing][e] >= 0 && X.pf_bs[l % Work::kPfRing][e] > pf_waited)
                 CU(cudaStreamWaitEvent(g_s, X.pf_evs[l % Work::kPfRing][pf_waited = X.pf_bs[l % Work::kPfRing][e]], 0));
             if (X.miss_pos[e] >= 0 && cst != g_s && X.miss_pos[e] / Work::kMissBatch > miss_waited)
                 CU(cudaStreamWaitEvent(g_s, X.miss_ev[miss_waited = X.miss_pos[e] / Work::kMissBatch], 0));
             run_exp(e);
+        }
+        if (!cpu_exps.empty()) {   // the lane's experts while the GPU runs its own, their rows added after them
+            CU(cudaEventSynchronize(X.pc_ev));
+            k::decode_host(1, (const uint8_t*) X.pc_x16_h, (size_t) T * C, X.pc_x_h);   // (the GPU's input, in F32)
+            std::vector<ik2::cpu::BatchJob> jobs;
+            for (int e : cpu_exps) {
+                const int st_e = W.start[e], cnt_e = W.cnt[e];
+                for (int j0 = 0; j0 < cnt_e; j0 += 8) {
+                    ik2::cpu::BatchJob J{};
+                    J.gate = Ly.host[0] + (size_t) e * Ly.stride[0];
+                    J.up = Ly.host[1] + (size_t) e * Ly.stride[1];
+                    J.down = Ly.host[2] + (size_t) e * Ly.stride[2];
+                    J.tg = Ly.ty[0], J.tu = Ly.ty[1], J.td = Ly.ty[2];
+                    J.sg = sg[st_e], J.su = su[st_e];
+                    J.nt = std::min(8, cnt_e - j0);
+                    for (int j = 0; j < J.nt; ++j) {
+                        const int row = st_e + j0 + j;
+                        J.xt[j] = X.pc_x_h + (size_t) gidx[row] * C, J.yt[j] = X.pc_y_h + (size_t) row * C;
+                    }
+                    J.x = J.xt[0], J.y = J.yt[0];
+                    jobs.push_back(J);
+                }
+            }
+            ik2::cpu::experts_batch(jobs.data(), (int) jobs.size(), C, F, c.gate_cap, c.up_cap);
+            g_n_cpu += cpu_exps.size();
+            for (int e : cpu_exps) {
+                const int st_e = W.start[e], cnt_e = W.cnt[e];
+                CU(cudaMemcpyAsync(X.pc_y_d + (size_t) st_e * C, X.pc_y_h + (size_t) st_e * C, (size_t) cnt_e * C * 4,
+                                   cudaMemcpyHostToDevice, g_s));
+                scatter_add_rows_kernel<<<cnt_e, 256, 0, g_s>>>(X.pc_y_d + (size_t) st_e * C, X.gidx + st_e, X.wtr + st_e,
+                                                               C, X.tmp, C);
+            }
         }
         X.pf_layers[l % Work::kPfRing] = -1;
     };
@@ -2875,7 +2958,8 @@ void dp_request(int l, int e) {   // a miss: its copy into the least recently us
         if (g_dp.lfu ? g_dp.lscore[g_dp.owner[s2]] < g_dp.lscore[g_dp.owner[v]] : g_dp.last[s2] < g_dp.last[v]) v = s2;
     }
     if (v < 0) return;
-    if (g_dp.lfu && g_dp.owner[v] >= 0 && !(g_dp.lscore[key] > g_dp.lscore[g_dp.owner[v]])) return;   // (not worth it)
+    static const float margin = getenv("IK2_DP_MARGIN") ? (float) std::atof(getenv("IK2_DP_MARGIN")) : 0.0f;
+    if (g_dp.lfu && g_dp.owner[v] >= 0 && !(g_dp.lscore[key] > g_dp.lscore[g_dp.owner[v]] + margin)) return;   // (not worth it)
     auto& q = g_dp.q[qi];
     const cudaEvent_t ev = q.ev;
     q = DevPlan::Copy{true, v, key, l, e, 1, 0, ev};
@@ -5595,6 +5679,7 @@ int run(int argc, char** argv) {
             CU(cudaDeviceSynchronize());
         }
         use_dev(0);
+        if (g_pool && n_gpu == 1 && (!getenv("IK2_PCPU") || std::atoi(getenv("IK2_PCPU")))) pc_alloc(dev_work(0), c.C);
     }
     if (serve) {
         // --serve: requests on stdin, a line each - "GEN max_new temperature top_p seed stop,stop ids,ids,..." - and
