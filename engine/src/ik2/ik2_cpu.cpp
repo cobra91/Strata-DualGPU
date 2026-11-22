@@ -74,7 +74,10 @@ void Pool::post(std::function<void()> f) {
 }
 void Pool::wait() {
     std::unique_lock<std::mutex> lk(m_, std::defer_lock);
-    for (int spin = 0; spin < 200000; ++spin) {   // (the caller works the queue too, then spins: the work is short)
+    // (the caller works the queue too, then spins: the work is short.  The count restarts after each task it runs, so
+    // a queue that stays fed keeps it spinning - on purpose: the next task is microseconds away - and it sleeps only
+    // after 200000 idle spins)
+    for (int spin = 0; spin < 200000; ++spin) {
         lk.lock();
         if (pending_ == 0) return;
         if (!q_.empty()) {
@@ -358,6 +361,10 @@ bool available_for(int type) {
 void rows(int type, const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
     if (type == 21 || type == 20 || type == 8) {
+        if (K % (type == 21 ? 256 : 32)) {   // (a row of whole blocks, as GGUF lays them out)
+            std::fprintf(stderr, "ik2 CPU lane: a row of %d values is not whole blocks of type %d\n", K, type);
+            std::abort();
+        }
         const size_t rb = type == 21 ? (size_t) K / 256 * 110 : (size_t) K / 32 * (type == 20 ? 18 : 34);
         for (int r = r0; r < r1; ++r) {
             const uint8_t* w = W + (size_t) r * rb;
@@ -376,6 +383,10 @@ void rows(int type, const uint8_t* W, int K, int r0, int r1, const float* x, flo
 // rows by the int8 dots (IQ3_S / IQ4_NL only; xq / xs from quant_q8)
 void rows_q8(int type, const uint8_t* W, int K, int r0, int r1, const int8_t* xq, const float* xs, float* out) {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    if (K % (type == 21 ? 256 : 32)) {
+        std::fprintf(stderr, "ik2 CPU lane: a row of %d values is not whole blocks of type %d\n", K, type);
+        std::abort();
+    }
     const size_t rb = type == 21 ? (size_t) K / 256 * 110 : (size_t) K / 32 * 18;
     for (int r = r0; r < r1; ++r) {
         const uint8_t* w = W + (size_t) r * rb;

@@ -5739,7 +5739,7 @@ int run(int argc, char** argv) {
                     g_pool->size(), (unsigned long long) g_n_cpu, g_t_cpu * 1e3, (unsigned long long) g_n_wait);
     if (g_dp.M)
         std::printf("devplan: %llu experts on the CPU, %llu copied in, %llu not (queue full); the GPU waited for the CPU "
-                    "%d times, %.1f ms in all\n", (unsigned long long) g_dp.cpu_experts, (unsigned long long) g_dp.copies,
+                    "(or a late host) %d times, %.1f ms in all\n", (unsigned long long) g_dp.cpu_experts, (unsigned long long) g_dp.copies,
                     (unsigned long long) g_dp.skipped, g_dp.ctl[4], g_dp.ctl[3] / 1000.0);
     if (g_prof)
         std::printf("profile (all calls): attention %.2f s, router %.2f s, uploads %.2f s, experts %.2f s, rest %.2f s\n",
