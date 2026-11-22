@@ -18,6 +18,7 @@
 #include <type_traits>
 
 namespace ik2::k {
+bool g_v_rot = !getenv("IK2_KV_VROT") || std::atoi(getenv("IK2_KV_VROT"));   // k8v8: int8 V rotated
 namespace {
 
 void check(const char* what) {
@@ -300,6 +301,44 @@ __device__ __forceinline__ void store_i8_warp(const float* src, float f, int8_t*
         if (lane == 0) sdst[gq] = sh;
     }
 }
+// (k8v8, k::g_v_rot) the orthonormal Walsh-Hadamard transform of a 128-vector (its own inverse): V stored rotated
+// (its int8 groups then hold no outliers), the attention's output rotated back.  A block of 128 threads, a value each.
+__device__ __forceinline__ float wht128_block(float v, float* sm) {
+    const int t = threadIdx.x;
+    __syncthreads();
+    sm[t] = v;
+#pragma unroll
+    for (int st = 1; st < 128; st <<= 1) {
+        __syncthreads();
+        const float a = sm[t], b = sm[t ^ st];
+        __syncthreads();
+        sm[t] = (t & st) ? b - a : a + b;
+    }
+    __syncthreads();
+    return sm[t] * 0.08838834764831845f;
+}
+// ... of a warp's 128 values in sm (4 a lane: t = lane + 32 j), in place
+__device__ __forceinline__ void wht128_warp(float* sm) {
+    const int lane = threadIdx.x & 31;
+#pragma unroll
+    for (int st = 1; st < 128; st <<= 1) {
+        float nv[4];
+        __syncwarp();
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int t = lane + 32 * j;
+            const float a = sm[t], b = sm[t ^ st];
+            nv[j] = (t & st) ? b - a : a + b;
+        }
+        __syncwarp();
+#pragma unroll
+        for (int j = 0; j < 4; ++j) sm[lane + 32 * j] = nv[j];
+    }
+    __syncwarp();
+#pragma unroll
+    for (int j = 0; j < 4; ++j) sm[lane + 32 * j] *= 0.08838834764831845f;
+    __syncwarp();
+}
 __device__ __forceinline__ float sumsq_warp(const float* src, int D) {
     float a = 0.0f;
     for (int d = threadIdx.x & 31; d < D; d += 32) a += src[d] * src[d];
@@ -413,7 +452,7 @@ __global__ void prep_qkv_r_impl_kernel(float* q, const float* q_clip, const floa
                                        float qk_clip, float rel_clip, float eps, const int* pos, float alpha,
                                        float n_floor, int pos0, int kv_cap, float k_scale, float v_scale,
                                        const int* pos0_d, uint16_t* q16, const uint16_t* sink_w, const float* sink_x,
-                                       int sink_k, float* sink_y) {
+                                       int sink_k, float* sink_y, bool v_rot = false) {
     if (pos0_d) pos0 = *pos0_d;   // (a token of a replayed graph: its position read here)
     const int gid = blockIdx.x;
     const int per_tok = 2 * H + 2 * KVh;
@@ -450,9 +489,16 @@ __global__ void prep_qkv_r_impl_kernel(float* q, const float* q_clip, const floa
         const int slot = kv_cap > 0 ? (pos0 + t) % kv_cap : (pos0 + t);
         const float* vp = v_in + ((size_t) t * KVh + kv) * D;
         KV* rw = vc + (size_t) slot * kv_row<KV>(KVh * D);
-        if constexpr (kv_i8<KV>()) {   // (V RMS-normalized)
+        if constexpr (kv_i8<KV>()) {   // (V RMS-normalized; rotated first for k8v8)
             const float f = rsqrtf(sumsq_warp(vp, D) / (float) D + eps);
-            store_i8_warp(vp, f, rw + (size_t) kv * D, (uint16_t*) (rw + KVh * D) + kv * (D / 64), D);
+            if (v_rot && D == 128) {
+                __shared__ float vr[128];
+                for (int d = threadIdx.x & 31; d < 128; d += 32) vr[d] = vp[d];
+                wht128_warp(vr);
+                store_i8_warp(vr, f, rw + (size_t) kv * D, (uint16_t*) (rw + KVh * D) + kv * (D / 64), D);
+            } else {
+                store_i8_warp(vp, f, rw + (size_t) kv * D, (uint16_t*) (rw + KVh * D) + kv * (D / 64), D);
+            }
         } else
             store_v_warp(vp, rw + (size_t) kv * D, D, eps, v_scale);
     } else {
@@ -1457,7 +1503,8 @@ attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __r
 // the splits merged with the sink: out [Tq] rows of o_ld, head h at h * D; a block a (query, head), D threads
 __global__ void attn_flash_combine_kernel(const float* __restrict__ o_part, const float2* __restrict__ ml_part,
                                           int n_split, int Tq, int H, const float* __restrict__ sink, float* out,
-                                          int o_ld, float v_inv) {
+                                          int o_ld, float v_inv, bool rot = false) {
+    __shared__ float rsm[kFaD];
     const int i = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     float m = sink[(size_t) i * H + h] * kLog2e;
     for (int s = 0; s < n_split; ++s) m = fmaxf(m, ml_part[((size_t) s * Tq + i) * H + h].x);
@@ -1469,7 +1516,9 @@ __global__ void attn_flash_combine_kernel(const float* __restrict__ o_part, cons
         den += ml.y * c;
         acc += o_part[(((size_t) s * Tq + i) * H + h) * kFaD + d] * c;
     }
-    out[(size_t) i * o_ld + (size_t) h * kFaD + d] = acc / den * v_inv;   // (v_inv: an FP8 cache's V scale)
+    float res = acc / den * v_inv;   // (v_inv: an FP8 cache's V scale)
+    if (rot) res = wht128_block(res, rsm);
+    out[(size_t) i * o_ld + (size_t) h * kFaD + d] = res;
 }
 
 // ---- one token's attention on the tensor cores (long contexts: the scalar kernels are bound by their arithmetic)
@@ -1733,7 +1782,7 @@ attn_decode_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__
 __global__ void attn_decode_mma_combine_kernel(const float* __restrict__ o_part, const float2* __restrict__ ml_part,
                                                int n_split, int H, const float* __restrict__ sink, float v_inv,
                                                const int* pos_d, int qpos, int window, const float* __restrict__ gate,
-                                               float* out, uint16_t* out16) {
+                                               float* out, uint16_t* out16, bool rot = false) {
     extern __shared__ float cm_sm[];
     float* red = cm_sm;         // [kFaD] the block's reductions
     float* cw = cm_sm + kFaD;   // [n_split * kWaNW] the warps' weights
@@ -1756,6 +1805,7 @@ __global__ void attn_decode_mma_combine_kernel(const float* __restrict__ o_part,
     float acc = 0.0f;
     for (int s = 0; s < n_act; ++s) acc += o_part[((size_t) s * H + h) * kFaD + d] * cw[s];
     float res = acc / den * v_inv;
+    if (rot) res = wht128_block(res, red);   // (k8v8: V was rotated)
     if (gate) res = res * (1.0f / (1.0f + expf(-gate[(size_t) h * kFaD + d])));
     out[(size_t) h * kFaD + d] = res;
     if (out16) out16[(size_t) h * kFaD + d] = f2h(res);
@@ -3616,7 +3666,9 @@ __global__ void attn_split_kernel(const float* q, const float* r, const KV* kc, 
     pp[2 + tid] = o;
 }
 
-__global__ void attn_combine_kernel(const float* sink, const float* part, int H, int P, float v_inv_scale, float* out) {
+__global__ void attn_combine_kernel(const float* sink, const float* part, int H, int P, float v_inv_scale, float* out,
+                                    bool rot = false) {
+    __shared__ float rsm[128];
     const int h = blockIdx.x, qi = blockIdx.y, tid = threadIdx.x;
     const float* pp = part + ((size_t) qi * H + h) * P * 130;
     const float sk = sink[(size_t) qi * H + h];
@@ -3630,7 +3682,9 @@ __global__ void attn_combine_kernel(const float* sink, const float* part, int H,
         den += pp[(size_t) p * 130 + 1] * f;
         o += pp[(size_t) p * 130 + 2 + tid] * f;
     }
-    out[((size_t) qi * H + h) * 128 + tid] = (o / den) * v_inv_scale;
+    float res = (o / den) * v_inv_scale;
+    if (rot) res = wht128_block(res, rsm);
+    out[((size_t) qi * H + h) * 128 + tid] = res;
 }
 
 template <int WARPS, int ROWS>
@@ -3651,7 +3705,8 @@ __global__ void mv_blocks_kernel(int type, const uint8_t* W, int N, int K, size_
 template <class KV>
 __global__ void attn_decode_kernel(const float* q, const float* r, const float* sink, const KV* kc, const KV* vc,
                                    int kv_cap, int H, int Hkv, int k0, int nk, int qpos, float qk_scale,
-                                   float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* out) {
+                                   float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* out,
+                                   bool rot = false) {
     __shared__ float sm_m[4], sm_s[4];
     __shared__ __align__(16) float sm_o[4][128];
     const int h = blockIdx.x, g = h / (H / Hkv), tid = threadIdx.x;
@@ -3670,7 +3725,9 @@ __global__ void attn_decode_kernel(const float* q, const float* r, const float* 
         den += sm_s[w] * f;
         o += sm_o[w][tid] * f;
     }
-    out[(size_t) h * 128 + tid] = (o / den) * v_inv_scale;
+    float res = (o / den) * v_inv_scale;
+    if (rot) res = wht128_block(res, &sm_o[0][0]);   // (sm_o read above: free)
+    out[(size_t) h * 128 + tid] = res;
 }
 
 __global__ void unpack_kv_fp8_to_f16_vec4_kernel(const uint8_t* kc, const uint8_t* vc, int kv_cap, int k0, int nk,
@@ -5571,7 +5628,7 @@ void attn_multi_impl(const float* q, const float* r, const float* sink, const KV
     attn_split_kernel<KV><<<dim3(H, P, nq), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos0, qk_scale, proj,
                                                           d_rel, extent, window, part, nullptr);
     check("attn_multi_split");
-    attn_combine_kernel<<<dim3(H, nq), 128, 0, s>>>(sink, part, H, P, v_inv_scale, out);
+    attn_combine_kernel<<<dim3(H, nq), 128, 0, s>>>(sink, part, H, P, v_inv_scale, out, kv_i8<KV>() && g_v_rot);
     check("attn_multi_combine");
 }
 
@@ -5627,7 +5684,7 @@ void attn_decode_impl(const float* q, const float* r, const float* sink, const K
     const int P = std::min(128, std::max(1, (nk + 63) / 64));
     if (P == 1) {
         attn_decode_kernel<KV><<<H, 128, 0, s>>>(q, r, sink, kc, vc, kv_cap, H, Hkv, k0, nk, qpos, qk_scale,
-                                                   v_inv_scale, proj, d_rel, extent, window, out);
+                                                   v_inv_scale, proj, d_rel, extent, window, out, kv_i8<KV>() && g_v_rot);
         check("attn_decode");
         return;
     }
@@ -5635,7 +5692,7 @@ void attn_decode_impl(const float* q, const float* r, const float* sink, const K
     attn_split_kernel<KV><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos, qk_scale, proj, d_rel,
                                                       extent, window, part, nullptr);
     check("attn_decode_split");
-    attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, part, H, P, v_inv_scale, out);
+    attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, part, H, P, v_inv_scale, out, kv_i8<KV>() && g_v_rot);
     check("attn_decode_combine");
 }
 
@@ -5845,7 +5902,7 @@ void attn_decode_mma_impl(const uint16_t* q16, const float* r, const float* sink
         ml_part);
     check("attn_decode_mma");
     attn_decode_mma_combine_kernel<<<(unsigned) H, kFaD, (size_t) (kFaD + n_split * kWaNW) * sizeof(float), s>>>(
-        o_part, ml_part, n_split, H, sink, v_inv, pos, qpos, window, gate, out, out16);
+        o_part, ml_part, n_split, H, sink, v_inv, pos, qpos, window, gate, out, out16, kv_i8<KV>() && g_v_rot);
     check("attn_decode_mma (combine)");
 }
 void attn_decode_mma_f16(const uint16_t* q16, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
@@ -5933,7 +5990,7 @@ void prep_qkv_r_i8(float* q, const float* q_clip, const float* k_in, int8_t* kc,
     }
     prep_qkv_r_impl_kernel<int8_t><<<(unsigned) (T * (2 * H + 2 * KV)), 32, 0, s>>>(
         q, q_clip, k_in, kc, v_in, vc, r, r_clip, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, pos, alpha, n_floor,
-        pos0, kv_cap, 1.0f, 1.0f, nullptr, nullptr, nullptr, nullptr, 0, nullptr);
+        pos0, kv_cap, 1.0f, 1.0f, nullptr, nullptr, nullptr, nullptr, 0, nullptr, g_v_rot);
     check("prep_qkv_r_i8");
 }
 void prep_qkv_r_i8_at(float* q, const float* q_clip, const float* k_in, int8_t* kc, const float* v_in, int8_t* vc,
@@ -5947,7 +6004,7 @@ void prep_qkv_r_i8_at(float* q, const float* q_clip, const float* k_in, int8_t* 
     }
     prep_qkv_r_impl_kernel<int8_t><<<(unsigned) (2 * H + 2 * KV + (sink_w ? H : 0)), 32, 0, s>>>(
         q, q_clip, k_in, kc, v_in, vc, r, r_clip, 1, H, KV, D, d_rel, qk_clip, rel_clip, eps, log_scale ? pos : nullptr,
-        alpha, n_floor, 0, kv_cap, 1.0f, 1.0f, pos, q16, sink_w, sink_x, sink_k, sink_y);
+        alpha, n_floor, 0, kv_cap, 1.0f, 1.0f, pos, q16, sink_w, sink_x, sink_k, sink_y, g_v_rot);
     check("prep_qkv_r_i8_at");
 }
 void attn_multi_i8(const float* q, const float* r, const float* sink, const int8_t* kc, const int8_t* vc, int kv_cap,
@@ -5968,7 +6025,7 @@ void attn_decode_i8_at(const float* q, const float* r, const float* sink, const 
     attn_split_kernel<int8_t><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, 0, 0, 0, qk_scale, proj, d_rel,
                                                           extent, window, scratch, pos);
     check("attn_decode_i8_at (split)");
-    attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, scratch, H, P, 1.0f, out);
+    attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, scratch, H, P, 1.0f, out, g_v_rot);
     check("attn_decode_i8_at (combine)");
 }
 void attn_decode_mma_i8(const uint16_t* q16, const float* r, const float* sink, const int8_t* kc, const int8_t* vc,
@@ -5993,7 +6050,7 @@ void attn_flash_i8(const uint16_t* q16, int q_ld, const int8_t* kc, const int8_t
     attn_flash_launch<kFaNW, false, int8_t>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, qk_scale, bias, extent, window,
                                             n_split, o_part, ml_part, s);
     attn_flash_combine_kernel<<<dim3((unsigned) Tq, (unsigned) H), kFaD, 0, s>>>(o_part, ml_part, n_split, Tq, H, sink,
-                                                                                 out, o_ld, 1.0f);
+                                                                                 out, o_ld, 1.0f, g_v_rot);
     check("attn_flash_combine");
 }
 void unpack_kv_i8_to_f16(const int8_t* kc, const int8_t* vc, int kv_cap, int k0, int nk, int KD, uint16_t* k_out16,
@@ -6020,5 +6077,18 @@ void f16_to_f32(const uint16_t* x, size_t n, float* y, cudaStream_t s) {
     if (!n) return;
     f16_to_f32_kernel_k<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(x, n, y);
     check("f16_to_f32");
+}
+}  // namespace ik2::k
+
+namespace ik2::k {
+__global__ void wht_rows_kernel(float* x) {   // a block a 128-row of x, rotated in place
+    __shared__ float sm[128];
+    float* r = x + (size_t) blockIdx.x * 128;
+    r[threadIdx.x] = wht128_block(r[threadIdx.x], sm);
+}
+void wht_rows(float* x, int rows, cudaStream_t s) {
+    if (rows <= 0) return;
+    wht_rows_kernel<<<(unsigned) rows, 128, 0, s>>>(x);
+    check("wht_rows");
 }
 }  // namespace ik2::k

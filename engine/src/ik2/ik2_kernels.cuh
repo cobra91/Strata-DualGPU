@@ -434,6 +434,10 @@ void decode_host(int type, const uint8_t* blocks, size_t n, float* out);
 void mv_q8p_t(const int8_t* q, const uint16_t* d, int N, int K, const float* x, int T, float* y, int ldy,
               cudaStream_t s);
 size_t kv_row_bytes_i8(int KD);
+/// k8v8 (IK2_KV_VROT, default on): int8 V stored Walsh-Hadamard rotated a head (D 128) - the attention kernels rotate
+/// their output back; wht_rows: that rotation over rows of 128 values in place (the GEMM path's output)
+extern bool g_v_rot;
+void wht_rows(float* x, int rows, cudaStream_t s);
 void f16_to_f32(const uint16_t* x, size_t n, float* y, cudaStream_t s);
 /// the dp4a expert calls' scratch growths so far (a captured graph from before a growth holds freed pointers)
 int scratch_epoch();

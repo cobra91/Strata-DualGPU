@@ -1536,6 +1536,8 @@ void test_attn_decode_mma() {
 // prep_qkv_r_i8's rows against prep_qkv_r_f16's values (one int8 step of a group's max)
 void test_kv_i8() {
     const int H = 12, KV = 2, D = 128, KD = KV * D, d_rel = 16;
+    const bool rot_was = k::g_v_rot;
+    k::g_v_rot = false;   // (the kernels against the FP16 ones on the same values: V as stored, unrotated)
     const int RS = (int) k::kv_row_bytes_i8(KD);
     struct Case { int n_pos, kv_cap, window, extent; const char* name; };
     const Case cases[] = {{1, 0, 1 << 30, 64, "1 key"}, {2500, 0, 1 << 30, 1024, "2500 keys"},
@@ -1669,6 +1671,29 @@ void test_kv_i8() {
         }
         std::printf("     prep_qkv_r_i8: worst error %.3f of a step (a step: the group's max / 127)\n", worst);
         expect_true("prep_qkv_r_i8: within 0.55 steps of prep_qkv_r_f16", worst <= 0.55);
+        // k8v8: V stored rotated by prep_qkv_r_i8, the decode's output rotated back - against the FP16 cache's
+        k::g_v_rot = true;
+        int8_t *k8r = dev_n<int8_t>((size_t) cap * RS), *v8r = dev_n<int8_t>((size_t) cap * RS);
+        float* dqc = dev(q);
+        float* drc = dev(r);
+        k::prep_qkv_r_i8(dqc, nullptr, dk, k8r, dv, v8r, drc, nullptr, T, H, KV, D, d_rel, 22.6f, 8.0f, 1e-6f, nullptr,
+                         0.0f, 1.0f, pos0, cap, 0);
+        auto proj = fvec((size_t) 64 * d_rel), sink = fvec(H, 1.0f);
+        float *dp = dev(proj), *ds = dev(sink), *oa = dev_n<float>((size_t) H * D), *ob = dev_n<float>((size_t) H * D);
+        float* scr = dev_n<float>((size_t) 1 << 20);
+        const int qpos = pos0 + T - 1;   // (the window's last token over the 16-row ring: keys 0 .. qpos)
+        k::attn_decode_f16(dqa + (size_t) (T - 1) * H * D, dra + (size_t) (T - 1) * H * d_rel, ds, k16, v16, cap, H, KV, D,
+                           0, qpos + 1, qpos, 1.0f / std::sqrt((float) D), dp, d_rel, 64, 1 << 30, scr, oa, 0);
+        k::attn_decode_i8(dqc + (size_t) (T - 1) * H * D, drc + (size_t) (T - 1) * H * d_rel, ds, k8r, v8r, cap, H, KV, D,
+                          0, qpos + 1, qpos, 1.0f / std::sqrt((float) D), dp, d_rel, 64, 1 << 30, scr, ob, 0);
+        const auto va = host(oa, (size_t) H * D), vb = host(ob, (size_t) H * D);
+        double mx = 0;
+        for (float v : va) mx = std::max(mx, (double) std::fabs(v));
+        std::vector<double> want(va.begin(), va.end());
+        expect("k8v8 decode vs FP16 K / V", vb, want, 0.0, 0.03 * mx);
+        for (float* pp : {dqc, drc, dp, ds, oa, ob, scr}) cudaFree(pp);
+        cudaFree(k8r), cudaFree(v8r);
+        k::g_v_rot = rot_was;
         for (float* p : {dqa, dqb, dk, dv, dra, drb}) cudaFree(p);
         cudaFree(k16), cudaFree(v16), cudaFree(k8), cudaFree(v8), cudaFree(uk), cudaFree(uv);
     }

@@ -1717,6 +1717,8 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
                     }
                 }
+                if (g_kv_i8 && k::g_v_rot && c.D == 128)   // (k8v8: the rows' output rotated back)
+                    k::wht_rows(W.o + (size_t) ts * HD, Tq * c.H, g_s);
             } else {
                 const int start = attn_kv_cap > 0 ? (k0_s % attn_kv_cap) : k0_s;
                 const int n1 = attn_kv_cap > 0 ? std::min(nk_s, attn_kv_cap - start) : nk_s;
