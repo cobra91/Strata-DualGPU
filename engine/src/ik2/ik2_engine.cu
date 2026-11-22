@@ -2586,12 +2586,29 @@ __device__ __forceinline__ int dp_ld_sys(const volatile int* p) {
 // the slot's expert, [72 + s] its miss flag, then x [T][C] at kDpHdr bytes.  T > 1: the hits grouped by expert on the
 // device (gblob / gn / gtok / grow, kGroupMax tokens a group, gn 0 past the last) for the grouped kernels
 constexpr int kDpT = 8, kDpS = 64, kDpHdr = 1024;
-__device__ unsigned long long d_plan_ns[4], d_plan_n;   // (IK2_DP_KTIME=1: k_dp_plan's phases, ns)
+__device__ unsigned long long d_plan_ns[8], d_plan_n;   // (IK2_DP_KTIME=1: k_dp_plan's phases, ns)
 const bool g_dp_ktime = getenv("IK2_DP_KTIME") && std::atoi(getenv("IK2_DP_KTIME"));
+double g_dp_bt[8] = {};   // (IK2_DP_KTIME: the CPU lane's batches' time by their experts, 7: 7 or more)
+long g_dp_bn[8] = {};
 __device__ __forceinline__ unsigned long long gtime() {
     unsigned long long t;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
     return t;
+}
+// IK2_PQ_CHECK=1: the plan's int8 x against quant_rows_i8's arithmetic (a warp a sub-block), the mismatches counted
+__device__ unsigned long long d_pq_bad, d_pq_n;
+__global__ void k_pq_check(const float* x, const int8_t* xq8, const float* xs8, int C) {
+    const int lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    for (int sb = threadIdx.x >> 5; sb < C / 32; sb += nw) {
+        const float v = x[sb * 32 + lane];
+        float m = fabsf(v);
+        for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        const int8_t q = (int8_t) __float2int_rn(m > 0.0f ? v * (127.0f / m) : 0.0f);
+        int bad = q != xq8[sb * 32 + lane];
+        if (lane == 0) bad |= __float_as_uint(m * (1.0f / 127.0f)) != __float_as_uint(xs8[sb]);
+        if (bad) atomicAdd(&d_pq_bad, 1ull);
+        if (lane == 0) atomicAdd(&d_pq_n, 1ull);
+    }
 }
 __global__ void k_dp_plan(const float* __restrict__ logits, const float* __restrict__ bias, int E, float scale,
                           const uint8_t* const* __restrict__ tab_l, int K, int C, const float* __restrict__ x, int T,
@@ -2600,9 +2617,8 @@ __global__ void k_dp_plan(const float* __restrict__ logits, const float* __restr
                           const uint8_t** gblob, int* gn, int* gtok, int* grow, int8_t* xq8 = nullptr,
                           float* xs8 = nullptr, bool ktime = false) {
     const unsigned long long t0 = threadIdx.x == 0 ? gtime() : 0;
-    if (xq8) {   // (a token's x made int8 for the dp4a gate_up, as its own quant_rows_i8 would: the same codes)
+    if (xq8 && (C / 32) % 4) {   // (a warp's 4 sub-blocks below must all be there: else a warp a sub-block)
         const int lane = threadIdx.x & 31, nw = blockDim.x >> 5;
-#pragma unroll 3
         for (int sb = threadIdx.x >> 5; sb < C / 32; sb += nw) {
             const float v = x[sb * 32 + lane];
             float m = fabsf(v);
@@ -2611,7 +2627,23 @@ __global__ void k_dp_plan(const float* __restrict__ logits, const float* __restr
             xq8[sb * 32 + lane] = (int8_t) __float2int_rn(m > 0.0f ? v * (127.0f / m) : 0.0f);
             if (lane == 0) xs8[sb] = m * (1.0f / 127.0f);
         }
+    } else if (xq8) {   // (a token's x made int8 for the dp4a gate_up, as its own quant_rows_i8 would: the same codes -
+        //  here 8 threads a sub-block of 32, a float4 each, all of x's loads at once)
+        const int sub = threadIdx.x & 7;
+        for (int sb = threadIdx.x >> 3; sb < C / 32; sb += blockDim.x >> 3) {
+            const float4 v = __ldg((const float4*) (x + sb * 32) + sub);
+            float m = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+#pragma unroll
+            for (int o = 4; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+            const float f = m > 0.0f ? 127.0f / m : 0.0f;
+            char4 q;
+            q.x = (signed char) __float2int_rn(m > 0.0f ? v.x * f : 0.0f), q.y = (signed char) __float2int_rn(m > 0.0f ? v.y * f : 0.0f);
+            q.z = (signed char) __float2int_rn(m > 0.0f ? v.z * f : 0.0f), q.w = (signed char) __float2int_rn(m > 0.0f ? v.w * f : 0.0f);
+            ((char4*) (xq8 + sb * 32))[sub] = q;
+            if (sub == 0) xs8[sb] = m * (1.0f / 127.0f);
+        }
     }
+    const unsigned long long tq = threadIdx.x == 0 ? gtime() : 0;
     __shared__ int s_seq;
     __shared__ float s_sig[256], s_val[256];
     __shared__ int s_flag[256], top[kDpS];
@@ -2720,12 +2752,14 @@ __global__ void k_dp_plan(const float* __restrict__ logits, const float* __restr
             const unsigned long long t3 = gtime();
             atomicAdd(&d_plan_ns[0], t1 - t0), atomicAdd(&d_plan_ns[1], t2 - t1), atomicAdd(&d_plan_ns[2], t2b - t2);
             atomicAdd(&d_plan_ns[3], t3 - t2b);
+            atomicAdd(&d_plan_ns[4], tq - t0);
             atomicAdd(&d_plan_n, 1ull);
         }
     }
 }
-__global__ void k_dp_wait(const int* __restrict__ mflag, int K, int* seqd, volatile int* ctl) {
+__global__ void k_dp_wait(const int* __restrict__ mflag, int K, int* seqd, volatile int* ctl, bool ktime = false) {
     if (threadIdx.x) return;
+    const unsigned long long tw0 = gtime();
     const int seq = seqd[1];
     int any = 0;
     for (int k = 0; k < K; ++k) any |= mflag[k];
@@ -2739,8 +2773,11 @@ __global__ void k_dp_wait(const int* __restrict__ mflag, int K, int* seqd, volat
         ctl[3] = (int) min(2147483647ull, (unsigned long long) ctl[3] + (t1 - t0) / 1000);   // the GPU's wait, us (saturating)
         ctl[4] = (int) min(2147483647ull, (unsigned long long) ctl[4] + 1);
     }
-    __threadfence_system();
+    const unsigned long long tw1 = gtime();
+    // (ctl[1]: the GPU past plan seq - the slots it named read by the kernels before this one, done in stream order;
+    //  no system fence for it: one cost 3.6 us a layer visit)
     ctl[1] = seq;
+    if (ktime) atomicAdd(&d_plan_ns[5], tw1 - tw0), atomicAdd(&d_plan_ns[6], gtime() - tw1);
 }
 __global__ void k_dp_merge(float* __restrict__ y, const float* ey, const int* __restrict__ mflag,
                            const int* __restrict__ seqd, int C, int R) {
@@ -2945,7 +2982,12 @@ void dp_service() {
             J.y = y;
         }
         // the misses on the CPU and published first (the GPU waits for them), then their copies for the next tokens
+        const double tb0 = g_dp_ktime && n ? now() : 0;
         ik2::cpu::experts_batch(jobs, n, g_dp.C, g_dp.F, g_dp.gcap, g_dp.ucap);
+        if (g_dp_ktime && n) {
+            const int b = std::min(n, 7);
+            g_dp_bt[b] += now() - tb0, ++g_dp_bn[b];
+        }
         g_dp.cpu_experts += n;
         std::atomic_thread_fence(std::memory_order_seq_cst);
         g_dp.ctl[2] = next;
@@ -3261,6 +3303,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                                           g_dp.R, l, g_dp.seqd, g_dp.ctl_d, g_dp.blob, g_dp.tok, g_dp.inv, g_dp.sg,
                                           g_dp.su, g_dp.wt, g_dp.mflag, g_dp.gblob, g_dp.gn, g_dp.gtok, g_dp.grow,
                                           pq ? xq8 : nullptr, xs8, g_dp_ktime);
+            static const bool pq_check = getenv("IK2_PQ_CHECK") != nullptr;
+            if (pq && pq_check) k_pq_check<<<1, 256, 0, g_s>>>(W.xq, xq8, xs8, C);
             if (T == 1) {
                 k::experts_gate_up_swiglu(g_dp.blob, g_dp.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, c.F, g_dp.sg,
                                           g_dp.su, c.gate_cap, c.up_cap, W.h16, g_s, pq ? -1 : 1);
@@ -3271,7 +3315,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 k::experts_down_g(g_dp.gblob, g_dp.gn, g_dp.grow, S1, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F,
                                   W.y32, g_s, S1);
             }
-            k_dp_wait<<<1, 32, 0, g_s>>>(g_dp.mflag, S1, g_dp.seqd, g_dp.ctl_d);
+            k_dp_wait<<<1, 32, 0, g_s>>>(g_dp.mflag, S1, g_dp.seqd, g_dp.ctl_d, g_dp_ktime);
             static const bool dcc = !getenv("IK2_DP_CC") || std::atoi(getenv("IK2_DP_CC"));
             if (T == 1 && !g_rec && dcc) {   // (the CPU rows, the experts' sum and the short conv: one launch)
                 k_dp_combine_conv<<<(unsigned) ((C + 127) / 128), 128, 0, g_s>>>(W.y32, g_dp.ey_d, g_dp.mflag, g_dp.seqd,
@@ -6194,12 +6238,22 @@ int run(int argc, char** argv) {
     if (g_pool)
         std::printf("CPU lane: %d threads, %llu experts computed on the CPU (%.2f ms each at the end), %llu waited for\n",
                     g_pool->size(), (unsigned long long) g_n_cpu, g_t_cpu * 1e3, (unsigned long long) g_n_wait);
+        if (getenv("IK2_PQ_CHECK")) {
+            unsigned long long bad = 0, n = 0;
+            cudaMemcpyFromSymbol(&bad, d_pq_bad, sizeof bad);
+            cudaMemcpyFromSymbol(&n, d_pq_n, sizeof n);
+            std::printf("plan's int8 x: %llu of %llu sub-blocks differ\n", bad, n);
+        }
         if (g_dp_ktime) {
-            unsigned long long ns[4] = {}, nn = 0;
+            unsigned long long ns[8] = {}, nn = 0;
             cudaMemcpyFromSymbol(ns, d_plan_ns, sizeof ns);
             cudaMemcpyFromSymbol(&nn, d_plan_n, sizeof nn);
             if (nn) std::printf("k_dp_plan: %.2f us routing, %.2f us the ring's wait, %.2f us the record, %.2f us its fence (%llu plans)\n",
                                 ns[0] / 1e3 / nn, ns[1] / 1e3 / nn, ns[2] / 1e3 / nn, ns[3] / 1e3 / nn, nn);
+            if (nn) std::printf("  (of the routing %.2f us x made int8; k_dp_wait %.2f us its wait, %.2f us its fence)\n",
+                                ns[4] / 1e3 / nn, ns[5] / 1e3 / nn, ns[6] / 1e3 / nn);
+            for (int b = 1; b < 8; ++b)
+                if (g_dp_bn[b]) std::printf("  CPU batches of %d%s experts: %ld, %.3f ms each\n", b, b == 7 ? "+" : "", g_dp_bn[b], g_dp_bt[b] / g_dp_bn[b] * 1e3);
         }
     if (g_dp.M)
         std::printf("devplan: %llu experts on the CPU, %llu copied in, %llu not (queue full); the GPU waited for the CPU "
