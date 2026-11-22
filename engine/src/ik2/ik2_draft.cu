@@ -447,7 +447,7 @@ void set_f_rnn(Drafter* d, const float* taps, int ld, int row) {
 }
 
 void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_t* lm_f16, int n_rows, int n_vocab,
-             int* out) {
+             int* out, const int8_t* lm_q8, const uint16_t* lm_q8d) {
     const int C = d->C, T = kBlock;
     // Initialize the residual stream [anchor_h; mask x 7], block positions, and anchor token in one kernel.
     // Layer 0 reads d->res and overwrites d->x, so d->x does not need pre-filling.
@@ -467,8 +467,12 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
     k::add(d->x, d->res, TC, d->res, d->s);
     k::rms(d->res, d->norm, T, C, d->eps, d->h, d->s);   // the draft hidden, rows 1 .. 7 used
     // base logits of rows 1 .. 7 through the target's head
-    k::to_f16(d->h + C, (size_t) (T - 1) * C, (uint16_t*) d->x16, d->s);
-    gemm_h(d, lm_f16, n_rows, C, d->x16, T - 1, d->base, n_rows);
+    if (lm_f16) {
+        k::to_f16(d->h + C, (size_t) (T - 1) * C, (uint16_t*) d->x16, d->s);
+        gemm_h(d, lm_f16, n_rows, C, d->x16, T - 1, d->base, n_rows);
+    } else {
+        k::mv_q8p_t(lm_q8, lm_q8d, n_rows, C, d->h + C, T - 1, d->base, n_rows, d->s);
+    }
     // the Markov head, a token at a time (note: k::rnn_gates keeps state/latent in F32 whereas SGLang mtp.py
     // rounds intermediate gate/tanh ops to BF16; fused argmax_gemv_f16 reads FP16 fold_w/fold_b + F32 base/latent)
     cu(cudaMemsetAsync(d->state, 0, d->R * 4, d->s), "state");

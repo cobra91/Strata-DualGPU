@@ -3786,6 +3786,39 @@ __global__ void mv_q8p_kernel(const int8_t* __restrict__ q, const uint16_t* __re
     acc = wsum(acc);
     if (lane == 0 && !mv_conv_row(c0, row, acc) && !mv_conv_row(c1, row, acc)) y[row] = acc;
 }
+// Y [T][ldy] = W . X [T][K] for T <= 8 tokens over the planar Q8_0 matrix: the weights read once for all T (a short
+// verify window, a small prompt chunk), a warp a row
+template <int WARPS, int TT>
+__global__ void mv_q8p_t_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, int N, int K,
+                                const float* __restrict__ x, int T, float* y, int ldy) {
+    const int row = blockIdx.x * WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= N) return;
+    const uint32_t* qr = (const uint32_t*) (q + (size_t) row * K);
+    const uint16_t* dr = d + (size_t) row * (K >> 5);
+    float acc[TT];
+#pragma unroll
+    for (int t = 0; t < TT; ++t) acc[t] = 0.0f;
+    for (int it = 0, n_it = K >> 7; it < n_it; ++it) {
+        const uint32_t w = __ldg(qr + it * 32 + lane);
+        const float dv = h2f(__ldg(dr + it * 4 + (lane >> 3)));
+        const float w0 = dv * (float) (int8_t) (w & 0xFFu), w1 = dv * (float) (int8_t) ((w >> 8) & 0xFFu);
+        const float w2 = dv * (float) (int8_t) ((w >> 16) & 0xFFu), w3 = dv * (float) (int8_t) (w >> 24);
+#pragma unroll
+        for (int t = 0; t < TT; ++t) {
+            if (t < T) {
+                const float4 xv = __ldg((const float4*) (x + (size_t) t * K) + it * 32 + lane);
+                acc[t] += w0 * xv.x + w1 * xv.y + w2 * xv.z + w3 * xv.w;
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < TT; ++t) {
+        if (t < T) {
+            const float a = wsum(acc[t]);
+            if (lane == 0) y[(size_t) t * ldy + row] = a;
+        }
+    }
+}
 __global__ void decode_q8p_f16_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, size_t n,
                                       uint16_t* __restrict__ out) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -5318,6 +5351,19 @@ void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* 
     }
     mv_q8p_kernel<4><<<(unsigned) ((N + 3) / 4), 128, 0, s>>>(q, d, N, K, x, y, c0, c1, a0, a1);
     check("mv_q8p");
+}
+void mv_q8p_t(const int8_t* q, const uint16_t* d, int N, int K, const float* x, int T, float* y, int ldy,
+              cudaStream_t s) {
+    if (N <= 0 || T <= 0) return;
+    if (K % 128 || T > 8 || ((uintptr_t) q & 3) || ((uintptr_t) x & 15)) {
+        std::fprintf(stderr, "ik2::k::mv_q8p_t: K %d, T %d, or q / x not aligned\n", K, T);
+        std::abort();
+    }
+    const unsigned g = (unsigned) ((N + 3) / 4);
+    if (T <= 2) mv_q8p_t_kernel<4, 2><<<g, 128, 0, s>>>(q, d, N, K, x, T, y, ldy);
+    else if (T <= 4) mv_q8p_t_kernel<4, 4><<<g, 128, 0, s>>>(q, d, N, K, x, T, y, ldy);
+    else mv_q8p_t_kernel<4, 8><<<g, 128, 0, s>>>(q, d, N, K, x, T, y, ldy);
+    check("mv_q8p_t");
 }
 void mv_q8p(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, cudaStream_t s) {
     mv_q8p_conv(q, d, N, K, x, y, MvConv{}, MvConv{}, s);

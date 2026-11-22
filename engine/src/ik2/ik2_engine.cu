@@ -631,6 +631,7 @@ void mv1c(const Mat& m, const float* x, float* y, const k::MvConv& c0, const k::
         if (cv->n) k::conv4_res(y + cv->r0, cv->hist, cv->w, cv->dyn, cv->heads, 1, cv->n, cv->res, cv->y, g_s);
 }
 
+bool g_q8_t = !getenv("IK2_Q8_T") || std::atoi(getenv("IK2_Q8_T"));
 uint16_t* g_w16 = nullptr;   // a matrix's FP16 decode for the prompt path's GEMMs (the largest of a layer's)
 size_t g_w16_n = 0;          // values it holds
 // Y [T][N] = X [T][K] . W^T: one token straight over the blocks (x32), more through an FP16 decode and a GEMM (x16).
@@ -638,6 +639,10 @@ size_t g_w16_n = 0;          // values it holds
 void matmul(const Mat& m, const float* x32, const uint16_t* x16, int T, float* Y, int ldy) {
     if (m.f16) {
         gemm16(m.f16, m.N, m.K, x16, T, Y, ldy);
+        return;
+    }
+    if (m.q8 && T > 1 && T <= 8 && m.K % 128 == 0 && g_q8_t) {   // (a short chunk: the weights read once for all T)
+        k::mv_q8p_t(m.q8, m.q8d, m.N, m.K, x32, T, Y, ldy, g_s);
         return;
     }
     if (m.K <= 8192 && (T == 1 || (size_t) m.N * m.K > g_w16_n)) {
@@ -1386,6 +1391,9 @@ void loop_gates_chunk(Work& W, const k::LoopGate* gt, int n, int T, int C, int R
 // h_in ([T][C]) is unmodified and acts as the residual input; when l % c.block == 0, it is saved to blk(nb).
 // msg: a looped core's later pass - the layer's messages [4][T][C] (q's, k's, v's, the MoE's), which gate its q, k and
 // v inputs before their norms (so a sliding layer too projects each from its own input).
+int g_attn_mma = 1;         // a token's attention on the tensor cores (IK2_ATTN_MMA=0: the scalar kernels; 2: the
+                            // layers without a window only)
+int g_mma_split = 1;        // its blocks a K / V head (k::attn_decode_mma_blocks: the device filled once)
 void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const float* h_in, const int* pos_p, int nb,
                     size_t blk_off, float* r_out, Work& W, const float* msg = nullptr) {
     const Config& c = M.c;
@@ -1393,7 +1401,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const size_t TC = (size_t) T * C;
     auto blk = [&](int i) { return W.blocks + ((size_t) i * W.blk_ld + blk_off) * C; };
 
-    const bool need_x32 = g_dense_q8 && T == 1;
+    const bool need_x32 = g_dense_q8 && (T == 1 || (T <= 8 && g_q8_t));   // (matmul's planar Q8 products take F32)
     const uint16_t* xk16 = W.x16;
     const uint16_t* xv16 = W.x16;
     const float *in_q = h_in, *in_k = h_in, *in_v = h_in;
@@ -1566,7 +1574,22 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const float one = 1.0f, zero = 0.0f;
     const float qk_scale = 1.0f / std::sqrt((float) c.D);
     const int attn_kv_cap = Ly.sliding ? Ly.kv_cap : 0;
-    if (T == 1) {
+    const bool mma1 = T == 1 && (g_attn_mma == 1 || (g_attn_mma == 2 && !Ly.sliding));
+    if (mma1) {   // a token's attention on the tensor cores (q in FP16; a K / V head's query heads share its tiles)
+        const int ns = Ly.sliding ? std::min(g_mma_split, std::max(1, (c.window + 63) / 64)) : g_mma_split;
+        k::to_f16(q_p, (size_t) HD, W.x16, g_s);
+        if (g_kv_i8)
+            k::attn_decode_mma_i8(W.x16, r_p, sink_p, (const int8_t*) Ly.kc8, (const int8_t*) Ly.vc8, attn_kv_cap, c.H,
+                                  c.KV, nullptr, pos0, ns, qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o,
+                                  nullptr, nullptr, g_s);
+        else if (g_kv_fp8)
+            k::attn_decode_mma_fp8(W.x16, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, nullptr, pos0, ns,
+                                   qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, nullptr,
+                                   nullptr, g_s);
+        else
+            k::attn_decode_mma_f16(W.x16, r_p, sink_p, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, nullptr, pos0, ns, qk_scale,
+                                   Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, nullptr, nullptr, g_s);
+    } else if (T == 1) {
         if (g_kv_i8) {
             k::attn_decode_i8(q_p, r_p, sink_p, (const int8_t*) Ly.kc8, (const int8_t*) Ly.vc8, attn_kv_cap, c.H, c.KV,
                               c.D, k0, nk, pos0, qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
@@ -1709,7 +1732,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             ts += Tq;
         }
     }
-    k::gate_mul_f16(W.o, gate_p, (size_t) T * HD, W.x16, g_dense_q8 && T == 1, g_s);
+    k::gate_mul_f16(W.o, gate_p, (size_t) T * HD, W.x16, g_dense_q8 && (T == 1 || (T <= 8 && g_q8_t)), g_s);
     matmul(Ly.wo, W.o, W.x16, T, W.tmp, C);
     conv_rec(Ly, 2, W.tmp, Ly.h_attn, T, C);
     if (l % c.block == 0) {
@@ -2065,9 +2088,6 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
 bool g_fast = false;        // set at load: every expert resident, one GPU, the dense weights as blocks (IK2_FAST=0: no)
 bool g_fast_want = false;
 bool g_graph = true;        // IK2_GRAPH=0: the resident path's launches one by one
-int g_attn_mma = 1;         // a token's attention on the tensor cores (IK2_ATTN_MMA=0: the scalar kernels; 2: the
-                            // layers without a window only)
-int g_mma_split = 1;        // its blocks a K / V head (k::attn_decode_mma_blocks: the device filled once)
 struct FastGraph {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
@@ -4245,7 +4265,7 @@ int run(int argc, char** argv) {
     // a small card with a looped model: a long prompt takes lent layer-major passes (forward_prefill_sup), so forward()'s
     // chunk only sizes the short prompts' and the decode's buffers and the sliding layers' rings - 512 instead of 2048
     // gives the expert cache their VRAM (RTX 2060 SUPER, Inkling-2-Mini IQ3_S: 1192 -> 1365 slots, TG 36.2 -> 38.4)
-    if (small_card && !chunk_given && c.n_pass > 1 && draft_path.empty() &&
+    if (small_card && !chunk_given && c.n_pass > 1 &&
         !(getenv("IK2_LOOP_SUP") && !std::atoi(getenv("IK2_LOOP_SUP"))))
         chunk = 512;
     g_kv_grow = kv_grow_arg >= 0 ? kv_grow_arg != 0 : small_card;
@@ -4272,7 +4292,7 @@ int run(int argc, char** argv) {
     // cache that holds ~3 GiB: RTX 2060 SUPER 8 GB, Inkling-2-Mini IQ3_S, 654 -> 908 slots, TG 14.0 -> 20.7) - one GPU
     // (IK2_DENSE=q8 is refused past one: its FP16 scratch is one device's), and not with --draft (it reads the output
     // head in FP16)
-    if (!getenv("IK2_DENSE") && small_card && draft_path.empty()) g_dense_q8 = true;
+    if (!getenv("IK2_DENSE") && small_card) g_dense_q8 = true;   // (with --draft too: its verify's products by mv_q8p_t)
     const bool can_resident = (n_gpu == 1 || (dual() && g_ep)) && !g_pool;
     if (can_resident) {
         size_t exp_b = 0, dense_b = 0, kv_b = 0;
@@ -4765,12 +4785,14 @@ int run(int argc, char** argv) {
     if (!draft_path.empty()) {
         if (n_gpu > 2 || (n_gpu == 2 && !g_ep)) die("--draft: single GPU or dual-GPU EP only so far");
         use_dev(0);
+        bool stage_here = false;   // (the head's staging and FP16 copy only for the fold: freed after it on dense Q8)
         if (!M.out_w.f16) {
             const auto* t = S.info("output.weight");
             const size_t nb = tensor_bytes(*t);
             if (nb > g_stage_bytes) {
                 if (g_stage) cudaFree(g_stage);
                 g_stage = dalloc<uint8_t>(g_stage_bytes = nb);
+                stage_here = true;
             }
             CU(cudaMemcpy(g_stage, S.data("output.weight"), nb, cudaMemcpyHostToDevice));
             M.out_w.f16 = dalloc<uint16_t>((size_t) c.n_rows * c.C);
@@ -4783,6 +4805,12 @@ int run(int argc, char** argv) {
             ik2::draft::fold(drafter, M.out_w.f16, c.n_rows);
         } catch (const std::exception& e) {
             die(e.what());
+        }
+        if (M.out_w.q8) {   // (the head stays planar Q8: the drafter's base rows by mv_q8p_t; 0.9 GiB to the cache)
+            CU(cudaDeviceSynchronize());
+            cudaFree(M.out_w.f16);
+            M.out_w.f16 = nullptr;
+            if (stage_here) cudaFree(g_stage), g_stage = nullptr, g_stage_bytes = 0;
         }
         g_taps_n = ik2::draft::taps(drafter);
         g_taps_ld = std::max(chunk, ik2::draft::kBlock);
@@ -5681,7 +5709,8 @@ int run(int argc, char** argv) {
             const double t0 = now();
             embed_row(M, anchor, raw, anchor_h);
             int dr[ik2::draft::kBlock - 1];
-            ik2::draft::propose(drafter, anchor, anchor_h, P, M.out_w.f16, c.n_rows, c.n_vocab, dr);
+            ik2::draft::propose(drafter, anchor, anchor_h, P, M.out_w.f16, c.n_rows, c.n_vocab, dr, M.out_w.q8,
+                                M.out_w.q8d);
             const double t1 = now();
             int tk[ik2::draft::kBlock];
             tk[0] = anchor;

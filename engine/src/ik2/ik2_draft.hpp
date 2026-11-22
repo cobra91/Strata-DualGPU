@@ -47,8 +47,9 @@ void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos
 void set_f_rnn(Drafter* d, const float* taps, int ld, int row);
 /// Drafts 7 tokens (out, host) after the anchor at position P; anchor_h: its embedding, normed (device [C] F32).
 /// lm_f16: the target's output head; n_vocab: the real rows (the argmax's range).
+/// (lm_f16 null: the head planar Q8 - lm_q8 / lm_q8d as k::mv_q8p's)
 void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_t* lm_f16, int n_rows, int n_vocab,
-             int* out);
+             int* out, const int8_t* lm_q8 = nullptr, const uint16_t* lm_q8d = nullptr);
 /// VRAM it holds, bytes.
 size_t bytes(const Drafter* d);
 

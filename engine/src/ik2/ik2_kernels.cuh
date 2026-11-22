@@ -428,6 +428,9 @@ void decode_host(int type, const uint8_t* blocks, size_t n, float* out);
 /// int8 K / V (IK2_KV=i8): a token's row is kv_row_bytes_i8(KD) bytes - its KD int8 codes, then one FP16 scale per
 /// 64 values (padded to 16 bytes); K L2-clipped and V RMS-normalized as for FP16, value = code * scale.  The same
 /// calls as the FP16 cache's (no K / V scale factors: the rows carry theirs).
+/// Y [T][ldy] = W . X [T][K] (T <= 8) over a planar Q8_0 matrix (as mv_q8p's), the weights read once for all T
+void mv_q8p_t(const int8_t* q, const uint16_t* d, int N, int K, const float* x, int T, float* y, int ldy,
+              cudaStream_t s);
 size_t kv_row_bytes_i8(int KD);
 void prep_qkv_r_i8(float* q, const float* q_clip, const float* k_in, int8_t* kc, const float* v_in, int8_t* vc,
                    float* r, const float* r_clip, int T, int H, int KV, int D, int d_rel, float qk_clip,
